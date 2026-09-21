@@ -1,0 +1,22 @@
+# Normalize line endings; Godot writes LF and diffs stay clean across OSes.
+* text=auto eol=lf
+*.gd text eol=lf
+*.tscn text eol=lf
+*.tres text eol=lf
+*.import text eol=lf
+*.uid text eol=lf
+*.cfg text eol=lf
+*.godot text eol=lf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ogg binary
+*.mp3 binary
+*.wav binary
+*.ttf binary
+*.otf binary
+*.glb binary
+*.gltf binary
