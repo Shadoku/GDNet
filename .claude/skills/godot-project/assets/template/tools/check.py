@@ -139,6 +139,11 @@ def main() -> int:
             print("    " + clean(out).replace("\n", "\n    "))
         elif not ok:
             print("    " + details.replace("\n", "\n    "))
+        else:
+            # Always show the one-line summary so a report can quote it.
+            for line in out.splitlines():
+                if line.startswith(("TESTS:", "SCRIPTS:")):
+                    print("    " + line)
         if not ok:
             failed.append(name)
 
@@ -158,6 +163,8 @@ def main() -> int:
 
     # 3. test: the runner already prints only failures + summary; show that verbatim.
     test_args = ["-s", "res://tests/framework/runner.gd", "--"]
+    if args.verbose:
+        test_args.append("--verbose")
     if args.filter:
         test_args.append(f"--filter={args.filter}")
     if args.junit:

@@ -36,7 +36,26 @@ also add by hand (keep section headers alphabetical, Godot rewrites the file).
 GameState="*res://src/autoload/game_state.gd"   ; leading * = singleton node
 
 [input]
-jump={ "deadzone": 0.5, "events": [Object(InputEventKey,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"pressed":false,"keycode":0,"physical_keycode":32,"key_label":0,"unicode":32,"location":0,"echo":false,"script":null)] }
+move_left={
+"deadzone": 0.2,
+"events": [Object(InputEventKey,"physical_keycode":65), Object(InputEventKey,"physical_keycode":4194319)]
+}
+move_right={
+"deadzone": 0.2,
+"events": [Object(InputEventKey,"physical_keycode":68), Object(InputEventKey,"physical_keycode":4194321)]
+}
+move_up={
+"deadzone": 0.2,
+"events": [Object(InputEventKey,"physical_keycode":87), Object(InputEventKey,"physical_keycode":4194320)]
+}
+move_down={
+"deadzone": 0.2,
+"events": [Object(InputEventKey,"physical_keycode":83), Object(InputEventKey,"physical_keycode":4194322)]
+}
+jump={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"physical_keycode":32), Object(InputEventJoypadButton,"button_index":0)]
+}
 
 [layer_names]
 2d_physics/layer_1="world"
@@ -52,9 +71,15 @@ window/stretch/mode="canvas_items"   ; pixel art: also rendering/textures/canvas
 renderer/rendering_method="gl_compatibility"   ; 2D and web-friendly; forward_plus for 3D desktop
 ```
 
-Input events written by hand are error-prone; add actions in the editor
-(Project Settings > Input Map) and commit the result. Name physics layers before
-using them so `collision_layer` values in scenes stay readable.
+The minimal `Object(InputEventKey,"physical_keycode":N)` form above is verified
+headless (Godot 4.6 loads it; `InputMap.action_get_events` returns the events;
+`Input.parse_input_event` drives the action). The editor writes a longer form
+with every property; both work. Key codes: A=65 D=68 S=83 W=87 Space=32
+Enter=4194309 Escape=4194305 Left=4194319 Up=4194320 Right=4194321 Down=4194322;
+any `KEY_*` constant's value can be printed with `godot --headless -s` and a
+one-line script, or looked up in the `@GlobalScope.Key` docs. Lock the format in
+with a test that asserts `InputMap.has_action("move_left")`. Name physics layers
+before using them so `collision_layer` values in scenes stay readable.
 
 Autoloads named in project.godot are available in headless test runs too.
 

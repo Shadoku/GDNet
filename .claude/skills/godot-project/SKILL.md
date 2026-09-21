@@ -11,7 +11,8 @@ scene headless, then ends with `CHECK: PASS` or `CHECK: FAIL`. Nothing needs an
 addon or the editor, so it works in CI and in Claude Code on the web.
 
 For GDScript style, node architecture, or Tiled/YATI questions, also consult the
-`godot-gd` skill if it is available; this skill is about project setup and verification.
+`godot-gd` skill (it may be listed under a prefix such as `anthropic-skills:godot-gd`)
+if it is available; this skill is about project setup and verification.
 
 ## Decide which mode applies
 
@@ -29,17 +30,26 @@ Check with `ls project.godot tools/check.py tests/framework` before choosing.
    name (folder name), `--type 2d|3d` (2d), renderer (gl_compatibility for 2d,
    forward_plus for 3d; gl_compatibility is the safe choice for web export),
    Godot version (4.6 unless the user has another installed: `godot --version`).
+   Genre words such as "top-down", "platformer", or "roguelike" change nothing
+   here; they shape the first features you write afterwards.
 2. Run the scaffolder from this skill's directory:
    ```
    python3 <skill-dir>/scripts/new_project.py <target> --name "Name" --type 2d --godot-version 4.6
    ```
    It writes project.godot, a main scene, an example logic class with tests, the
-   test framework, `tools/`, CI, the Claude session hook, and `CLAUDE.md`, and
-   copies this skill into `<target>/.claude/skills/` so future sessions have it.
-3. Get a Godot binary: `godot --version`, else `bash tools/install_godot.sh`
-   (downloads the pinned release into `~/.cache/godot/`; Linux/macOS).
+   test framework, `tools/`, CI, the Claude session hook, and `CLAUDE.md`, copies
+   this skill into `<target>/.claude/skills/` so future sessions have it, and
+   runs `git init` if the target is not already inside a repository. Several of
+   the files are dotfiles (`.github/`, `.claude/`, `.godot-version`, ...): use
+   `ls -la` when checking what was written.
+3. Make sure a Godot binary is reachable. `check.py` looks at `$GODOT`, then
+   `godot`/`godot4` on PATH, then `~/.cache/godot/<version>/godot`. If none
+   exists, `bash tools/install_godot.sh` downloads the pinned release into that
+   cache (Linux/macOS); it is idempotent and reuses a cached binary, so running
+   it is always safe.
 4. Run `python3 tools/check.py` in the new project. It must end with `CHECK: PASS`
-   before you report success. The first `--import` creates `*.uid` files; commit them.
+   before you report success. The first `--import` creates `*.uid` and `*.import`
+   sidecar files; commit them with the rest.
 5. Replace the example `Health` class and its test with the user's first real
    feature when they describe one; otherwise leave them as a worked example.
 

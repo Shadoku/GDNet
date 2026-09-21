@@ -24,6 +24,7 @@ Options:
   --force                  overwrite existing files
   --no-ci --no-hook        skip .github/workflows or .claude hook files
   --no-skill               do not copy this skill into <target>/.claude/skills/
+  --no-git                 do not run `git init` when the target is not in a repository
   --no-examples            skip src/health.gd and its tests (adopt mode default)
 """
 from __future__ import annotations
@@ -31,6 +32,7 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -87,6 +89,7 @@ def main() -> int:
     ap.add_argument("--no-ci", action="store_true")
     ap.add_argument("--no-hook", action="store_true")
     ap.add_argument("--no-skill", action="store_true")
+    ap.add_argument("--no-git", action="store_true")
     ap.add_argument("--no-examples", action="store_true")
     args = ap.parse_args()
 
@@ -160,7 +163,16 @@ def main() -> int:
             shutil.copytree(SKILL_DIR, skill_dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             written.append(".claude/skills/" + SKILL_DIR.name + "/")
 
+    git_initialized = False
+    if not args.no_git and shutil.which("git"):
+        inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=target, capture_output=True, text=True)
+        if inside.returncode != 0:
+            subprocess.run(["git", "init", "-q"], cwd=target, check=False)
+            git_initialized = True
+
     print(f"{'Adopted' if args.adopt else 'Created'} Godot {feature} project '{name}' at {target}")
+    if git_initialized:
+        print("  + (git init)")
     for rel in written:
         print(f"  + {rel}")
     for rel in skipped:
@@ -172,7 +184,7 @@ def main() -> int:
     print(f"  cd {target}")
     print("  bash tools/install_godot.sh      # once, if godot is not on PATH")
     print("  python3 tools/check.py           # must end with CHECK: PASS")
-    print("  git add -A && git commit -m 'Scaffold Godot project with headless test tooling'")
+    print("  git add -A && git commit -m 'Scaffold Godot project with headless test tooling'   # includes the *.uid files")
     return 0
 
 

@@ -73,7 +73,7 @@ extends TestCase
 var inv: Inventory
 
 func before_each() -> void:
-	inv = Inventory.new(capacity = 3)
+	inv = Inventory.new(3)  # GDScript has no keyword arguments
 
 func test_rejects_when_full() -> void:
 	for i in 3:
