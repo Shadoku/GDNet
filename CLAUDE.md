@@ -93,3 +93,13 @@ tools/install_godot.sh downloads the pinned Godot into ~/.cache/godot
 - After adding a `class_name` or a new resource, `check.py` re-imports
   automatically. If you run Godot by hand, run `godot --headless --import` first.
 - Prefer editing `.tscn` files through small, reviewable diffs; they are text.
+
+## This repository also hosts the skill
+
+`.claude/skills/godot-project/` is the reusable skill that generated this
+project. `assets/template/` in it is the source of truth for
+`tests/framework/`, `tools/`, CI, and this file's general sections. When you
+improve the runner, `check.py`, or the docs here, port the change to the
+template too (or edit the template and re-run the scaffolder with `--force`),
+so new projects get the fix. Install the skill for all projects with
+`cp -r .claude/skills/godot-project ~/.claude/skills/`.
