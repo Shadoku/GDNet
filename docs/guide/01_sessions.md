@@ -55,7 +55,7 @@ Ticks Per Second).
 | `peer_left(id)` | a joined peer left |
 | `connected` | this side is in the session: a client at `Welcome`, a host at its first tick |
 | `disconnected(reason)` | the session ended on its own (refused, server lost); `leave()` emits nothing |
-| `tick(tick)` | once per physics tick while online |
+| `ticked(tick)` | once per physics tick while online |
 | `Net.tick()` | the current tick (a client adopts the server's at `Welcome`) |
 | `Net.peers()` | remote peers that finished the handshake (a client sees `[1]`) |
 | `Net.rtt(id)` | smoothed round-trip time in milliseconds, `-1` before the first sample |
@@ -65,12 +65,10 @@ Ticks Per Second).
 The tick is the physics tick: gdnet runs its loop in `_physics_process`, never on its own clock, so
 `move_and_slide()` and your own `_physics_process` stay in step with it.
 
-One GDScript detail: the method `tick()` and the signal `tick` share a name, and Godot resolves `Net.tick`
-to the method. Connect to the signal by name:
+The per-tick signal is `ticked` (the method `tick()` returns the current tick):
 
 ```gdscript
-Net.connect("tick", func(t: int) -> void: print("tick ", t))
-# or: Signal(Net, "tick").connect(...)
+Net.ticked.connect(func(t: int) -> void: print("tick ", t))
 ```
 
 ## Your existing multiplayer code keeps working

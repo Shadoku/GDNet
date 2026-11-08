@@ -8,26 +8,36 @@
 //! signals. Per-branch sessions for headless tests are separate `NetSession` nodes
 //! (tests/framework/net_fixture.gd); `Net` itself always serves the default (whole-tree) multiplayer.
 //!
-//! GDScript note: the method `tick()` and the signal `tick` share a name, as the plan specifies; Godot
-//! resolves `Net.tick` to the method, so connect to the signal with `Net.connect("tick", f)` or
-//! `Signal(Net, "tick")`.
+//! The per-tick signal is `ticked(tick)` (WP2 renamed it from `tick`, which the method `tick()` shadowed).
+//!
+//! WP2 entity surface: `manage`, `ignore`, `set_owner`, `spawn_for`, `is_owner`, `is_authority`,
+//! `net_id`, and the signals `entity_spawned`, `entity_despawning`, `spawn_refused` (relayed from the
+//! default session). The node-taking calls work for any branch: they find the node's `NetManager`, so
+//! they serve fixture branches as well as the default session.
 
 use crate::emulation::NetEmulation;
+use crate::manager::{entity_root_of, net_entity_of, NetManager, LOCAL_GROUP, META_OWNER};
 use crate::pipe_peer::NetPipePeer;
 use crate::session::{tick_rate, NetSession};
-use godot::classes::{ENetMultiplayerPeer, Engine, MultiplayerPeer, SceneTree};
+use godot::classes::node::InternalMode;
+use godot::classes::{ENetMultiplayerPeer, Engine, MultiplayerPeer, Node, PackedScene, SceneTree};
 use godot::global::Error;
 use godot::prelude::*;
 
 /// Name of the default session's node under the tree's root.
 pub const SESSION_NODE: &str = "__NetSession";
+/// Name of the manager `Net.manage(node)` adds under `node`.
+pub const MANAGED_NODE: &str = "__NetManaged";
 
-const RELAYED: [(&str, &str); 5] = [
+const RELAYED: [(&str, &str); 8] = [
     ("peer_joined", "_on_peer_joined"),
     ("peer_left", "_on_peer_left"),
     ("connected", "_on_connected"),
     ("disconnected", "_on_disconnected"),
-    ("tick", "_on_tick"),
+    ("ticked", "_on_ticked"),
+    ("entity_spawned", "_on_entity_spawned"),
+    ("entity_despawning", "_on_entity_despawning"),
+    ("spawn_refused", "_on_spawn_refused"),
 ];
 
 #[derive(GodotClass)]
@@ -70,7 +80,112 @@ impl Net {
     #[signal]
     fn disconnected(reason: GString);
     #[signal]
-    fn tick(tick: i64);
+    fn ticked(tick: i64);
+    #[signal]
+    fn entity_spawned(node: Gd<Node>);
+    #[signal]
+    fn entity_despawning(node: Gd<Node>);
+    #[signal]
+    fn spawn_refused(node: Gd<Node>);
+
+    /// Enrols `node`'s subtree as if `node` were a `NetManager` (its scene instances become entities).
+    /// For nodes outside any manager; call it on every peer, at the same path, before spawning under it.
+    /// Returns the manager created (a hidden child of `node`), or the existing one.
+    #[func]
+    fn manage(&mut self, mut node: Gd<Node>) -> Gd<NetManager> {
+        if let Some(existing) = node.get_node_or_null(MANAGED_NODE) {
+            if let Ok(m) = existing.try_cast::<NetManager>() {
+                return m;
+            }
+        }
+        let mut m = NetManager::new_alloc();
+        m.set_name(MANAGED_NODE);
+        m.bind_mut().set_managed_root(node.clone());
+        node.add_child_ex(&m).internal(InternalMode::FRONT).done();
+        m
+    }
+
+    /// Excludes `node` and everything below it from enrolment (adds it to the group `net_local`). Call it
+    /// before the node enters a managed subtree.
+    #[func]
+    fn ignore(&mut self, mut node: Gd<Node>) {
+        node.add_to_group(LOCAL_GROUP);
+    }
+
+    /// Server: makes `peer` the owner of the entity `node` belongs to (announced at the next tick). On a
+    /// node not enrolled yet, the owner is used when it is. Returns false on a node outside any manager
+    /// that is not a scene instance.
+    #[func]
+    fn set_owner(&mut self, mut node: Gd<Node>, peer: i64) -> bool {
+        let peer = peer.max(0) as u32;
+        match entity_root_of(&node) {
+            Some((root, mut m)) => m.bind_mut().set_entity_owner(&root, peer),
+            None => {
+                node.set_meta(META_OWNER, &i64::from(peer).to_variant());
+                if let Some(mut ne) = net_entity_of(&node) {
+                    ne.bind_mut().set_owner_peer(i64::from(peer));
+                }
+                true
+            }
+        }
+    }
+
+    /// Server: instantiates `scene`, names it `name` (when given), makes `peer` its owner and adds it under
+    /// `parent` (a manager or a node below one). Returns the new node.
+    #[func]
+    fn spawn_for(
+        &mut self,
+        peer: i64,
+        scene: Gd<PackedScene>,
+        mut parent: Gd<Node>,
+        name: GString,
+    ) -> Option<Gd<Node>> {
+        let Some(mut node) = scene.instantiate() else {
+            godot_error!("Net.spawn_for: the scene could not be instantiated");
+            return None;
+        };
+        if !name.is_empty() {
+            node.set_name(&name);
+        }
+        node.set_meta(META_OWNER, &peer.max(0).to_variant());
+        if let Some(mut ne) = net_entity_of(&node) {
+            ne.bind_mut().set_owner_peer(peer.max(0));
+        }
+        parent.add_child(&node);
+        Some(node)
+    }
+
+    /// True when this peer owns the entity `node` belongs to (without a session, or for an unmanaged node:
+    /// true).
+    #[func]
+    fn is_owner(&self, node: Gd<Node>) -> bool {
+        entity_root_of(&node)
+            .and_then(|(root, m)| m.bind().query(&root))
+            .is_none_or(|(_, owner, _)| owner)
+    }
+
+    /// True when this peer is the authority for the entity `node` belongs to: the server (without a
+    /// session, or for an unmanaged node: true).
+    #[func]
+    fn is_authority(&self, node: Gd<Node>) -> bool {
+        entity_root_of(&node)
+            .and_then(|(root, m)| m.bind().query(&root))
+            .is_none_or(|(_, _, auth)| auth)
+    }
+
+    /// The owner peer of the entity `node` belongs to (1 = the server; 0 for an unmanaged node).
+    #[func]
+    fn get_owner_of(&self, node: Gd<Node>) -> i64 {
+        entity_root_of(&node)
+            .and_then(|(root, m)| m.bind().query(&root))
+            .map_or(0, |(o, _, _)| i64::from(o))
+    }
+
+    /// The net id of the entity `node` belongs to (0 before it is spawned or when unmanaged).
+    #[func]
+    fn net_id(&self, node: Gd<Node>) -> i64 {
+        entity_root_of(&node).map_or(0, |(root, m)| i64::from(m.bind().net_id_of(&root)))
+    }
 
     /// Hosts over ENet on `port`. Returns `OK` or the error `ENetMultiplayerPeer.create_server` gave.
     #[func]
@@ -219,8 +334,26 @@ impl Net {
     }
 
     #[func]
-    fn _on_tick(&mut self, tick: i64) {
-        self.base_mut().emit_signal("tick", &[tick.to_variant()]);
+    fn _on_ticked(&mut self, tick: i64) {
+        self.base_mut().emit_signal("ticked", &[tick.to_variant()]);
+    }
+
+    #[func]
+    fn _on_entity_spawned(&mut self, node: Gd<Node>) {
+        self.base_mut()
+            .emit_signal("entity_spawned", &[node.to_variant()]);
+    }
+
+    #[func]
+    fn _on_entity_despawning(&mut self, node: Gd<Node>) {
+        self.base_mut()
+            .emit_signal("entity_despawning", &[node.to_variant()]);
+    }
+
+    #[func]
+    fn _on_spawn_refused(&mut self, node: Gd<Node>) {
+        self.base_mut()
+            .emit_signal("spawn_refused", &[node.to_variant()]);
     }
 }
 

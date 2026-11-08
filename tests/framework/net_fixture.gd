@@ -72,12 +72,38 @@ func build() -> void:
 
 ## Starts every session: the server first, then each client.
 func start() -> void:
+	start_server()
+	start_clients()
+
+
+## Starts only the server's session (late-join scenarios start the clients later).
+func start_server() -> void:
 	if _started:
 		return
 	_started = true
 	server_session.start(_server_peer, server.get_path())
+
+
+## Starts the clients' sessions that are not running yet (after `start_server()`).
+func start_clients() -> void:
+	start_server()
 	for i in clients.size():
-		client_sessions[i].start(_client_peers[i], clients[i].get_path())
+		if not client_sessions[i].is_online():
+			client_sessions[i].start(_client_peers[i], clients[i].get_path())
+
+
+## Adds a `NetManager` named `manager_name` (default `World`) to every branch, at the same path, and
+## returns them by branch name. `configure` (optional) is called with each manager before it is added.
+func add_managers(manager_name: String = "World", configure: Callable = Callable()) -> Dictionary:
+	var out := {}
+	for branch: Node in [server] + clients:
+		var m := NetManager.new()
+		m.name = manager_name
+		if configure.is_valid():
+			configure.call(m)
+		branch.add_child(m)
+		out[String(branch.name)] = m
+	return out
 
 
 ## Awaits physics frames until every client finished the handshake and the server sees all of them.

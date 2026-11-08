@@ -7,7 +7,10 @@ use godot::prelude::*;
 
 mod api_ext;
 mod emulation;
+mod entity_node;
+mod manager;
 mod net;
+mod parts;
 mod pipe_peer;
 mod session;
 mod version;

@@ -41,7 +41,7 @@ func test_offline_ticks_once_per_physics_frame() -> void:
 	assert_eq(Net.tick_rate, Engine.physics_ticks_per_second)
 	var count := [0]
 	var last := [-1]
-	Net.connect("tick", func(t: int) -> void:
+	Net.ticked.connect(func(t: int) -> void:
 		count[0] += 1
 		last[0] = t)
 	await _physics_frames(2)

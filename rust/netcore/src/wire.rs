@@ -2,6 +2,7 @@
 //! WP1 defines the session messages: `Hello` / `Welcome` / `Reject` (the handshake) and `Time`
 //! ping/pong. Later packages add kinds; a receiver that does not know a kind reports it as an error.
 
+use crate::entity::EntityAction;
 use serde::{Deserialize, Serialize};
 use std::string::String;
 use std::vec::Vec;
@@ -97,6 +98,8 @@ pub enum Message {
     Reject(Reject),
     Ping(Ping),
     Pong(Pong),
+    /// WP2: an entity action (create, destroy, reparent, set owner, scene announcement).
+    Entity(EntityAction),
 }
 
 /// The kind bytes. 0 is never used, so a zeroed buffer is not a message.
@@ -106,6 +109,7 @@ pub mod kind {
     pub const REJECT: u8 = 3;
     pub const PING: u8 = 4;
     pub const PONG: u8 = 5;
+    pub const ENTITY: u8 = 6;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,13 +138,16 @@ impl Message {
             Message::Reject(_) => kind::REJECT,
             Message::Ping(_) => kind::PING,
             Message::Pong(_) => kind::PONG,
+            Message::Entity(_) => kind::ENTITY,
         }
     }
 
     /// The channel this message travels on.
     pub fn channel(&self) -> Channel {
         match self {
-            Message::Hello(_) | Message::Welcome(_) | Message::Reject(_) => Channel::Reliable,
+            Message::Hello(_) | Message::Welcome(_) | Message::Reject(_) | Message::Entity(_) => {
+                Channel::Reliable
+            }
             Message::Ping(_) | Message::Pong(_) => Channel::Diagnostics,
         }
     }
@@ -161,6 +168,7 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         Message::Reject(m) => body(kind::REJECT, m),
         Message::Ping(m) => body(kind::PING, m),
         Message::Pong(m) => body(kind::PONG, m),
+        Message::Entity(m) => body(kind::ENTITY, m),
     }
 }
 
@@ -177,6 +185,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         kind::REJECT => Message::Reject(parse(k, rest)?),
         kind::PING => Message::Ping(parse(k, rest)?),
         kind::PONG => Message::Pong(parse(k, rest)?),
+        kind::ENTITY => Message::Entity(parse(k, rest)?),
         other => return Err(WireError::UnknownKind(other)),
     })
 }
@@ -186,6 +195,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Protocol {
     pub items: Vec<ProtocolItem>,
+    /// WP2: the scenes this side registered, as (scene path, part table hash), in registration order.
+    /// They are not part of `Hello` (part tables are computed when a scene is first spawned); they are
+    /// compared per scene on first use with [`Protocol::scene_mismatch`].
+    pub scenes: Vec<(String, u64)>,
 }
 
 impl Protocol {
@@ -202,7 +215,38 @@ impl Protocol {
                 item("tick rate", std::format!("{tick_rate}")),
                 item("protocol salt", std::format!("{salt}")),
             ],
+            scenes: Vec::new(),
         }
+    }
+
+    /// Records this side's part table hash for `path` (replacing an earlier one).
+    pub fn register_scene(&mut self, path: &str, parts_hash: u64) {
+        match self.scenes.iter_mut().find(|(p, _)| p == path) {
+            Some(entry) => entry.1 = parts_hash,
+            None => self.scenes.push((String::from(path), parts_hash)),
+        }
+    }
+
+    /// This side's part table hash for `path`, if registered.
+    pub fn scene(&self, path: &str) -> Option<u64> {
+        self.scenes.iter().find(|(p, _)| p == path).map(|(_, h)| *h)
+    }
+
+    /// `None` when `theirs` equals this side's part table hash for `path` (or this side has not
+    /// registered the scene); otherwise a reason naming the scene.
+    pub fn scene_mismatch(
+        &self,
+        path: &str,
+        theirs: u64,
+        local_label: &str,
+        remote_label: &str,
+    ) -> Option<String> {
+        let ours = self.scene(path)?;
+        (ours != theirs).then(|| {
+            std::format!(
+                "protocol mismatch: the part table of scene {path} differs ({local_label} {ours:016x}, {remote_label} {theirs:016x}); both peers need the same version of the scene at the same path"
+            )
+        })
     }
 
     /// FNV-1a 64 over every item's name and value, each terminated by a zero byte.
@@ -309,6 +353,59 @@ mod tests {
             echo_us: 0,
             tick: u64::MAX,
         }));
+        use crate::entity::{CreateAction, ParentRef};
+        let parent = ParentRef {
+            manager: u64::MAX,
+            entity: 3,
+            part: 2,
+        };
+        for action in [
+            EntityAction::Scene {
+                hash: 9,
+                path: "res://a.tscn".into(),
+                parts_hash: 77,
+            },
+            EntityAction::Create(CreateAction {
+                id: 65_537,
+                scene_hash: 9,
+                parent,
+                name: "Slime ✓".into(),
+                owner: 4,
+                parts: 3,
+                initial_state: std::vec![1, 2, 3],
+            }),
+            EntityAction::Destroy { id: 1 },
+            EntityAction::Reparent { id: 1, parent },
+            EntityAction::SetOwner { id: 1, owner: 9 },
+        ] {
+            let msg = Message::Entity(action);
+            assert_eq!(msg.channel(), Channel::Reliable);
+            roundtrip(msg);
+        }
+    }
+
+    #[test]
+    fn scene_mismatch_names_the_scene() {
+        let mut p = Protocol::new(60, 0);
+        assert_eq!(
+            p.scene_mismatch("res://a.tscn", 5, "client", "server"),
+            None
+        );
+        p.register_scene("res://a.tscn", 5);
+        assert_eq!(p.scene("res://a.tscn"), Some(5));
+        assert_eq!(
+            p.scene_mismatch("res://a.tscn", 5, "client", "server"),
+            None
+        );
+        let reason = p
+            .scene_mismatch("res://a.tscn", 6, "client", "server")
+            .unwrap();
+        assert!(
+            reason.starts_with("protocol mismatch: the part table of scene res://a.tscn differs"),
+            "{reason}"
+        );
+        // Scenes are compared per scene, not in the Hello hash.
+        assert_eq!(p.hash(), Protocol::new(60, 0).hash());
     }
 
     #[test]
@@ -389,7 +486,10 @@ mod tests {
         );
         let mut short = a.items.clone();
         short.pop();
-        let p = Protocol { items: short };
+        let p = Protocol {
+            items: short,
+            scenes: Vec::new(),
+        };
         assert_eq!(
             a.mismatch(&p.items, p.hash(), "server", "client")
                 .as_deref(),

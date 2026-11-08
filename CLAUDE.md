@@ -77,8 +77,9 @@ Never say a change works without a passing check. If you cannot run Godot
   `allow_errors = true` in a test that deliberately triggers one.
 - Run without `check.py`: `godot --headless --path . -s tests/framework/runner.gd -- --filter=name --verbose`.
 - Networked behaviour: `NetFixture.new(self, n_clients)`, `start()`, `await wait_connected()`, then
-  `teardown()` in `after_each`; never real sockets except the single ENet test. Connect to the `tick`
-  signal with `connect("tick", f)` (`Net.tick` is the method).
+  `teardown()` in `after_each`; never real sockets except the single ENet test. The per-tick signal
+  is `ticked` (`Net.tick()` is the method). Entities: `net.add_managers()` puts a `NetManager` at the
+  same path in every branch; spawn under the server's, assert on the clients' (`test_net_entities.gd`).
 
 ## Design for testability
 

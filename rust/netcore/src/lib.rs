@@ -7,19 +7,24 @@
 //!
 //! WP1 modules: [`clock`] (tick clock, offset, RTT/jitter), [`peers`] (the peer table), [`wire`]
 //! (framing and the session messages), [`emul`] (the network emulator), [`session`] (the handshake and
-//! `Time` state machine).
+//! `Time` state machine). WP2: [`entity`] (the entity table, id ranges, part tables, `EntityAction`).
 
 #![forbid(unsafe_code)]
 
 pub mod clock;
 pub mod emul;
+pub mod entity;
 pub mod peers;
 pub mod session;
 pub mod wire;
 
 pub use emul::{EmulSettings, Emulator, Pcg32};
+pub use entity::{
+    CreateAction, EntityAction, EntityRecord, EntityTable, NetId, ParentRef, PartTable,
+    MANAGER_ROOT,
+};
 pub use peers::{PeerId, SERVER};
-pub use session::{Event, Outgoing, Role, Session, SessionConfig};
+pub use session::{EntityEvent, Event, Outgoing, Role, Session, SessionConfig, Spawn};
 pub use wire::{Channel, Reliability};
 
 /// The protocol engine version, kept equal to the gdnet crate version by `tests/unit/test_gdnet_loads.gd`.

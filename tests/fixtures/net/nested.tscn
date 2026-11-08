@@ -1,0 +1,10 @@
+[gd_scene format=3]
+
+[ext_resource type="PackedScene" path="res://tests/fixtures/net/crate.tscn" id="1_crate"]
+[ext_resource type="PackedScene" path="res://tests/fixtures/net/split_crate.tscn" id="2_split"]
+
+[node name="Nested" type="Node2D"]
+
+[node name="Inner" parent="." instance=ExtResource("1_crate")]
+
+[node name="Split" parent="." instance=ExtResource("2_split")]
