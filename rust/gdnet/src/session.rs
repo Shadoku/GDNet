@@ -19,7 +19,10 @@ use crate::api_ext::NetMultiplayerApi;
 use crate::emulation::{settings_of, NetEmulation};
 use crate::manager::{NetManager, MANAGERS_GROUP};
 use crate::pipe_peer::NetPipePeer;
+use crate::poll::{NetPoller, POLLER_NODE};
+use crate::profiles;
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
+use godot::classes::node::InternalMode;
 use godot::classes::{
     Engine, INode, MultiplayerApi, MultiplayerPeer, Node, OfflineMultiplayerPeer, SceneMultiplayer,
     SceneTree, Time,
@@ -27,7 +30,7 @@ use godot::classes::{
 use godot::global::Error;
 use godot::prelude::*;
 use netcore::session::EntityEvent;
-use netcore::{EmulSettings, Event, Reliability, Session, SessionConfig};
+use netcore::{EmulSettings, Event, Reliability, Session, SessionConfig, StateUpdate};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -88,6 +91,37 @@ pub struct NetSession {
     branch_root: Option<Gd<Node>>,
     /// Entity events for a manager not found yet, with the tick they arrived and whether reported.
     unrouted: Vec<(u64, bool, EntityEvent)>,
+    /// WP3: snapshot bytes per second per peer; 0 = `Net.budget_bytes_per_s` / the project setting.
+    /// Changes apply at once.
+    #[var(get = get_budget_bytes_per_s, set = set_budget_bytes_per_s)]
+    budget_bytes_per_s: i64,
+    /// WP3: cold properties are polled every this many ticks; 0 = `Net.cold_poll_ticks` / the project
+    /// setting (default 6).
+    #[var(get = get_cold_poll_ticks, set = set_cold_poll_ticks)]
+    cold_poll_ticks: i64,
+    /// Test hook (WP3): this side's property tables change the quantiser of every property with this
+    /// name, so a spawn fails the property check with a reason naming the scene and property. Set it
+    /// before the first spawn.
+    #[var(rename = _debug_perturb_property, get = get_debug_perturb_property, set = set_debug_perturb_property)]
+    debug_perturb_property: GString,
+    poller_added: bool,
+    stats: Counters,
+}
+
+/// Byte and timing counters behind `stats()` (2.7, the WP8 meter's source).
+#[derive(Default, Clone)]
+struct Counters {
+    sent: [u64; 3],
+    received: [u64; 3],
+    window_start_sent: [u64; 3],
+    window_start_received: [u64; 3],
+    sent_per_s: [u64; 3],
+    received_per_s: [u64; 3],
+    window_ticks: u32,
+    poll_us_last: u64,
+    poll_us_window: u64,
+    poll_ms_avg: f64,
+    record_calls: u64,
 }
 
 #[godot_api]
@@ -95,6 +129,15 @@ impl INode for NetSession {
     fn ready(&mut self) {
         self.base_mut().set_process_priority(-1000);
         self.base_mut().set_physics_process_priority(-1000);
+        if !self.poller_added {
+            self.poller_added = true;
+            let mut poller = NetPoller::new_alloc();
+            poller.set_name(POLLER_NODE);
+            self.base_mut()
+                .add_child_ex(&poller)
+                .internal(InternalMode::BACK)
+                .done();
+        }
     }
 
     fn physics_process(&mut self, _delta: f64) {
@@ -143,6 +186,78 @@ impl NetSession {
     /// A client-side spawn was refused (spawn policy `server_only`); the node is freed.
     #[signal]
     fn spawn_refused(node: Gd<Node>);
+
+    #[func]
+    fn get_budget_bytes_per_s(&self) -> i64 {
+        self.budget_bytes_per_s
+    }
+
+    #[func]
+    fn set_budget_bytes_per_s(&mut self, v: i64) {
+        self.budget_bytes_per_s = v.max(0);
+        let b = self.effective_budget();
+        if let Some(c) = self.core.as_mut() {
+            c.set_budget(b);
+        }
+    }
+
+    #[func]
+    fn get_cold_poll_ticks(&self) -> i64 {
+        self.cold_poll_ticks
+    }
+
+    #[func]
+    fn set_cold_poll_ticks(&mut self, v: i64) {
+        self.cold_poll_ticks = v.max(0);
+    }
+
+    #[func]
+    fn get_debug_perturb_property(&self) -> GString {
+        self.debug_perturb_property.clone()
+    }
+
+    #[func]
+    fn set_debug_perturb_property(&mut self, v: GString) {
+        self.debug_perturb_property = v;
+    }
+
+    /// Counters for the meter (WP8) and tests: `bytes_sent_per_s` / `bytes_received_per_s` (per channel,
+    /// the last full second), `bytes_sent_total` / `bytes_received_total` (per channel),
+    /// `entities`, `poll_ms` (the last record step), `poll_ms_avg` (over the last second),
+    /// `budget_bytes_per_s`, `cold_poll_ticks`, and netcore's snapshot counters (`snapshots_sent`,
+    /// `snapshot_bytes`, `snapshot_entities_sent`, `snapshot_fields_sent`, `reliable_fields_sent`,
+    /// `snapshots_received`, `snapshots_stale`, `snapshots_unacked`, `fields_received`, `fallbacks`,
+    /// `changes`).
+    #[func]
+    pub fn stats(&self) -> VarDictionary {
+        let c = &self.stats;
+        let arr = |a: &[u64; 3]| PackedInt64Array::from(&a.map(|x| x as i64)[..]);
+        let mut d = VarDictionary::new();
+        d.set("bytes_sent_per_s", &arr(&c.sent_per_s));
+        d.set("bytes_received_per_s", &arr(&c.received_per_s));
+        d.set("bytes_sent_total", &arr(&c.sent));
+        d.set("bytes_received_total", &arr(&c.received));
+        d.set("entities", self.entity_count());
+        d.set("poll_ms", c.poll_us_last as f64 / 1000.0);
+        d.set("poll_ms_avg", c.poll_ms_avg);
+        d.set("budget_bytes_per_s", i64::from(self.effective_budget()));
+        d.set("cold_poll_ticks", i64::from(self.effective_cold_poll()));
+        if let Some(core) = self.core.as_ref() {
+            let r = core.repl_stats();
+            d.set("snapshots_sent", r.snapshots_sent as i64);
+            d.set("snapshot_bytes", r.snapshot_bytes as i64);
+            d.set("snapshot_entities_sent", r.entities_sent as i64);
+            d.set("snapshot_fields_sent", r.fields_sent as i64);
+            d.set("reliable_fields_sent", r.reliable_fields_sent as i64);
+            d.set("snapshots_received", r.snapshots_received as i64);
+            d.set("snapshots_stale", r.snapshots_stale as i64);
+            d.set("snapshots_unacked", r.snapshots_unacked as i64);
+            d.set("fields_received", r.fields_received as i64);
+            d.set("fallbacks", r.fallbacks as i64);
+            d.set("changes", r.changes as i64);
+        }
+        d
+    }
 
     #[func]
     fn get_debug_part_table_salt(&self) -> i64 {
@@ -256,6 +371,8 @@ impl NetSession {
 
         let mut cfg = SessionConfig::new(tick_rate());
         cfg.protocol_salt = self.debug_protocol_salt as u64;
+        cfg.profiles_hash = profiles::global_profiles().hash();
+        cfg.budget_bytes_per_s = self.effective_budget();
         let hosting = peer.get_unique_id() == 1;
         let mut core = if hosting {
             Session::server(cfg)
@@ -277,6 +394,7 @@ impl NetSession {
         self.restore = Some(restore);
         self.inbox.clear();
         self.applied = None;
+        self.stats = Counters::default();
         self.apply_emulation();
         self.base_mut().set_physics_process(true);
         Error::OK
@@ -389,6 +507,10 @@ impl NetSession {
     #[func]
     fn _on_peer_packet(&mut self, id: i64, packet: PackedByteArray) {
         if self.core.is_some() {
+            if let Some(&k) = packet.as_slice().first() {
+                let ch = usize::from(netcore::wire::channel_of_kind(k).index()).min(2);
+                self.stats.received[ch] += packet.len() as u64;
+            }
             self.inbox.push((id as i32, packet.to_vec()));
         }
     }
@@ -434,7 +556,8 @@ impl NetSession {
 }
 
 impl NetSession {
-    /// One physics tick: 2.2 steps 1 (drain) and 6 (send), then the signals.
+    /// One physics tick: 2.2 step 1 (drain), netcore's tick, entity actions and received state, then
+    /// the signals. Steps 5 and 6 (record, send) run in `post_tick()`, from the `NetPoller` at +1000.
     fn step(&mut self) {
         if self.core.is_none() {
             return;
@@ -452,43 +575,16 @@ impl NetSession {
             core.tick(now);
         }
         self.sync_managers();
-        let (outgoing, events, tick) = {
+        let (events, tick) = {
             let Some(core) = self.core.as_mut() else {
                 return;
             };
-            let out = core.outgoing();
             let mut events = Vec::new();
             while let Some(e) = core.poll_event() {
                 events.push(e);
             }
-            (out, events, core.current_tick() as i64)
+            (events, core.current_tick() as i64)
         };
-        if let Some(mut inner) = self.inner.clone() {
-            let connected = inner
-                .get_multiplayer_peer()
-                .is_some_and(|p| p.get_connection_status() == ConnectionStatus::CONNECTED);
-            if connected {
-                let known = inner.get_peers();
-                for o in outgoing {
-                    let to = o.peer as i32;
-                    if !known.as_slice().contains(&to) {
-                        continue;
-                    }
-                    let mode = match o.reliability {
-                        Reliability::Reliable => TransferMode::RELIABLE,
-                        Reliability::Unreliable => TransferMode::UNRELIABLE,
-                    };
-                    let bytes = PackedByteArray::from(o.bytes.as_slice());
-                    PACKETS_SENT.fetch_add(1, Ordering::Relaxed);
-                    inner
-                        .send_bytes_ex(&bytes)
-                        .id(to)
-                        .mode(mode)
-                        .channel(i32::from(o.channel))
-                        .done();
-                }
-            }
-        }
         let mut ended: Option<String> = None;
         for e in events {
             match e {
@@ -522,6 +618,115 @@ impl NetSession {
             return;
         }
         self.base_mut().emit_signal("ticked", &[tick.to_variant()]);
+    }
+
+    /// 2.2 steps 5 and 6, from the `NetPoller` (priority +1000): the server records its managers'
+    /// entities (hot properties every tick, cold ones every `cold_poll_ticks`, staggered), then every
+    /// side builds its snapshots / acks and hands netcore's packets to the transport.
+    pub fn post_tick(&mut self) {
+        if self.core.is_none() {
+            return;
+        }
+        let now = now_us();
+        if self.is_server() && self.is_connected() {
+            let t0 = now_us();
+            let tick = self.core.as_ref().map_or(0, |c| c.current_tick());
+            let cold = self.effective_cold_poll();
+            let managers = self.managers();
+            let mut batch = Vec::new();
+            {
+                let _guard = self.base_mut();
+                for (_, mut m) in managers {
+                    m.bind_mut().record(tick, cold, &mut batch);
+                }
+            }
+            if let Some(core) = self.core.as_mut() {
+                for (id, part, values) in &batch {
+                    core.record_part(*id, *part, values);
+                }
+            }
+            let us = now_us().saturating_sub(t0);
+            self.stats.poll_us_last = us;
+            self.stats.poll_us_window += us;
+            self.stats.record_calls += 1;
+        }
+        let outgoing = match self.core.as_mut() {
+            Some(core) => {
+                core.send_snapshots(now);
+                core.outgoing()
+            }
+            None => return,
+        };
+        self.flush(outgoing);
+        self.roll_stats_window();
+    }
+
+    fn flush(&mut self, outgoing: Vec<netcore::Outgoing>) {
+        if let Some(mut inner) = self.inner.clone() {
+            let connected = inner
+                .get_multiplayer_peer()
+                .is_some_and(|p| p.get_connection_status() == ConnectionStatus::CONNECTED);
+            if connected {
+                let known = inner.get_peers();
+                for o in outgoing {
+                    let to = o.peer as i32;
+                    if !known.as_slice().contains(&to) {
+                        continue;
+                    }
+                    let mode = match o.reliability {
+                        Reliability::Reliable => TransferMode::RELIABLE,
+                        Reliability::Unreliable => TransferMode::UNRELIABLE,
+                    };
+                    let bytes = PackedByteArray::from(o.bytes.as_slice());
+                    let ch = usize::from(o.channel).min(2);
+                    self.stats.sent[ch] += o.bytes.len() as u64;
+                    PACKETS_SENT.fetch_add(1, Ordering::Relaxed);
+                    inner
+                        .send_bytes_ex(&bytes)
+                        .id(to)
+                        .mode(mode)
+                        .channel(i32::from(o.channel))
+                        .done();
+                }
+            }
+        }
+    }
+
+    fn roll_stats_window(&mut self) {
+        let rate = tick_rate();
+        let c = &mut self.stats;
+        c.window_ticks += 1;
+        if c.window_ticks >= rate {
+            for i in 0..3 {
+                c.sent_per_s[i] = c.sent[i] - c.window_start_sent[i];
+                c.received_per_s[i] = c.received[i] - c.window_start_received[i];
+            }
+            c.window_start_sent = c.sent;
+            c.window_start_received = c.received;
+            c.poll_ms_avg = c.poll_us_window as f64 / 1000.0 / f64::from(c.window_ticks);
+            c.poll_us_window = 0;
+            c.window_ticks = 0;
+        }
+    }
+
+    fn effective_budget(&self) -> u32 {
+        if self.budget_bytes_per_s > 0 {
+            self.budget_bytes_per_s as u32
+        } else {
+            profiles::budget_bytes_per_s()
+        }
+    }
+
+    pub fn effective_cold_poll(&self) -> u32 {
+        if self.cold_poll_ticks > 0 {
+            self.cold_poll_ticks as u32
+        } else {
+            profiles::cold_poll_ticks()
+        }
+    }
+
+    pub fn debug_perturb_property(&self) -> String {
+        self.debug_perturb_property.to_string()
     }
 
     /// The session's generation (a new one per `start()`).
@@ -595,6 +800,11 @@ impl NetSession {
             }
         }
         let managers = self.managers();
+        let updates: Vec<StateUpdate> = self
+            .core
+            .as_mut()
+            .map(|c| c.drain_state_updates())
+            .unwrap_or_default();
         if managers.is_empty() && events.is_empty() {
             return;
         }
@@ -623,11 +833,23 @@ impl NetSession {
             }
         }
         self.unrouted = keep;
+        let mut states: HashMap<u64, Vec<StateUpdate>> = HashMap::new();
+        if let Some(core) = self.core.as_ref() {
+            for u in updates {
+                if let Some(r) = core.entities().get(u.id) {
+                    states.entry(r.parent.manager).or_default().push(u);
+                }
+            }
+        }
         let me = self.to_gd();
         let _guard = self.base_mut();
         for (key, mut m) in managers {
             let evs = routed.remove(&key).unwrap_or_default();
+            let sts = states.remove(&key).unwrap_or_default();
             m.bind_mut().sync(me.clone(), key, evs);
+            if !sts.is_empty() {
+                m.bind_mut().apply_states(sts);
+            }
         }
     }
 

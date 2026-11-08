@@ -22,16 +22,25 @@
 //! instances, exist on both peers).
 //!
 //! Re-entrancy: every call out into the engine that may run user code (instantiate, `add_child`,
-//! `queue_free`, the `_net_*` calls, signal emits) holds `self.base_mut()`; core access goes through short
-//! `session.bind_mut().with_core(...)` borrows.
+//! `queue_free`, the `_net_*` calls, signal emits, property reads and writes) holds `self.base_mut()`;
+//! core access goes through short `session.bind_mut().with_core(...)` borrows.
+//!
+//! State (WP3): each entity gets its scene's property table (infer.rs) when it is spawned or applied;
+//! the server reads its parts' properties for the `Create` and then every tick in `record()` (called by
+//! the session's post-tick hook); a client applies a `Create`'s initial state after `add_child` and
+//! before `_net_spawned`, and snapshot values in `apply_states()`. RigidBody parts of a client's replica
+//! are frozen once.
 
+use crate::apply;
 use crate::entity_node::NetEntity;
+use crate::infer::{self, RuntimeProps};
 use crate::parts::{self, SceneInfo};
+use crate::profiles::{self, NetProfiles, Profiles};
 use crate::session::NetSession;
 use godot::classes::{Engine, INode, Node, SceneTree};
 use godot::prelude::*;
 use netcore::session::EntityEvent;
-use netcore::{NetId, ParentRef, Spawn, MANAGER_ROOT};
+use netcore::{NetId, ParentRef, Spawn, StateUpdate, Value, MANAGER_ROOT};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -45,6 +54,13 @@ pub const META_REPLICA: &str = "_net_replica";
 pub const META_MANAGER: &str = "_net_manager";
 /// Meta read at enrolment for the owner when the entity has no `NetEntity` (`Net.spawn_for`).
 pub const META_OWNER: &str = "_net_owner";
+/// Meta on an entity root: its priority set by `Net.configure(node, {"priority": p})`.
+pub const META_PRIORITY: &str = "_net_priority";
+
+/// One recorded part: (entity, part index, (field index, value)...).
+pub type Recorded = (NetId, u16, Vec<(u16, Value)>);
+
+type PartNodes = Rc<Vec<Option<Gd<Node>>>>;
 
 /// Who may spawn entities under a manager.
 #[derive(GodotConvert, Var, Export, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -80,6 +96,29 @@ struct Entry {
     owner_dirty: bool,
     /// A parent that cannot be announced was reported once.
     reported: bool,
+    /// WP3: the scene's property table with cached accessors, and the part nodes.
+    props: Option<Rc<RuntimeProps>>,
+    nodes: PartNodes,
+    /// Poll the cold properties at the next record (`mark_cold_dirty`).
+    cold_force: bool,
+}
+
+impl Entry {
+    fn new(scene: Rc<SceneInfo>, owner: u32, origin: Origin) -> Self {
+        Self {
+            id: None,
+            scene,
+            owner,
+            origin,
+            parent: None,
+            dirty: false,
+            owner_dirty: false,
+            reported: false,
+            props: None,
+            nodes: Rc::new(Vec::new()),
+            cold_force: false,
+        }
+    }
 }
 
 #[derive(GodotClass)]
@@ -93,6 +132,12 @@ pub struct NetManager {
     /// they sit in (a `NetEntity` child does the same per instance).
     #[export]
     split_scenes: PackedStringArray,
+    /// Profiles laid over the global ones for this manager's entities (3.1).
+    #[export]
+    #[var(get = get_profiles, set = set_profiles)]
+    profiles: Option<Gd<NetProfiles>>,
+    profiles_cache: Option<(usize, Rc<Profiles>)>,
+    runtime: HashMap<usize, Rc<RuntimeProps>>,
     /// Spawned entities under this manager (read only).
     #[var(get = get_entities, no_set)]
     #[allow(dead_code)]
@@ -173,6 +218,17 @@ impl NetManager {
     fn entity_despawning(node: Gd<Node>);
     #[signal]
     fn spawn_refused(node: Gd<Node>);
+
+    #[func]
+    fn get_profiles(&self) -> Option<Gd<NetProfiles>> {
+        self.profiles.clone()
+    }
+
+    #[func]
+    fn set_profiles(&mut self, p: Option<Gd<NetProfiles>>) {
+        self.profiles = p;
+        self.profiles_cache = None;
+    }
 
     #[func]
     fn get_entities(&self) -> i64 {
@@ -331,19 +387,7 @@ impl NetManager {
         };
         let owner = owner_of(&node);
         let iid = node.instance_id();
-        self.entries.insert(
-            iid,
-            Entry {
-                id: None,
-                scene,
-                owner,
-                origin,
-                parent: None,
-                dirty: false,
-                owner_dirty: false,
-                reported: false,
-            },
-        );
+        self.entries.insert(iid, Entry::new(scene, owner, origin));
         self.order.push(iid);
         let mut n = node;
         n.set_meta(
@@ -628,19 +672,10 @@ impl NetManager {
                         e.parent = Some(create.parent);
                     }
                 } else {
-                    self.entries.insert(
-                        iid,
-                        Entry {
-                            id: Some(create.id),
-                            scene: scene.clone(),
-                            owner: create.owner,
-                            origin: Origin::Remote,
-                            parent: Some(create.parent),
-                            dirty: false,
-                            owner_dirty: false,
-                            reported: false,
-                        },
-                    );
+                    let mut entry = Entry::new(scene.clone(), create.owner, Origin::Remote);
+                    entry.id = Some(create.id);
+                    entry.parent = Some(create.parent);
+                    self.entries.insert(iid, entry);
                     self.order.push(iid);
                     let mut n = node.clone();
                     n.set_meta(
@@ -661,6 +696,31 @@ impl NetManager {
                         create.name,
                         node.get_name()
                     );
+                }
+                // WP3: the scene's property table, then the initial state, before _net_spawned.
+                let rt = self.props_for(&node, &scene, session);
+                if !session.bind().is_connected() {
+                    return; // the property tables differ: the session ended naming them
+                }
+                let nodes = part_node_list(&scene, &node);
+                if let Some(e) = self.entries.get_mut(&iid) {
+                    e.props = rt.clone();
+                    e.nodes = nodes.clone();
+                }
+                if let Some(rt) = &rt {
+                    let mut s = session.clone();
+                    let values = s
+                        .bind_mut()
+                        .with_core(|c, _| c.decode_state(create.scene_hash, &create.initial_state))
+                        .flatten();
+                    let writes = state_writes(rt, &nodes, values.unwrap_or_default());
+                    let _guard = self.base_mut();
+                    for (n, f, v) in writes {
+                        apply::write(&n, &f, &v);
+                    }
+                }
+                if !self.is_server {
+                    freeze_bodies(&nodes);
                 }
                 if proposal {
                     let mut s = session.clone();
@@ -850,19 +910,39 @@ impl NetManager {
             };
             let owner = self.entries[&iid].owner;
             let name = node.get_name().to_string();
-            let result = s.bind_mut().with_core(|c, now| {
+            // WP3: the property table and every part's values travel with the create.
+            s.bind_mut().with_core(|c, _| {
                 c.register_scene(&scene.path, scene.parts_hash.wrapping_add(salt));
-                c.spawn(
-                    &scene.path,
-                    Spawn::new(parent, &name, owner, scene.part_count(), Vec::new()),
-                    now,
-                )
+            });
+            let rt = self.props_for(&node, &scene, session);
+            if !s.bind().is_connected() {
+                return;
+            }
+            let nodes = part_node_list(&scene, &node);
+            let values = rt.as_ref().map(|rt| {
+                let _guard = self.base_mut();
+                read_all(rt, &nodes)
+            });
+            let priority = priority_of(&node);
+            let result = s.bind_mut().with_core(|c, now| {
+                let spec = Spawn::new(parent, &name, owner, scene.part_count(), Vec::new());
+                let spec = match values {
+                    Some(v) => spec.with_values(v),
+                    None => spec,
+                };
+                let r = c.spawn(&scene.path, spec, now);
+                if let Ok(id) = r {
+                    c.set_entity_priority(id, priority);
+                }
+                r
             });
             match result {
                 Some(Ok(id)) => {
                     if let Some(e) = self.entries.get_mut(&iid) {
                         e.id = Some(id);
                         e.parent = Some(parent);
+                        e.props = rt.clone();
+                        e.nodes = nodes.clone();
                     }
                     self.by_id.insert(id, iid);
                     set_net_entity(&node, Some(owner), Some(id));
@@ -875,6 +955,156 @@ impl NetManager {
                 }
                 None => {}
             }
+        }
+    }
+
+    /// The global profiles with this manager's override on top.
+    fn effective_profiles(&mut self) -> Rc<Profiles> {
+        let global = profiles::global_profiles();
+        let key = Rc::as_ptr(&global) as usize;
+        if let Some((k, p)) = &self.profiles_cache {
+            if *k == key {
+                return p.clone();
+            }
+        }
+        let p = match &self.profiles {
+            Some(over) => {
+                let mut merged = (*global).clone();
+                merged.merge(&over.bind().parsed());
+                Rc::new(merged)
+            }
+            None => global,
+        };
+        self.profiles_cache = Some((key, p.clone()));
+        p
+    }
+
+    /// The property table of `node`'s scene (derived once per scene), registered with the session so
+    /// netcore can pack it and compare it with the peers'.
+    fn props_for(
+        &mut self,
+        node: &Gd<Node>,
+        scene: &SceneInfo,
+        session: &Gd<NetSession>,
+    ) -> Option<Rc<RuntimeProps>> {
+        let profiles = self.effective_profiles();
+        let perturb = session.bind().debug_perturb_property();
+        let inferred = infer::derive(
+            node,
+            scene,
+            &profiles,
+            &perturb,
+            crate::session::tick_rate(),
+        );
+        let key = Rc::as_ptr(&inferred) as usize;
+        let rt = self
+            .runtime
+            .entry(key)
+            .or_insert_with(|| Rc::new(RuntimeProps::new(inferred.clone())))
+            .clone();
+        let mut s = session.clone();
+        s.bind_mut().with_core(|c, _| {
+            if c.props(netcore::entity::scene_hash(&scene.path)) != Some(&inferred.table) {
+                c.register_props(
+                    &scene.path,
+                    inferred.table.clone(),
+                    inferred.part_names.clone(),
+                );
+            }
+        });
+        Some(rt)
+    }
+
+    /// 2.2 step 5 on the server: reads the hot properties of every spawned entity, and the cold ones
+    /// when due (every `cold` ticks, staggered by id, or right after `mark_cold_dirty`).
+    pub fn record(&mut self, tick: u64, cold: u32, out: &mut Vec<Recorded>) {
+        if !self.online || !self.is_server {
+            return;
+        }
+        let cold = u64::from(cold.max(1));
+        let mut work: Vec<(NetId, Rc<RuntimeProps>, PartNodes, bool)> = Vec::new();
+        for iid in &self.order {
+            let Some(e) = self.entries.get_mut(iid) else {
+                continue;
+            };
+            let (Some(id), Some(rt)) = (e.id, e.props.clone()) else {
+                continue;
+            };
+            let due = e.cold_force || (tick + u64::from(id)).is_multiple_of(cold);
+            e.cold_force = false;
+            work.push((id, rt, e.nodes.clone(), due));
+        }
+        let _guard = self.base_mut();
+        for (id, rt, nodes, cold_due) in work {
+            for (p, node) in nodes.iter().enumerate() {
+                let Some(node) = node else {
+                    continue;
+                };
+                if !node.is_instance_valid() {
+                    continue;
+                }
+                let hot = &rt.hot[p];
+                let colds = if cold_due { rt.cold[p].as_slice() } else { &[] };
+                if hot.is_empty() && colds.is_empty() {
+                    continue;
+                }
+                let mut vals = Vec::with_capacity(hot.len() + colds.len());
+                for &f in hot.iter().chain(colds) {
+                    vals.push((f, apply::read(node, &rt.fields[p][usize::from(f)])));
+                }
+                out.push((id, p as u16, vals));
+            }
+        }
+    }
+
+    /// Applies snapshot values to replicas (snapping; interpolation is WP5). Entities this peer spawned
+    /// itself keep their own state.
+    pub fn apply_states(&mut self, updates: Vec<StateUpdate>) {
+        let mut writes = Vec::new();
+        for u in updates {
+            let Some(e) = self.by_id.get(&u.id).and_then(|i| self.entries.get(i)) else {
+                continue;
+            };
+            if e.origin == Origin::Local {
+                continue;
+            }
+            let Some(rt) = e.props.as_ref() else {
+                continue;
+            };
+            let Some(Some(node)) = e.nodes.get(usize::from(u.part)) else {
+                continue;
+            };
+            let Some(f) = rt
+                .fields
+                .get(usize::from(u.part))
+                .and_then(|p| p.get(usize::from(u.field)))
+            else {
+                continue;
+            };
+            writes.push((node.clone(), f.clone(), u.value));
+        }
+        let _guard = self.base_mut();
+        for (n, f, v) in writes {
+            if n.is_instance_valid() {
+                apply::write(&n, &f, &v);
+            }
+        }
+    }
+
+    /// The hook WP6's `Net.sync` will call: poll the entity's cold properties at the next record.
+    #[allow(dead_code)]
+    pub fn mark_cold_dirty(&mut self, root: &Gd<Node>) {
+        if let Some(e) = self.entries.get_mut(&root.instance_id()) {
+            e.cold_force = true;
+        }
+    }
+
+    /// `Net.configure(node, {"priority": p})` on an enrolled entity: applied at once on the server.
+    pub fn set_priority(&mut self, root: &Gd<Node>, priority: f32) {
+        let id = self.entries.get(&root.instance_id()).and_then(|e| e.id);
+        if let (Some(id), Some(mut s)) = (id, self.session()) {
+            s.bind_mut()
+                .with_core(|c, _| c.set_entity_priority(id, priority));
         }
     }
 
@@ -969,4 +1199,62 @@ pub fn entity_root_of(node: &Gd<Node>) -> Option<(Gd<Node>, Gd<NetManager>)> {
         cur = n.get_parent();
     }
     None
+}
+
+/// Every part node of an entity, by part index (None for a part that is missing).
+fn part_node_list(scene: &SceneInfo, root: &Gd<Node>) -> PartNodes {
+    Rc::new(
+        (0..scene.part_count())
+            .map(|i| scene.part_node(root, i))
+            .collect(),
+    )
+}
+
+/// Every field of every part, in table order (for a `Create`).
+fn read_all(rt: &RuntimeProps, nodes: &[Option<Gd<Node>>]) -> Vec<Vec<Value>> {
+    rt.fields
+        .iter()
+        .enumerate()
+        .map(|(p, fields)| match nodes.get(p) {
+            Some(Some(n)) => fields.iter().map(|f| apply::read(n, f)).collect(),
+            _ => fields.iter().map(|_| Value::Nil).collect(),
+        })
+        .collect()
+}
+
+/// The writes a decoded state asks for.
+fn state_writes(
+    rt: &RuntimeProps,
+    nodes: &[Option<Gd<Node>>],
+    values: Vec<(u16, u16, Value)>,
+) -> Vec<(Gd<Node>, crate::infer::RtField, Value)> {
+    values
+        .into_iter()
+        .filter_map(|(p, f, v)| {
+            let node = nodes.get(usize::from(p))?.clone()?;
+            let field = rt.fields.get(usize::from(p))?.get(usize::from(f))?.clone();
+            Some((node, field, v))
+        })
+        .collect()
+}
+
+/// Replicas never simulate bodies (2.5): RigidBody parts are frozen once.
+fn freeze_bodies(nodes: &[Option<Gd<Node>>]) {
+    for n in nodes.iter().flatten() {
+        let is_body = n.is_class("RigidBody2D") || n.is_class("RigidBody3D");
+        if is_body {
+            let mut n = n.clone();
+            n.set("freeze", &true.to_variant());
+        }
+    }
+}
+
+/// An entity's priority: `Net.configure(node, {"priority": p})`, else its `NetEntity`'s, else 1.
+pub fn priority_of(root: &Gd<Node>) -> f32 {
+    if root.has_meta(META_PRIORITY) {
+        if let Some(p) = profiles::number(&root.get_meta(META_PRIORITY)) {
+            return p as f32;
+        }
+    }
+    net_entity_of(root).map_or(1.0, |ne| ne.bind().get_priority() as f32)
 }

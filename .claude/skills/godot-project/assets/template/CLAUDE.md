@@ -58,6 +58,7 @@ Never say a change works without a passing check. If you cannot run Godot
 - Any `ERROR`/`SCRIPT ERROR` printed while a test runs fails it. Set
   `allow_errors = true` in a test that deliberately triggers one.
 - Run without `check.py`: `godot --headless --path . -s tests/framework/runner.gd -- --filter=name --verbose`.
+  With `--verbose` a passing test's `print()` output is shown too (use it for measurements and benchmarks).
 
 ## Design for testability
 

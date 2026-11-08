@@ -1,0 +1,35 @@
+[gd_scene format=3]
+
+[node name="Bench" type="Node2D"]
+
+[node name="NetEntity" type="NetEntity" parent="."]
+state_properties = Array[NodePath]([NodePath("position"), NodePath("rotation"), NodePath("scale"), NodePath("skew"), NodePath("modulate"), NodePath("self_modulate"), NodePath("z_index"), NodePath("visible")])
+state_options = {
+"modulate": {
+"schedule": "hot"
+},
+"position": {
+"schedule": "hot"
+},
+"rotation": {
+"quantize": "deg",
+"schedule": "hot"
+},
+"scale": {
+"quantize": "f16",
+"schedule": "hot"
+},
+"self_modulate": {
+"schedule": "hot"
+},
+"skew": {
+"quantize": "deg",
+"schedule": "hot"
+},
+"visible": {
+"schedule": "hot"
+},
+"z_index": {
+"schedule": "hot"
+}
+}

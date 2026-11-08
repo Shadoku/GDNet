@@ -6,12 +6,17 @@ use godot::init::InitStage;
 use godot::prelude::*;
 
 mod api_ext;
+mod apply;
+mod configure;
 mod emulation;
 mod entity_node;
+mod infer;
 mod manager;
 mod net;
 mod parts;
 mod pipe_peer;
+mod poll;
+mod profiles;
 mod session;
 mod version;
 

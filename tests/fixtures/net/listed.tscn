@@ -1,0 +1,18 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/fixtures/net/state_probe.gd" id="1_probe"]
+
+[node name="Listed" type="Node2D"]
+script = ExtResource("1_probe")
+
+[node name="NetEntity" type="NetEntity" parent="."]
+state_properties = Array[NodePath]([NodePath("position"), NodePath("Sprite:frame")])
+state_options = {
+"position": {
+"quantize": "cm",
+"schedule": "hot"
+}
+}
+
+[node name="Sprite" type="Sprite2D" parent="."]
+hframes = 4

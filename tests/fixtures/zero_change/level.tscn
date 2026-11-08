@@ -1,0 +1,110 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/fixtures/zero_change/player.gd" id="1_foqfs"]
+[ext_resource type="Script" path="res://tests/fixtures/zero_change/stats.gd" id="2_lg52e"]
+
+[sub_resource type="PlaceholderTexture2D" id="PlaceholderTexture2D_mnw75"]
+size = Vector2(16, 16)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_wbquw"]
+animations = [{
+"frames": [],
+"loop": true,
+"name": &"default",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("PlaceholderTexture2D_mnw75")
+}, {
+"duration": 1.0,
+"texture": SubResource("PlaceholderTexture2D_mnw75")
+}],
+"loop": true,
+"name": &"idle",
+"speed": 2.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("PlaceholderTexture2D_mnw75")
+}, {
+"duration": 1.0,
+"texture": SubResource("PlaceholderTexture2D_mnw75")
+}, {
+"duration": 1.0,
+"texture": SubResource("PlaceholderTexture2D_mnw75")
+}, {
+"duration": 1.0,
+"texture": SubResource("PlaceholderTexture2D_mnw75")
+}],
+"loop": true,
+"name": &"walk",
+"speed": 4.0
+}]
+
+[sub_resource type="CircleShape2D" id="CircleShape2D_y42uh"]
+radius = 8.0
+
+[sub_resource type="Animation" id="Animation_odt7g"]
+length = 2.0
+loop_mode = 1
+tracks/0/type = "value"
+tracks/0/imported = false
+tracks/0/enabled = true
+tracks/0/path = NodePath(".:position")
+tracks/0/interp = 1
+tracks/0/loop_wrap = true
+tracks/0/keys = {
+"times": PackedFloat32Array(0, 1, 2),
+"transitions": PackedFloat32Array(1, 1, 1),
+"update": 0,
+"values": [Vector2(200, 300), Vector2(400, 300), Vector2(200, 300)]
+}
+
+[sub_resource type="AnimationLibrary" id="AnimationLibrary_fbgc7"]
+_data = {
+&"slide": SubResource("Animation_odt7g")
+}
+
+[sub_resource type="CircleShape2D" id="CircleShape2D_nv5ly"]
+
+[sub_resource type="WorldBoundaryShape2D" id="WorldBoundaryShape2D_wt32g"]
+
+[node name="Level" type="Node2D" unique_id=1751511530]
+
+[node name="Player" type="CharacterBody2D" parent="." unique_id=1394389171]
+position = Vector2(300, 100)
+script = ExtResource("1_foqfs")
+
+[node name="Sprite" type="AnimatedSprite2D" parent="Player" unique_id=814282834]
+sprite_frames = SubResource("SpriteFrames_wbquw")
+animation = &"walk"
+autoplay = "walk"
+
+[node name="Shape" type="CollisionShape2D" parent="Player" unique_id=1541531252]
+shape = SubResource("CircleShape2D_y42uh")
+
+[node name="Platform" type="Node2D" parent="." unique_id=2061464101]
+position = Vector2(200, 300)
+
+[node name="Anim" type="AnimationPlayer" parent="Platform" unique_id=1816798672]
+libraries/ = SubResource("AnimationLibrary_fbgc7")
+autoplay = &"slide"
+
+[node name="Score" type="Label" parent="." unique_id=1389717941]
+text = "Score"
+
+[node name="Stats" type="Node2D" parent="." unique_id=303063150]
+script = ExtResource("2_lg52e")
+
+[node name="Ball" type="RigidBody2D" parent="." unique_id=380619266]
+position = Vector2(500, 300)
+
+[node name="Shape" type="CollisionShape2D" parent="Ball" unique_id=1308293020]
+shape = SubResource("CircleShape2D_nv5ly")
+
+[node name="Floor" type="StaticBody2D" parent="." unique_id=1449059588]
+position = Vector2(0, 500)
+
+[node name="Shape" type="CollisionShape2D" parent="Floor" unique_id=1617396391]
+shape = SubResource("WorldBoundaryShape2D_wt32g")

@@ -14,10 +14,20 @@
 //! `net_id`, and the signals `entity_spawned`, `entity_despawning`, `spawn_refused` (relayed from the
 //! default session). The node-taking calls work for any branch: they find the node's `NetManager`, so
 //! they serve fixture branches as well as the default session.
+//!
+//! WP3: `configure(node, Dictionary)` (configure.rs), and the properties `profiles` (laid over the
+//! shipped defaults and `gdnet/sync/profiles`), `cold_poll_ticks` and `budget_bytes_per_s` (0 = the
+//! project settings `gdnet/sync/cold_poll_ticks`, `gdnet/budget/bytes_per_second`). Sessions read them
+//! when they start. `Net` is a `tool` class: it is created in the editor too (the singleton is registered
+//! at the scene init stage), which gdext's v0.6 placeholder migration requires to be explicit.
 
+use crate::configure::{self, Op};
 use crate::emulation::NetEmulation;
-use crate::manager::{entity_root_of, net_entity_of, NetManager, LOCAL_GROUP, META_OWNER};
+use crate::manager::{
+    entity_root_of, net_entity_of, NetManager, LOCAL_GROUP, META_OWNER, META_PRIORITY,
+};
 use crate::pipe_peer::NetPipePeer;
+use crate::profiles::{self, NetProfiles};
 use crate::session::{tick_rate, NetSession};
 use godot::classes::node::InternalMode;
 use godot::classes::{ENetMultiplayerPeer, Engine, MultiplayerPeer, Node, PackedScene, SceneTree};
@@ -28,6 +38,21 @@ use godot::prelude::*;
 pub const SESSION_NODE: &str = "__NetSession";
 /// Name of the manager `Net.manage(node)` adds under `node`.
 pub const MANAGED_NODE: &str = "__NetManaged";
+/// Meta on an entity root: `Net.configure()` options later packages read (radius, ...).
+pub const META_CONFIG: &str = "_net_config";
+
+/// The scene instance root `node` belongs to (itself or the nearest ancestor with a scene file), or
+/// `node` itself for a bare node.
+fn scene_root_of(node: &Gd<Node>) -> Gd<Node> {
+    let mut cur = Some(node.clone());
+    while let Some(n) = cur {
+        if !n.get_scene_file_path().is_empty() {
+            return n;
+        }
+        cur = n.get_parent();
+    }
+    node.clone()
+}
 
 const RELAYED: [(&str, &str); 8] = [
     ("peer_joined", "_on_peer_joined"),
@@ -41,7 +66,7 @@ const RELAYED: [(&str, &str); 8] = [
 ];
 
 #[derive(GodotClass)]
-#[class(init, base = Object)]
+#[class(tool, init, base = Object)]
 pub struct Net {
     base: Base<Object>,
     session: Option<Gd<NetSession>>,
@@ -57,6 +82,15 @@ pub struct Net {
     shutdown_hooked: bool,
     #[var(rename = _debug_protocol_salt, get = get_debug_protocol_salt, set = set_debug_protocol_salt)]
     debug_protocol_salt: i64,
+    /// Profiles laid over the shipped defaults and the `gdnet/sync/profiles` resource (WP3).
+    #[var(get = get_profiles, set = set_profiles)]
+    profiles: Option<Gd<NetProfiles>>,
+    /// Cold properties are polled every this many ticks (0 = `gdnet/sync/cold_poll_ticks`, default 6).
+    #[var(get = get_cold_poll_ticks, set = set_cold_poll_ticks)]
+    cold_poll_ticks: i64,
+    /// Snapshot bytes per second per peer (0 = `gdnet/budget/bytes_per_second`, default 32,768).
+    #[var(get = get_budget_bytes_per_s, set = set_budget_bytes_per_s)]
+    budget_bytes_per_s: i64,
 }
 
 #[godot_api]
@@ -69,6 +103,155 @@ impl Net {
     #[func]
     fn set_debug_protocol_salt(&mut self, salt: i64) {
         self.debug_protocol_salt = salt;
+    }
+
+    #[func]
+    fn get_profiles(&self) -> Option<Gd<NetProfiles>> {
+        self.profiles.clone()
+    }
+
+    #[func]
+    fn set_profiles(&mut self, p: Option<Gd<NetProfiles>>) {
+        profiles::set_net_profiles(p.as_ref().map(|r| r.bind().parsed()));
+        self.profiles = p;
+    }
+
+    #[func]
+    fn get_cold_poll_ticks(&self) -> i64 {
+        i64::from(profiles::cold_poll_ticks())
+    }
+
+    #[func]
+    fn set_cold_poll_ticks(&mut self, v: i64) {
+        self.cold_poll_ticks = v.max(0);
+        profiles::set_cold_poll_ticks((v > 0).then_some(v as u32));
+    }
+
+    #[func]
+    fn get_budget_bytes_per_s(&self) -> i64 {
+        i64::from(profiles::budget_bytes_per_s())
+    }
+
+    #[func]
+    fn set_budget_bytes_per_s(&mut self, v: i64) {
+        self.budget_bytes_per_s = v.max(0);
+        profiles::set_budget((v > 0).then_some(v as u32));
+    }
+
+    /// Corrects what the entity `node` belongs to replicates (rung 3): `state: ["+prop", "-prop"]`,
+    /// `quantize: {prop: "cm"}`, `send: {prop: "hot"}`, `tolerance`, `interpolate` change the property
+    /// table of the entity's scene and must be made before that scene's first spawn on this peer, the
+    /// same way on every peer; `priority` applies to this entity at any time. Paths are `prop` or
+    /// `Part:prop`, relative to `node`.
+    #[func]
+    fn configure(&mut self, node: Gd<Node>, options: VarDictionary) {
+        let (root, manager) = match entity_root_of(&node) {
+            Some((r, m)) => (r, Some(m)),
+            None => (scene_root_of(&node), None),
+        };
+        let scene = root.get_scene_file_path().to_string();
+        let key = if scene.is_empty() {
+            root.get_class().to_string()
+        } else {
+            scene
+        };
+        let prefix = if root == node {
+            String::new()
+        } else {
+            root.get_path_to(&node).to_string()
+        };
+        let path = |t: &str| configure::parse_path(t, &prefix);
+        let mut ops = Vec::new();
+        let mut extra = VarDictionary::new();
+        for (k, v) in options.iter_shared() {
+            let k = k.to_string();
+            match k.as_str() {
+                "state" => {
+                    let Ok(list) = v.try_to::<VarArray>() else {
+                        godot_error!(
+                            "Net.configure: state must be an Array of \"+prop\" / \"-prop\""
+                        );
+                        continue;
+                    };
+                    for item in list.iter_shared() {
+                        let t = item.to_string();
+                        if let Some(rest) = t.strip_prefix('-') {
+                            ops.push(Op::Remove(path(rest)));
+                        } else {
+                            ops.push(Op::Add(path(t.trim_start_matches('+'))));
+                        }
+                    }
+                }
+                "quantize" | "send" | "schedule" => {
+                    let Ok(d) = v.try_to::<VarDictionary>() else {
+                        godot_error!("Net.configure: {k} must be a Dictionary of property: value");
+                        continue;
+                    };
+                    for (p, q) in d.iter_shared() {
+                        let (p, q) = (p.to_string(), q.to_string());
+                        let op = if k == "quantize" {
+                            netcore::Quant::parse(&q).map(|q| Op::Quantize(path(&p), q))
+                        } else {
+                            netcore::Schedule::parse(&q).map(|s| Op::Send(path(&p), s))
+                        };
+                        match op {
+                            Some(op) => ops.push(op),
+                            None => godot_error!("Net.configure: {k} {q:?} for {p} is not known"),
+                        }
+                    }
+                }
+                "tolerance" => match profiles::number(&v) {
+                    Some(t) => ops.push(Op::Tolerance(None, t as f32)),
+                    None => {
+                        if let Ok(d) = v.try_to::<VarDictionary>() {
+                            for (p, t) in d.iter_shared() {
+                                let t = profiles::number(&t).unwrap_or(0.0) as f32;
+                                ops.push(Op::Tolerance(Some(path(&p.to_string())), t));
+                            }
+                        }
+                    }
+                },
+                "interpolate" => match v.try_to::<bool>() {
+                    Ok(b) => ops.push(Op::Interpolate(None, b)),
+                    Err(_) => {
+                        if let Ok(d) = v.try_to::<VarDictionary>() {
+                            for (p, b) in d.iter_shared() {
+                                let b = b.try_to::<bool>().unwrap_or(false);
+                                ops.push(Op::Interpolate(Some(path(&p.to_string())), b));
+                            }
+                        }
+                    }
+                },
+                "priority" => {
+                    let p = profiles::number(&v).unwrap_or(1.0);
+                    let mut r = root.clone();
+                    r.set_meta(META_PRIORITY, &p.to_variant());
+                    if let Some(mut m) = manager.clone() {
+                        m.bind_mut().set_priority(&root, p as f32);
+                    }
+                }
+                _ => {
+                    extra.set(k.as_str(), &v);
+                }
+            }
+        }
+        if let Err(e) = configure::add_ops(&key, ops) {
+            godot_error!("{e}");
+        }
+        if !extra.is_empty() {
+            let mut r = root.clone();
+            let mut stored = if r.has_meta(META_CONFIG) {
+                r.get_meta(META_CONFIG)
+                    .try_to::<VarDictionary>()
+                    .unwrap_or_default()
+            } else {
+                VarDictionary::new()
+            };
+            for (k, v) in extra.iter_shared() {
+                stored.set(&k, &v);
+            }
+            r.set_meta(META_CONFIG, &stored.to_variant());
+        }
     }
 
     #[signal]

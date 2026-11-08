@@ -124,8 +124,9 @@ func _report(inner_code: int) -> void:
 			if r.status != "pass":
 				for e in r.errors:
 					print("    " + _strip_runner_frames(e).replace("\n", "\n    "))
-				for o in r.output:
-					print("    | " + o)
+			# A failing test's output always; a passing one's with --verbose (measurements, benchmarks).
+			for o in r.output:
+				print("    | " + o)
 	for e in _orphan_errors:
 		print("[ERROR] outside any test:")
 		print("    " + e.replace("\n", "\n    "))

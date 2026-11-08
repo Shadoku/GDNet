@@ -76,10 +76,14 @@ Never say a change works without a passing check. If you cannot run Godot
 - Any `ERROR`/`SCRIPT ERROR` printed while a test runs fails it. Set
   `allow_errors = true` in a test that deliberately triggers one.
 - Run without `check.py`: `godot --headless --path . -s tests/framework/runner.gd -- --filter=name --verbose`.
+  With `--verbose` a passing test's `print()` output is shown too (use it for measurements and benchmarks).
 - Networked behaviour: `NetFixture.new(self, n_clients)`, `start()`, `await wait_connected()`, then
   `teardown()` in `after_each`; never real sockets except the single ENet test. The per-tick signal
   is `ticked` (`Net.tick()` is the method). Entities: `net.add_managers()` puts a `NetManager` at the
   same path in every branch; spawn under the server's, assert on the clients' (`test_net_entities.gd`).
+  State: change properties on the server, `wait_until` the client's copy matches; bandwidth and polling
+  cost come from `NetSession.stats()` (`test_net_state.gd`). Gate G7's plain scene is
+  `tests/fixtures/zero_change/`: keep its scripts free of `Net.` (a test checks).
 
 ## Design for testability
 

@@ -1,0 +1,257 @@
+[gd_resource type="NetProfiles" format=3]
+
+[resource]
+classes = {
+"AnimatedSprite2D": [{
+"name": "animation",
+"schedule": "cold"
+}, {
+"name": "frame",
+"schedule": "cold"
+}, {
+"name": "flip_h",
+"schedule": "cold"
+}, {
+"name": "flip_v",
+"schedule": "cold"
+}, {
+"name": "speed_scale",
+"schedule": "cold"
+}, {
+"name": "playing",
+"schedule": "cold"
+}],
+"AnimatedSprite3D": [{
+"name": "animation",
+"schedule": "cold"
+}, {
+"name": "frame",
+"schedule": "cold"
+}, {
+"name": "flip_h",
+"schedule": "cold"
+}, {
+"name": "flip_v",
+"schedule": "cold"
+}, {
+"name": "speed_scale",
+"schedule": "cold"
+}, {
+"name": "playing",
+"schedule": "cold"
+}],
+"AnimationPlayer": [{
+"name": "current_animation",
+"schedule": "cold"
+}, {
+"name": "speed_scale",
+"schedule": "cold"
+}, {
+"name": "current_animation_position",
+"poll_seconds": 1.0,
+"schedule": "cold"
+}],
+"AudioStreamPlayer": [],
+"AudioStreamPlayer2D": [],
+"AudioStreamPlayer3D": [],
+"CPUParticles2D": [{
+"name": "emitting",
+"schedule": "cold"
+}],
+"CPUParticles3D": [{
+"name": "emitting",
+"schedule": "cold"
+}],
+"Camera2D": [],
+"Camera3D": [],
+"CanvasItem": [{
+"name": "visible",
+"schedule": "cold"
+}, {
+"name": "modulate",
+"quantize": "f16",
+"schedule": "cold"
+}],
+"CharacterBody2D": [{
+"interpolate": false,
+"name": "velocity",
+"quantize": "mm",
+"schedule": "hot"
+}],
+"CharacterBody3D": [{
+"interpolate": false,
+"name": "velocity",
+"quantize": "mm",
+"schedule": "hot"
+}],
+"CollisionPolygon2D": [{
+"name": "disabled",
+"schedule": "cold"
+}],
+"CollisionPolygon3D": [{
+"name": "disabled",
+"schedule": "cold"
+}],
+"CollisionShape2D": [{
+"name": "disabled",
+"schedule": "cold"
+}],
+"CollisionShape3D": [{
+"name": "disabled",
+"schedule": "cold"
+}],
+"Control": [{
+"name": "visible",
+"schedule": "cold"
+}, {
+"name": "modulate",
+"quantize": "f16",
+"schedule": "cold"
+}],
+"GPUParticles2D": [{
+"name": "emitting",
+"schedule": "cold"
+}],
+"GPUParticles3D": [{
+"name": "emitting",
+"schedule": "cold"
+}],
+"Label": [{
+"name": "text",
+"schedule": "cold"
+}],
+"Light2D": [{
+"name": "energy",
+"schedule": "cold"
+}, {
+"name": "color",
+"quantize": "f16",
+"schedule": "cold"
+}, {
+"name": "enabled",
+"schedule": "cold"
+}],
+"Light3D": [{
+"name": "light_energy",
+"schedule": "cold"
+}, {
+"name": "light_color",
+"quantize": "f16",
+"schedule": "cold"
+}, {
+"name": "visible",
+"schedule": "cold"
+}],
+"Node2D": [{
+"interpolate": true,
+"name": "position",
+"quantize": "mm",
+"schedule": "hot"
+}, {
+"interpolate": true,
+"name": "rotation",
+"quantize": "deg",
+"schedule": "hot"
+}, {
+"interpolate": true,
+"name": "scale",
+"quantize": "f16",
+"schedule": "hot"
+}, {
+"name": "visible",
+"schedule": "cold"
+}, {
+"name": "modulate",
+"quantize": "f16",
+"schedule": "cold"
+}, {
+"name": "z_index",
+"schedule": "cold"
+}],
+"Node3D": [{
+"interpolate": true,
+"name": "position",
+"quantize": "mm",
+"schedule": "hot"
+}, {
+"interpolate": true,
+"name": "quaternion",
+"quantize": "smallest3",
+"schedule": "hot"
+}, {
+"interpolate": true,
+"name": "scale",
+"quantize": "f16",
+"schedule": "hot"
+}, {
+"name": "visible",
+"schedule": "cold"
+}],
+"RichTextLabel": [{
+"name": "text",
+"schedule": "cold"
+}],
+"RigidBody2D": [{
+"interpolate": false,
+"name": "linear_velocity",
+"quantize": "mm",
+"schedule": "hot"
+}, {
+"interpolate": false,
+"name": "angular_velocity",
+"quantize": "mm",
+"schedule": "hot"
+}],
+"RigidBody3D": [{
+"interpolate": false,
+"name": "linear_velocity",
+"quantize": "mm",
+"schedule": "hot"
+}, {
+"interpolate": false,
+"name": "angular_velocity",
+"quantize": "mm",
+"schedule": "hot"
+}],
+"Sprite2D": [{
+"name": "frame",
+"schedule": "cold"
+}, {
+"name": "flip_h",
+"schedule": "cold"
+}, {
+"name": "flip_v",
+"schedule": "cold"
+}, {
+"name": "texture",
+"schedule": "cold"
+}],
+"Sprite3D": [{
+"name": "frame",
+"schedule": "cold"
+}, {
+"name": "flip_h",
+"schedule": "cold"
+}, {
+"name": "flip_v",
+"schedule": "cold"
+}, {
+"name": "texture",
+"schedule": "cold"
+}],
+"TextureRect": [{
+"name": "frame",
+"schedule": "cold"
+}, {
+"name": "flip_h",
+"schedule": "cold"
+}, {
+"name": "flip_v",
+"schedule": "cold"
+}, {
+"name": "texture",
+"schedule": "cold"
+}],
+"Timer": [],
+"Tween": []
+}

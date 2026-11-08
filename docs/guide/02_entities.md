@@ -126,9 +126,8 @@ WP4, ownership transfer with WP7.
 
 A node a client adds before its session is connected counts as level content, not as a spawn.
 
-## Not synced yet
+## State
 
-This package makes spawning work. Between spawn and despawn nothing else replicates yet: positions,
-velocities, animation, visibility and exported variables come with WP3 (profiles and state replication),
-which fills the `Create`'s initial state too. A bare node therefore arrives as a default instance of its
-class.
+Between spawn and despawn the entity's properties replicate from inferred profiles: positions,
+velocities, animation, visibility, text and exported variables, and the `Create` carries every part's
+initial state, applied before `_net_spawned`. See [3. State](03_state.md).
