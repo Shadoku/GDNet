@@ -8,22 +8,31 @@
 //! WP1 modules: [`clock`] (tick clock, offset, RTT/jitter), [`peers`] (the peer table), [`wire`]
 //! (framing and the session messages), [`emul`] (the network emulator), [`session`] (the handshake and
 //! `Time` state machine). WP2: [`entity`] (the entity table, id ranges, part tables, `EntityAction`).
+//! WP3: [`props`] (property tables), [`quant`] (bit packing, quantisers), [`snapshot`] (the snapshot
+//! format), [`priority`] (accumulator and budget), [`delta`] (dirty tracking, acked baselines, packing).
 
 #![forbid(unsafe_code)]
 
 pub mod clock;
+pub mod delta;
 pub mod emul;
 pub mod entity;
 pub mod peers;
+pub mod priority;
+pub mod props;
+pub mod quant;
 pub mod session;
+pub mod snapshot;
 pub mod wire;
 
+pub use delta::{Ack, FieldMsg, ReplStats, Replication, StateUpdate};
 pub use emul::{EmulSettings, Emulator, Pcg32};
 pub use entity::{
     CreateAction, EntityAction, EntityRecord, EntityTable, NetId, ParentRef, PartTable,
     MANAGER_ROOT,
 };
 pub use peers::{PeerId, SERVER};
+pub use props::{PropDesc, Quant, ScenePropsTable, Schedule, TypeTag, Value};
 pub use session::{EntityEvent, Event, Outgoing, Role, Session, SessionConfig, Spawn};
 pub use wire::{Channel, Reliability};
 

@@ -2,6 +2,7 @@
 //! WP1 defines the session messages: `Hello` / `Welcome` / `Reject` (the handshake) and `Time`
 //! ping/pong. Later packages add kinds; a receiver that does not know a kind reports it as an error.
 
+use crate::delta::{Ack, FieldMsg};
 use crate::entity::EntityAction;
 use serde::{Deserialize, Serialize};
 use std::string::String;
@@ -100,6 +101,12 @@ pub enum Message {
     Pong(Pong),
     /// WP2: an entity action (create, destroy, reparent, set owner, scene announcement).
     Entity(EntityAction),
+    /// WP3: a snapshot body (bit-packed, see snapshot.rs; not postcard).
+    Snapshot(Vec<u8>),
+    /// WP3: the receiver's acknowledgement of snapshots.
+    Ack(Ack),
+    /// WP3: one field sent reliably.
+    Field(FieldMsg),
 }
 
 /// The kind bytes. 0 is never used, so a zeroed buffer is not a message.
@@ -110,6 +117,18 @@ pub mod kind {
     pub const PING: u8 = 4;
     pub const PONG: u8 = 5;
     pub const ENTITY: u8 = 6;
+    pub const SNAPSHOT: u8 = 7;
+    pub const ACK: u8 = 8;
+    pub const FIELD: u8 = 9;
+}
+
+/// The channel a message of kind `k` travels on (for byte counters of received packets).
+pub fn channel_of_kind(k: u8) -> Channel {
+    match k {
+        kind::PING | kind::PONG => Channel::Diagnostics,
+        kind::SNAPSHOT | kind::ACK => Channel::Unreliable,
+        _ => Channel::Reliable,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,15 +158,21 @@ impl Message {
             Message::Ping(_) => kind::PING,
             Message::Pong(_) => kind::PONG,
             Message::Entity(_) => kind::ENTITY,
+            Message::Snapshot(_) => kind::SNAPSHOT,
+            Message::Ack(_) => kind::ACK,
+            Message::Field(_) => kind::FIELD,
         }
     }
 
     /// The channel this message travels on.
     pub fn channel(&self) -> Channel {
         match self {
-            Message::Hello(_) | Message::Welcome(_) | Message::Reject(_) | Message::Entity(_) => {
-                Channel::Reliable
-            }
+            Message::Hello(_)
+            | Message::Welcome(_)
+            | Message::Reject(_)
+            | Message::Entity(_)
+            | Message::Field(_) => Channel::Reliable,
+            Message::Snapshot(_) | Message::Ack(_) => Channel::Unreliable,
             Message::Ping(_) | Message::Pong(_) => Channel::Diagnostics,
         }
     }
@@ -169,6 +194,14 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         Message::Ping(m) => body(kind::PING, m),
         Message::Pong(m) => body(kind::PONG, m),
         Message::Entity(m) => body(kind::ENTITY, m),
+        Message::Snapshot(b) => {
+            let mut out = Vec::with_capacity(b.len() + 1);
+            out.push(kind::SNAPSHOT);
+            out.extend_from_slice(b);
+            out
+        }
+        Message::Ack(m) => body(kind::ACK, m),
+        Message::Field(m) => body(kind::FIELD, m),
     }
 }
 
@@ -186,6 +219,9 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         kind::PING => Message::Ping(parse(k, rest)?),
         kind::PONG => Message::Pong(parse(k, rest)?),
         kind::ENTITY => Message::Entity(parse(k, rest)?),
+        kind::SNAPSHOT => Message::Snapshot(rest.to_vec()),
+        kind::ACK => Message::Ack(parse(k, rest)?),
+        kind::FIELD => Message::Field(parse(k, rest)?),
         other => return Err(WireError::UnknownKind(other)),
     })
 }
@@ -205,6 +241,11 @@ impl Protocol {
     /// The WP1 protocol: netcore version, tick rate, and `salt` (0 normally; a test hook forces a
     /// mismatch with any other value).
     pub fn new(tick_rate: u32, salt: u64) -> Self {
+        Self::with_profiles(tick_rate, salt, 0)
+    }
+
+    /// WP3 (3.3): the protocol with the hash of the effective profiles (0 = none given).
+    pub fn with_profiles(tick_rate: u32, salt: u64, profiles_hash: u64) -> Self {
         let item = |name: &str, value: String| ProtocolItem {
             name: name.into(),
             value,
@@ -214,6 +255,7 @@ impl Protocol {
                 item("netcore version", crate::VERSION.into()),
                 item("tick rate", std::format!("{tick_rate}")),
                 item("protocol salt", std::format!("{salt}")),
+                item("profiles", std::format!("{profiles_hash:016x}")),
             ],
             scenes: Vec::new(),
         }
@@ -364,6 +406,9 @@ mod tests {
                 hash: 9,
                 path: "res://a.tscn".into(),
                 parts_hash: 77,
+                props: crate::props::ScenePropsTable::new(std::vec![std::vec![
+                    crate::props::PropDesc::new("position", crate::props::TypeTag::Vector2)
+                ]]),
             },
             EntityAction::Create(CreateAction {
                 id: 65_537,
@@ -382,6 +427,27 @@ mod tests {
             assert_eq!(msg.channel(), Channel::Reliable);
             roundtrip(msg);
         }
+        roundtrip(Message::Snapshot(std::vec![1, 2, 3]));
+        roundtrip(Message::Ack(Ack {
+            tick: 99,
+            history: 0xdead_beef,
+        }));
+        roundtrip(Message::Field(FieldMsg {
+            tick: 5,
+            id: 3,
+            part: 1,
+            field: 2,
+            bits: 9,
+            data: std::vec![1, 2],
+        }));
+        assert_eq!(channel_of_kind(kind::SNAPSHOT), Channel::Unreliable);
+        assert_eq!(channel_of_kind(kind::FIELD), Channel::Reliable);
+        assert_eq!(channel_of_kind(kind::PONG), Channel::Diagnostics);
+        let ack = encode(&Message::Ack(Ack {
+            tick: 600,
+            history: 0,
+        }));
+        assert!(ack.len() <= 5, "{} bytes", ack.len());
     }
 
     #[test]
@@ -493,7 +559,7 @@ mod tests {
         assert_eq!(
             a.mismatch(&p.items, p.hash(), "server", "client")
                 .as_deref(),
-            Some("protocol mismatch: protocol salt is missing on the client")
+            Some("protocol mismatch: profiles is missing on the client")
         );
     }
 }

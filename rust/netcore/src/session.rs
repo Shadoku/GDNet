@@ -19,11 +19,13 @@
 //! `now` is microseconds since any epoch, supplied by the caller.
 
 use crate::clock::TickClock;
+use crate::delta::{ReplStats, Replication, StateUpdate};
 use crate::emul::{EmulSettings, Emulator};
 use crate::entity::{
     CreateAction, EntityAction, EntityRecord, EntityTable, HeldQueue, IdAllocator, NetId, ParentRef,
 };
 use crate::peers::{PeerId, PeerTable, Stage, SERVER};
+use crate::props::{ScenePropsTable, Value};
 use crate::wire::{
     self, Hello, IdRange, Message, Ping, Pong, Protocol, Reject, Reliability, Welcome,
 };
@@ -99,6 +101,10 @@ pub enum EntityEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionConfig {
+    /// WP3 (3.3): a hash of the effective profiles, part of the `Hello` protocol items.
+    pub profiles_hash: u64,
+    /// WP3 (2.7): snapshot bytes per second per peer (0 = 32,768).
+    pub budget_bytes_per_s: u32,
     /// Ticks per second (Godot's physics ticks per second).
     pub tick_rate: u32,
     /// Debug hook: any value other than 0 changes the protocol hash, forcing a mismatch.
@@ -113,6 +119,8 @@ pub struct SessionConfig {
 impl SessionConfig {
     pub fn new(tick_rate: u32) -> Self {
         Self {
+            profiles_hash: 0,
+            budget_bytes_per_s: 0,
             tick_rate,
             protocol_salt: 0,
             ping_interval_ticks: 0,
@@ -164,7 +172,17 @@ pub struct Session {
     remote_scenes: BTreeMap<(PeerId, u64), u64>,
     /// Scenes already announced to each peer.
     scenes_sent: BTreeMap<PeerId, BTreeSet<u64>>,
+    /// WP3: state replication (property tables, recorded values, per-peer baselines).
+    repl: Replication,
+    budget_bytes_per_s: u32,
+    /// WP3: property tables peers announced, by (peer, scene hash).
+    remote_props: BTreeMap<(PeerId, u64), ScenePropsTable>,
+    /// WP3: part names (paths) per scene hash, for mismatch reasons.
+    part_names: BTreeMap<u64, Vec<String>>,
 }
+
+/// The default snapshot budget per peer (2.7, D8).
+pub const DEFAULT_BUDGET: u32 = 32_768;
 
 impl Session {
     fn new(role: Role, cfg: SessionConfig) -> Self {
@@ -177,7 +195,7 @@ impl Session {
         Self {
             role,
             local_id: if role == Role::Server { SERVER } else { 0 },
-            protocol: Protocol::new(rate, cfg.protocol_salt),
+            protocol: Protocol::with_profiles(rate, cfg.protocol_salt, cfg.profiles_hash),
             clock: TickClock::new(rate),
             peers: PeerTable::default(),
             out: Vec::new(),
@@ -219,6 +237,14 @@ impl Session {
             scene_paths: BTreeMap::new(),
             remote_scenes: BTreeMap::new(),
             scenes_sent: BTreeMap::new(),
+            repl: Replication::default(),
+            budget_bytes_per_s: if cfg.budget_bytes_per_s == 0 {
+                DEFAULT_BUDGET
+            } else {
+                cfg.budget_bytes_per_s
+            },
+            remote_props: BTreeMap::new(),
+            part_names: BTreeMap::new(),
         }
     }
 
@@ -377,6 +403,8 @@ impl Session {
     /// The transport lost `peer`.
     pub fn peer_disconnected(&mut self, peer: PeerId, _now_us: u64) {
         self.scenes_sent.remove(&peer);
+        self.repl.remove_peer(peer);
+        self.remote_props.retain(|(p, _), _| *p != peer);
         self.remote_scenes.retain(|(p, _), _| *p != peer);
         let Some(state) = self.peers.remove(peer) else {
             return;
@@ -444,6 +472,19 @@ impl Session {
                 self.send(peer, &Message::Pong(pong), now_us);
             }
             Message::Entity(a) => self.on_entity(peer, a, now_us),
+            Message::Snapshot(body) if self.role == Role::Client && peer == SERVER => {
+                let entities = &self.entities;
+                self.repl
+                    .on_snapshot(&body, &|id| entities.get(id).map(|r| r.scene));
+            }
+            Message::Field(f) if self.role == Role::Client && peer == SERVER => {
+                let entities = &self.entities;
+                self.repl
+                    .on_field(f, &|id| entities.get(id).map(|r| r.scene));
+            }
+            Message::Ack(a) if self.role == Role::Server && self.peers.is_joined(peer) => {
+                self.repl.on_ack(peer, a, tick);
+            }
             Message::Pong(p) => {
                 let rtt = now_us.saturating_sub(p.echo_us) as f64;
                 if let Some(state) = self.peers.get_mut(peer) {
@@ -497,8 +538,17 @@ impl Session {
         self.ping(peer, now_us);
         // The late-join burst: the whole entity table as creates, parents first.
         self.scenes_sent.remove(&peer);
-        for c in self.entities.burst() {
+        let tick = self.clock.tick();
+        self.repl.add_peer(peer, tick);
+        // WP3: each create carries the entity's latest full state, and the peer is then known to hold
+        // it (netcore keeps the latest values, so the burst reproduces current state).
+        for mut c in self.entities.burst() {
+            let id = c.id;
+            if self.repl.entity(id).is_some() {
+                c.initial_state = self.repl.encode_full(id);
+            }
             self.send_entity(peer, EntityAction::Create(c), now_us);
+            self.repl.mark_synced(peer, id);
         }
         self.events.push_back(Event::PeerJoined(peer));
     }
@@ -614,13 +664,16 @@ impl Session {
 
 /// What [`Session::spawn`] creates: where, under which name, for whom, with how many parts and which
 /// initial state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Spawn {
     pub parent: ParentRef,
     pub name: String,
     pub owner: PeerId,
     pub parts: u16,
     pub initial_state: Vec<u8>,
+    /// WP3: every part's property values (in table order). When given and the scene has a property
+    /// table, netcore records them and encodes `initial_state` itself.
+    pub values: Option<Vec<Vec<Value>>>,
 }
 
 impl Spawn {
@@ -637,7 +690,14 @@ impl Spawn {
             owner,
             parts,
             initial_state,
+            values: None,
         }
+    }
+
+    /// WP3: the entity's property values per part (they become the `Create`'s initial state).
+    pub fn with_values(mut self, values: Vec<Vec<Value>>) -> Self {
+        self.values = Some(values);
+        self
     }
 }
 
@@ -754,12 +814,14 @@ impl Session {
                 if let Some(path) = self.scene_paths.get(&c.scene_hash).cloned() {
                     sent.insert(c.scene_hash);
                     let parts_hash = self.protocol.scene(&path).unwrap_or(0);
+                    let props = self.repl.table(c.scene_hash).cloned().unwrap_or_default();
                     self.send(
                         peer,
                         &Message::Entity(EntityAction::Scene {
                             hash: c.scene_hash,
                             path,
                             parts_hash,
+                            props,
                         }),
                         now_us,
                     );
@@ -794,7 +856,8 @@ impl Session {
             name,
             owner,
             parts,
-            initial_state,
+            mut initial_state,
+            values,
         } = spec;
         if !self.is_connected() {
             return Err(String::from("the session is not connected"));
@@ -812,6 +875,12 @@ impl Session {
         let Some(id) = self.ids.allocate() else {
             return Err(String::from("this peer's entity id range is used up"));
         };
+        let tick = self.clock.tick();
+        if let Some(values) = values {
+            if self.repl.table(scene_hash).is_some() {
+                initial_state = self.repl.add_entity(id, scene_hash, &values, tick);
+            }
+        }
         let create = CreateAction {
             id,
             scene_hash,
@@ -823,6 +892,11 @@ impl Session {
         };
         self.entities.insert(&create);
         self.share(EntityAction::Create(create), None, now_us);
+        if self.repl.entity(id).is_some() {
+            for peer in self.peers.joined() {
+                self.repl.mark_synced(peer, id);
+            }
+        }
         Ok(id)
     }
 
@@ -833,6 +907,10 @@ impl Session {
             return Vec::new();
         }
         let removed = self.entities.remove(id);
+        for r in &removed {
+            self.repl.remove_entity(r.id);
+            self.repl.forget_received(r.id);
+        }
         if !removed.is_empty() {
             self.share(EntityAction::Destroy { id }, None, now_us);
         }
@@ -912,6 +990,7 @@ impl Session {
             hash,
             path,
             parts_hash,
+            props,
         } = &action
         {
             if self.role == Role::Client && peer != SERVER {
@@ -922,7 +1001,11 @@ impl Session {
                 .or_insert_with(|| path.clone());
             self.remote_scenes.insert((peer, *hash), *parts_hash);
             let path = path.clone();
-            self.check_scene(peer, &path, *parts_hash, now_us);
+            let (hash, props) = (*hash, props.clone());
+            if self.check_scene(peer, &path, *parts_hash, now_us) && !props.parts.is_empty() {
+                self.remote_props.insert((peer, hash), props);
+                self.check_props(peer, hash, now_us);
+            }
             return;
         }
         if !self.admits(peer, &action) {
@@ -1032,6 +1115,10 @@ impl Session {
                 if removed.is_empty() {
                     return;
                 }
+                for r in &removed {
+                    self.repl.remove_entity(r.id);
+                    self.repl.forget_received(r.id);
+                }
                 let n = removed.len();
                 for (i, record) in removed.into_iter().enumerate() {
                     self.entity_events.push_back(EntityEvent::Destroy {
@@ -1064,6 +1151,165 @@ impl Session {
                     if self.entities.set_owner(id, owner) {
                         self.entity_events
                             .push_back(EntityEvent::SetOwner { id, manager, owner });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// State replication (WP3): property tables, recording, snapshots and acks.
+impl Session {
+    /// Registers this side's property table for a scene (registered with `register_scene` first) and
+    /// compares it with what peers announced; a difference ends the session (client) or refuses the
+    /// peer (server) with a reason naming the scene, part and property. `part_names` are the scene's
+    /// part paths, for that reason. Returns false when this side's session ended because of it.
+    pub fn register_props(
+        &mut self,
+        path: &str,
+        table: ScenePropsTable,
+        part_names: Vec<String>,
+    ) -> bool {
+        let hash = crate::entity::scene_hash(path);
+        self.scene_paths
+            .entry(hash)
+            .or_insert_with(|| String::from(path));
+        self.part_names.insert(hash, part_names);
+        if self.repl.table(hash) != Some(&table) {
+            self.repl.register_table(hash, table);
+        }
+        let peers: Vec<PeerId> = self
+            .remote_props
+            .keys()
+            .filter(|(_, h)| *h == hash)
+            .map(|(p, _)| *p)
+            .collect();
+        for peer in peers {
+            self.check_props(peer, hash, 0);
+        }
+        !self.closed
+    }
+
+    /// This side's property table of a scene hash.
+    pub fn props(&self, scene: u64) -> Option<&ScenePropsTable> {
+        self.repl.table(scene)
+    }
+
+    fn check_props(&mut self, peer: PeerId, scene: u64, now_us: u64) -> bool {
+        let (Some(ours), Some(theirs)) = (
+            self.repl.table(scene),
+            self.remote_props.get(&(peer, scene)),
+        ) else {
+            return true;
+        };
+        let (local, remote) = match self.role {
+            Role::Server => ("server", "client"),
+            Role::Client => ("client", "server"),
+        };
+        let path = self
+            .scene_paths
+            .get(&scene)
+            .cloned()
+            .unwrap_or_else(|| std::format!("{scene:016x}"));
+        let names = self.part_names.get(&scene).cloned().unwrap_or_default();
+        let name = |i: usize| {
+            names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| std::format!("#{i}"))
+        };
+        let Some(reason) = ours.diff(theirs, &path, &name, local, remote) else {
+            return true;
+        };
+        match self.role {
+            Role::Client => self.close(reason),
+            Role::Server => self.reject_peer(peer, reason, now_us),
+        }
+        false
+    }
+
+    /// Records the current values of one part of entity `id` (`(field index, value)`); see
+    /// [`Replication::record_part`]. Returns true when a value changed.
+    pub fn record_part(&mut self, id: NetId, part: u16, values: &[(u16, Value)]) -> bool {
+        let Some(scene) = self.entities.get(id).map(|r| r.scene) else {
+            return false;
+        };
+        let tick = self.clock.tick();
+        self.repl.record_part(id, scene, part, values, tick)
+    }
+
+    /// Decodes a `Create`'s initial state with this side's property table of `scene`: `(part, field,
+    /// value)`. `None` when the table is not registered or the bytes do not decode.
+    pub fn decode_state(&self, scene: u64, bytes: &[u8]) -> Option<Vec<(u16, u16, Value)>> {
+        self.repl.decode_state(scene, bytes)
+    }
+
+    /// The property values snapshots delivered since the last call, in arrival order.
+    pub fn drain_state_updates(&mut self) -> Vec<StateUpdate> {
+        self.repl.drain_updates()
+    }
+
+    pub fn set_entity_priority(&mut self, id: NetId, priority: f32) {
+        self.repl.set_priority(id, priority);
+    }
+
+    /// The hook WP14 scores (2.7): `id` is interacting with `peer`.
+    pub fn set_interacting(&mut self, peer: PeerId, id: NetId, on: bool) {
+        self.repl.set_interacting(peer, id, on);
+    }
+
+    pub fn set_budget(&mut self, bytes_per_s: u32) {
+        self.budget_bytes_per_s = bytes_per_s.max(1);
+    }
+
+    pub fn budget(&self) -> u32 {
+        self.budget_bytes_per_s
+    }
+
+    pub fn repl_stats(&self) -> ReplStats {
+        self.repl.stats
+    }
+
+    pub fn replication(&self) -> &Replication {
+        &self.repl
+    }
+
+    /// 2.2 step 6 for state: the server builds each joined peer's snapshot (and reliable fields)
+    /// within its budget; a client sends its `Ack` when snapshots arrived. Call once per tick, after
+    /// recording.
+    pub fn send_snapshots(&mut self, now_us: u64) {
+        if !self.is_connected() {
+            return;
+        }
+        match self.role {
+            Role::Client => {
+                if let Some(ack) = self.repl.take_ack() {
+                    self.send(SERVER, &Message::Ack(ack), now_us);
+                }
+            }
+            Role::Server => {
+                let tick = self.clock.tick();
+                let rate = self.tick_rate();
+                let budget = self.budget_bytes_per_s;
+                for peer in self.peers.joined() {
+                    let range = self.peers.get(peer).map(|p| p.id_range).unwrap_or_default();
+                    let entities = &self.entities;
+                    let owner_of = |id: NetId| entities.get(id).map(|r| r.owner);
+                    // An entity the peer created itself (spawn policy owner_allowed) is its own; WP7
+                    // decides who is authoritative for it.
+                    let skip = |id: NetId| {
+                        entities
+                            .get(id)
+                            .is_none_or(|r| r.owner == peer && IdAllocator::in_range(range, id))
+                    };
+                    let out = self
+                        .repl
+                        .build(peer, tick, tick, rate, budget, &owner_of, &skip);
+                    for f in out.fields {
+                        self.send(peer, &Message::Field(f), now_us);
+                    }
+                    if let Some(body) = out.snapshot {
+                        self.send(peer, &Message::Snapshot(body), now_us);
                     }
                 }
             }
@@ -1510,6 +1756,7 @@ mod tests {
                 hash: scene_hash(SCENE),
                 path: SCENE.into(),
                 parts_hash: 1,
+                props: ScenePropsTable::default(),
             },
         );
         // Child (and its destroy) before its parent, then an unrelated root entity.
@@ -1725,5 +1972,223 @@ mod tests {
             .unwrap();
         pump(&mut server, &mut a, &mut b);
         assert!(a.destroy(sid, now).is_empty());
+    }
+
+    // ---- WP3: state replication ----------------------------------------------------------------
+
+    use crate::props::{PropDesc, Quant, TypeTag};
+
+    fn props() -> ScenePropsTable {
+        ScenePropsTable::new(std::vec![
+            std::vec![
+                PropDesc::new("position", TypeTag::Vector2).hot(Quant::Mm),
+                PropDesc::new("visible", TypeTag::Bool),
+            ],
+            std::vec![],
+            std::vec![PropDesc::new("frame", TypeTag::Int)],
+        ])
+    }
+
+    fn names() -> Vec<String> {
+        std::vec![".".into(), "Sprite".into(), "Marker".into()]
+    }
+
+    fn state(x: f32) -> Vec<Vec<Value>> {
+        std::vec![
+            std::vec![Value::Vector2([x, 1.0]), Value::Bool(true)],
+            std::vec![],
+            std::vec![Value::Int(3)],
+        ]
+    }
+
+    /// Steps the pair with the post-tick snapshot pass on both sides.
+    fn step_sync(p: &mut Pair) {
+        p.step();
+        p.server.send_snapshots(p.now);
+        p.client.send_snapshots(p.now);
+    }
+
+    fn client_registers(p: &mut Pair) {
+        p.client.register_scene(SCENE, 42);
+        assert!(p.client.register_props(SCENE, props(), names()));
+    }
+
+    #[test]
+    fn create_carries_state_and_snapshots_follow_changes() {
+        let mut p = connected_pair();
+        p.server.register_scene(SCENE, 42);
+        p.server.register_props(SCENE, props(), names());
+        let id = p
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "A", 1, 3, std::vec![]).with_values(state(5.0)),
+                p.now,
+            )
+            .unwrap();
+        p.step();
+        client_registers(&mut p);
+        let ev = entity_events(&mut p.client);
+        let EntityEvent::Create { create, .. } = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        let init = p
+            .client
+            .decode_state(create.scene_hash, &create.initial_state)
+            .unwrap();
+        assert_eq!(
+            init,
+            std::vec![
+                (0, 0, Value::Vector2([5.0, 1.0])),
+                (0, 1, Value::Bool(true)),
+                (2, 0, Value::Int(3)),
+            ]
+        );
+        // Nothing changed: no snapshot travels.
+        for _ in 0..5 {
+            step_sync(&mut p);
+        }
+        assert_eq!(p.server.repl_stats().snapshots_sent, 0);
+        assert!(p.client.drain_state_updates().is_empty());
+        assert!(p
+            .server
+            .record_part(id, 0, &[(0, Value::Vector2([6.0, 1.0]))]));
+        for _ in 0..3 {
+            step_sync(&mut p);
+        }
+        let ups = p.client.drain_state_updates();
+        assert_eq!(ups.len(), 1, "{ups:?}");
+        assert_eq!(ups[0].value, Value::Vector2([6.0, 1.0]));
+        assert_eq!(p.server.repl_stats().snapshots_sent, 1);
+    }
+
+    #[test]
+    fn a_late_joiners_burst_reproduces_current_state() {
+        let mut server = Session::server(SessionConfig::new(60));
+        server.register_scene(SCENE, 42);
+        server.register_props(SCENE, props(), names());
+        server.tick(0);
+        let id = server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "A", 1, 3, std::vec![]).with_values(state(0.0)),
+                0,
+            )
+            .unwrap();
+        server.record_part(id, 0, &[(0, Value::Vector2([42.0, 1.0]))]);
+        server.record_part(id, 2, &[(0, Value::Int(9))]);
+        server.outgoing();
+        let mut p = Pair::with(server, Session::client(SessionConfig::new(60)), 3);
+        for _ in 0..3 {
+            step_sync(&mut p);
+        }
+        client_registers(&mut p);
+        let ev = entity_events(&mut p.client);
+        let EntityEvent::Create { create, .. } = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        let init = p
+            .client
+            .decode_state(create.scene_hash, &create.initial_state)
+            .unwrap();
+        assert!(
+            init.contains(&(0, 0, Value::Vector2([42.0, 1.0]))),
+            "{init:?}"
+        );
+        assert!(init.contains(&(2, 0, Value::Int(9))));
+        assert_eq!(
+            p.server.repl_stats().snapshots_sent,
+            0,
+            "the burst already carried the state"
+        );
+    }
+
+    #[test]
+    fn a_different_property_table_disconnects_naming_scene_and_property() {
+        let mut p = connected_pair();
+        p.server.register_scene(SCENE, 42);
+        p.server.register_props(SCENE, props(), names());
+        p.server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "A", 1, 3, std::vec![]).with_values(state(0.0)),
+                p.now,
+            )
+            .unwrap();
+        p.step();
+        p.client.register_scene(SCENE, 42);
+        let mut theirs = props();
+        theirs.parts[2][0].schedule = crate::props::Schedule::Hot;
+        assert!(!p.client.register_props(SCENE, theirs, names()));
+        p.step();
+        let reason = p
+            .client_events
+            .iter()
+            .find_map(|e| match e {
+                Event::Disconnected(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("disconnected");
+        assert!(
+            reason.starts_with(&std::format!(
+                "protocol mismatch: the property table of scene {SCENE} differs at part Marker, property frame"
+            )),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn profiles_are_part_of_the_hello_hash() {
+        let mut a = SessionConfig::new(60);
+        a.profiles_hash = 1;
+        let mut b = SessionConfig::new(60);
+        b.profiles_hash = 2;
+        let mut p = Pair::new(a, b, 2);
+        for _ in 0..5 {
+            p.step();
+        }
+        assert!(p.client_events.iter().any(|e| matches!(e,
+            Event::Disconnected(r) if r.starts_with("protocol mismatch: profiles differs"))));
+    }
+
+    #[test]
+    fn snapshots_survive_loss_through_the_emulator() {
+        let mut p = connected_pair();
+        let lossy = crate::emul::EmulSettings {
+            loss: 0.3,
+            ..crate::emul::EmulSettings::default()
+        };
+        p.server
+            .set_emulation(lossy, crate::emul::EmulSettings::default(), 7);
+        p.client
+            .set_emulation(lossy, crate::emul::EmulSettings::default(), 9);
+        p.server.register_scene(SCENE, 42);
+        p.server.register_props(SCENE, props(), names());
+        let id = p
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "A", 1, 3, std::vec![]).with_values(state(0.0)),
+                p.now,
+            )
+            .unwrap();
+        let mut last = Value::Nil;
+        let mut seen = Value::Nil;
+        for t in 0..300u32 {
+            if t == 2 {
+                client_registers(&mut p);
+            }
+            if t < 200 {
+                last = Value::Vector2([t as f32, 1.0]);
+                p.server.record_part(id, 0, &[(0, last.clone())]);
+            }
+            step_sync(&mut p);
+            for u in p.client.drain_state_updates() {
+                if (u.part, u.field) == (0, 0) {
+                    seen = u.value;
+                }
+            }
+        }
+        assert_eq!(seen, last, "the latest value arrived despite 30% loss");
     }
 }

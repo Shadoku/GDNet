@@ -125,6 +125,9 @@ pub enum EntityAction {
         hash: u64,
         path: String,
         parts_hash: u64,
+        /// WP3: the sender's property table for the scene (compared with the receiver's; a difference
+        /// names the scene, part and property). Empty when the sender registered none.
+        props: crate::props::ScenePropsTable,
     },
     Create(CreateAction),
     Destroy {
