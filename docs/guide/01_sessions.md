@@ -106,6 +106,13 @@ emu.send_latency_ms = 150.0    # or set the numbers yourself; edits apply at onc
 Net.emulation = emu
 ```
 
+The fields, each for both directions: `send_latency_ms` / `receive_latency_ms` (a fixed delay),
+`send_variance_ms` / `receive_variance_ms` (an extra uniform random delay), `send_loss` / `receive_loss`,
+`send_reorder` / `receive_reorder`, `send_duplicate` / `receive_duplicate` (probabilities 0..1), and `seed`
+(the same seed gives the same schedule). `is_off()` is true while every value is zero. `preset(name)`
+takes `off`, `lan`, `average`, `bad`, `mobile` or `custom` (the `gdnet/debug/emulation/<field>` settings);
+`Net.emulation_preset(name)` does the same on `Net`'s emulation.
+
 - Unreliable packets are dropped, delayed, reordered and duplicated as configured.
 - Reliable packets behave like a reliable transport's: never lost or reordered, but each simulated loss
   costs a resend delay. At `loss = 1.0` the link is dead and nothing arrives, reliable or not.
@@ -134,3 +141,24 @@ func test_clients_connect() -> void:
 
 `NetFixture.run_both_modes(test, n, scenario)` runs a scenario with the host as a player and as a
 dedicated server.
+
+## Smaller pieces of the surface
+
+- `Net.get_session()`: `Net`'s own `NetSession` while online (null otherwise); `Net.session_for(node)`
+  is the session of a node's branch.
+- `NetSession`: `unique_id()` (1 when hosting, the server-assigned id on a client after `connected`, 0
+  before), `entity_count()` (entities in its table), `server_tick()` (the estimated server tick,
+  fractional; the server's own tick on a server), `get_tick_rate()`, `get_api()` (gdnet's
+  `NetMultiplayerApi` for the branch), `get_peer()` (the transport peer), `set_emulation(e)` /
+  `get_emulation()`, static `packets_sent_total()` (every session of the process; 0 while nothing uses
+  gdnet, gate G0). Test hooks start with `_debug_`: `_debug_protocol_salt`, `_debug_part_table_salt`,
+  `_debug_perturb_property`, `_debug_extra_method` (properties) and `_debug_corrupt_held(node, prop,
+  value)`; none is for games.
+- `NetMultiplayerApi.get_inner()`: the wrapped `SceneMultiplayer` (stock RPCs and synchronizers run on
+  it unchanged).
+- `NetPipePeer`: `set_emulation(e)` / `get_emulation()` (applied at this end: `send_*` to what it sends,
+  `receive_*` to what it receives), `in_flight()` (packets its emulators hold), and the counters
+  `bytes_sent()`, `packets_sent()`, `bytes_received()`, `packets_received()`.
+- `NetManager.get_managed_root()`: the node whose subtree it manages (itself, or the node given to
+  `Net.manage()`).
+- `NetVersion`: `version()` (the gdnet crate) and `core_version()` (netcore; equal in a consistent build).
