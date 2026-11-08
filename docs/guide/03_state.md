@@ -84,8 +84,8 @@ the client's own entity, 100 for one interacting with it, 1 otherwise, times its
 snapshot takes the highest sums and the entities it sent drop to zero. An entity of priority 10 is sent
 about twice as often as one of priority 5, the client's own entity every time, and nothing exceeds the
 budget: with 100 moving entities and the budget halved, the ten of priority 10 updated every tick and the
-other ninety about every seventh (`test_g4_a_halved_budget_updates_far_entities_less_often`). Distance and
-rooms (interest management) come with WP7 and WP13.
+other ninety about every seventh (`test_g4_a_halved_budget_updates_far_entities_less_often`). Rooms
+(interest by level) are page 9; distance-based interest is not built yet.
 
 `NetSession.stats()` reports bytes sent and received per channel per second, entity count, the polling
 cost per tick (`poll_ms`, `poll_ms_avg`) and the snapshot counters; WP8's meter shows them. Measured

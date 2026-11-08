@@ -59,13 +59,15 @@ scene, parent, name, owner and, from WP3 on, its initial state). A client loads 
 (`load(path).instantiate()`), sets the name, adds it under the same parent and then calls `_net_spawned`.
 A `Create` whose parent has not arrived yet waits for it (it is never dropped; an error says so after five
 seconds). `queue_free()` sends `Destroy` (children of a destroyed entity go with it); moving a node within
-managed space sends `Reparent`.
+a manager's subtree sends `Reparent`. Moving it to another manager by hand is a destroy and a create;
+`Net.travel` moves it between managers (and rooms), page 9.
 
 Content that is part of the level on every peer (instances present when the manager becomes ready, or
 nested instances inside a spawned scene) is not instantiated twice: a client binds its own node to the
 server's entity when the `Create` names the same parent, name and scene.
 
-A client that joins late receives the whole entity table, parents first, right after its handshake.
+A client that joins late receives the entity table, parents first, right after its handshake (WP13: the
+entities of its room only, once the game uses rooms; page 9).
 
 ### The same scene at the same path
 

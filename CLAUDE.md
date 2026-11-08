@@ -84,6 +84,8 @@ Never say a change works without a passing check. If you cannot run Godot
   State: change properties on the server, `wait_until` the client's copy matches; bandwidth and polling
   cost come from `NetSession.stats()` (`test_net_state.gd`). Gate G7's plain scene is
   `tests/fixtures/zero_change/`: keep its scripts free of `Net.` (a test checks).
+  Rooms and travel (WP13): `tests/integration/test_doors_demo.gd` runs `demos/doors/` in every branch
+  (a `World` per branch, `NetSession.levels()`, a door's `body_entered` emitted on the server).
 
 ## Design for testability
 
@@ -111,6 +113,8 @@ rust/                  Cargo workspace: netcore (sans-IO protocol engine, no god
                        gdnet (the GDExtension); rust/target/ is ignored
 addons/gdnet/          gdnet.gdextension + bin/<platform>/ (built, ignored) + addon assets (WP8: meter.tscn/.gd)
 docs/guide/            the gdnet user guide, one page per topic (01_sessions.md, ...)
+demos/                 instructional demos, each a worked example with a README whose code listings a
+                       test diffs against the files (WP13: doors/ = players travelling between levels)
 tools/check.py         the one command to verify the project
 tools/validate_scripts.gd   compiles every script; used by check.py
 tools/install_godot.sh downloads the pinned Godot into ~/.cache/godot

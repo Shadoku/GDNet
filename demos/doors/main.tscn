@@ -1,0 +1,52 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://demos/doors/main.gd" id="1_main"]
+[ext_resource type="Script" path="res://demos/doors/world.gd" id="2_world"]
+[ext_resource type="PackedScene" path="res://demos/doors/chat.tscn" id="3_chat"]
+
+[node name="Main" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+script = ExtResource("1_main")
+
+[node name="World" type="Node2D" parent="."]
+script = ExtResource("2_world")
+
+[node name="Menu" type="VBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -100.0
+offset_top = -90.0
+offset_right = 100.0
+offset_bottom = 90.0
+
+[node name="Title" type="Label" parent="Menu"]
+layout_mode = 2
+text = "Doors"
+horizontal_alignment = 1
+
+[node name="Host" type="Button" parent="Menu"]
+layout_mode = 2
+text = "Host"
+
+[node name="Address" type="LineEdit" parent="Menu"]
+layout_mode = 2
+text = "127.0.0.1"
+
+[node name="Join" type="Button" parent="Menu"]
+layout_mode = 2
+text = "Join"
+
+[node name="Offline" type="Button" parent="Menu"]
+layout_mode = 2
+text = "Offline"
+
+[node name="Chat" parent="." instance=ExtResource("3_chat")]
+visible = false
+layout_mode = 0

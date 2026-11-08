@@ -1,0 +1,22 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://demos/doors/chat.gd" id="1_chat"]
+
+[node name="Chat" type="PanelContainer"]
+offset_left = 8.0
+offset_top = 8.0
+offset_right = 328.0
+offset_bottom = 208.0
+script = ExtResource("1_chat")
+
+[node name="Box" type="VBoxContainer" parent="."]
+layout_mode = 2
+
+[node name="Log" type="RichTextLabel" parent="Box"]
+layout_mode = 2
+size_flags_vertical = 3
+scroll_following = true
+
+[node name="Input" type="LineEdit" parent="Box"]
+layout_mode = 2
+placeholder_text = "Say something, then Enter"

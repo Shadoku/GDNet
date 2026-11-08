@@ -27,7 +27,7 @@ first session in the tree (set `meter.session` to choose one, e.g. a test branch
 | tick, server offset | `tick`, `server_tick_offset` (a client's estimate of the server tick minus its own) |
 | jitter buffer, render lag | `jitter_buffer_ticks`, `render_lag_ticks` (page 5) |
 | in / out per channel | `bytes_received_per_s`, `bytes_sent_per_s` (0 reliable, 1 unreliable, 2 diagnostics) |
-| entities, in scope | `entities`, `entities_in_scope` (every entity until rooms, WP13) |
+| entities, in scope | `entities`, `entities_in_scope` (a client: what it holds; the server: everything, with `entities_in_scope_by_peer`; page 9) |
 | snapshots, keyed | `snapshot_bytes_per_s`, `snapshot_bytes`, `keyed_bytes_per_s` |
 | budget | `budget_use` (server: snapshot bytes per second over the budget times the peers), `budget_bytes_per_s` |
 | calls | `calls_sent_per_s`, `calls_received_per_s`, `calls_refused` |
@@ -35,6 +35,7 @@ first session in the tree (set `meter.session` to choose one, e.g. a test branch
 | poll | `poll_ms`, `poll_ms_avg`: what reading the hot and cold properties cost (page 3, "Dirty tracking") |
 | hashes | `hashes_sent`, `hashes_received`, `divergences`, `divergences_per_s` |
 | authority | `owner_changes`, `writes_rejected` (page 7) |
+| rooms | `room` (a client's), `rooms` (entities per room), `travelling` (page 9) |
 
 Byte counts are what gdnet handed to the transport: `SceneMultiplayer` adds one byte per raw packet,
 which a `NetPipePeer`'s `bytes_sent()` / `bytes_received()` include (`packets_sent()` /
