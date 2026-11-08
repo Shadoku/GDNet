@@ -141,6 +141,10 @@ pub enum EntityAction {
         id: NetId,
         owner: PeerId,
     },
+    /// WP6: a received call (it travels as its own message, kind 11, never as an `EntityAction`). It is
+    /// kept here so a call waits behind its entity's pending `Create` in the same held queue, in order.
+    #[serde(skip)]
+    Call(crate::call::CallMsg),
 }
 
 impl EntityAction {
@@ -152,6 +156,7 @@ impl EntityAction {
             EntityAction::Destroy { id }
             | EntityAction::SetOwner { id, .. }
             | EntityAction::Reparent { id, .. } => Some(*id),
+            EntityAction::Call(c) => Some(c.entity),
         }
     }
 
@@ -162,6 +167,7 @@ impl EntityAction {
             EntityAction::Scene { .. } => (None, None),
             EntityAction::Create(c) => (None, parent(&c.parent)),
             EntityAction::Destroy { id } | EntityAction::SetOwner { id, .. } => (Some(*id), None),
+            EntityAction::Call(c) => (Some(c.entity), None),
             EntityAction::Reparent { id, parent: p } => (Some(*id), parent(p)),
         }
     }

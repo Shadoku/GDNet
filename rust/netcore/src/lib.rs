@@ -12,10 +12,12 @@
 //! format), [`priority`] (accumulator and budget), [`delta`] (dirty tracking, acked baselines, packing).
 //! WP4: [`input`] (input frames, redundancy, the server's input buffer, adaptive delay), [`predict`]
 //! (prediction histories, mismatch detection, rollback requests, the tick lead). WP5: [`interp`] (the
-//! render timeline, the adaptive jitter buffer, sample buffers, error offsets).
+//! render timeline, the adaptive jitter buffer, sample buffers, error offsets). WP6: [`call`] (calls and
+//! returns, the argument encoding, the routing verbs).
 
 #![forbid(unsafe_code)]
 
+pub mod call;
 pub mod clock;
 pub mod delta;
 pub mod emul;
@@ -31,6 +33,7 @@ pub mod session;
 pub mod snapshot;
 pub mod wire;
 
+pub use call::{Arg, CallIn, CallMsg, CallPlan, CallResult, CallStats, OutCall, Verb};
 pub use delta::{Ack, FieldMsg, ReplStats, Replication, StateUpdate};
 pub use emul::{EmulSettings, Emulator, Pcg32};
 pub use entity::{

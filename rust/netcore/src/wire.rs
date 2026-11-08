@@ -2,6 +2,7 @@
 //! WP1 defines the session messages: `Hello` / `Welcome` / `Reject` (the handshake) and `Time`
 //! ping/pong. Later packages add kinds; a receiver that does not know a kind reports it as an error.
 
+use crate::call::{CallMsg, CallReturn};
 use crate::delta::{Ack, FieldMsg};
 use crate::entity::EntityAction;
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,10 @@ pub enum Message {
     Field(FieldMsg),
     /// WP4: input frames, bit-packed (see input.rs; not postcard).
     Input(Vec<u8>),
+    /// WP6: a method call on an entity's part (call.rs).
+    Call(CallMsg),
+    /// WP6: the answer to a call's request id.
+    CallReturn(CallReturn),
 }
 
 /// The kind bytes. 0 is never used, so a zeroed buffer is not a message.
@@ -123,6 +128,8 @@ pub mod kind {
     pub const ACK: u8 = 8;
     pub const FIELD: u8 = 9;
     pub const INPUT: u8 = 10;
+    pub const CALL: u8 = 11;
+    pub const CALL_RETURN: u8 = 12;
 }
 
 /// The channel a message of kind `k` travels on (for byte counters of received packets).
@@ -165,6 +172,8 @@ impl Message {
             Message::Ack(_) => kind::ACK,
             Message::Field(_) => kind::FIELD,
             Message::Input(_) => kind::INPUT,
+            Message::Call(_) => kind::CALL,
+            Message::CallReturn(_) => kind::CALL_RETURN,
         }
     }
 
@@ -175,7 +184,10 @@ impl Message {
             | Message::Welcome(_)
             | Message::Reject(_)
             | Message::Entity(_)
-            | Message::Field(_) => Channel::Reliable,
+            | Message::Field(_)
+            | Message::CallReturn(_) => Channel::Reliable,
+            Message::Call(c) if c.unreliable => Channel::Unreliable,
+            Message::Call(_) => Channel::Reliable,
             Message::Snapshot(_) | Message::Ack(_) | Message::Input(_) => Channel::Unreliable,
             Message::Ping(_) | Message::Pong(_) => Channel::Diagnostics,
         }
@@ -212,6 +224,8 @@ pub fn encode(msg: &Message) -> Vec<u8> {
             out.extend_from_slice(b);
             out
         }
+        Message::Call(m) => body(kind::CALL, m),
+        Message::CallReturn(m) => body(kind::CALL_RETURN, m),
     }
 }
 
@@ -233,6 +247,8 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         kind::ACK => Message::Ack(parse(k, rest)?),
         kind::FIELD => Message::Field(parse(k, rest)?),
         kind::INPUT => Message::Input(rest.to_vec()),
+        kind::CALL => Message::Call(parse(k, rest)?),
+        kind::CALL_RETURN => Message::CallReturn(parse(k, rest)?),
         other => return Err(WireError::UnknownKind(other)),
     })
 }
@@ -423,6 +439,7 @@ mod tests {
                         crate::props::TypeTag::Vector2
                     )]],
                     inputs: std::vec!["jump".into()],
+                    methods: std::vec![7, 8],
                 },
             },
             EntityAction::Create(CreateAction {
@@ -466,6 +483,48 @@ mod tests {
             history: 0,
         }));
         assert!(ack.len() <= 5, "{} bytes", ack.len());
+        // WP6: calls and returns; a call's channel follows its `unreliable` flag.
+        let call = crate::call::CallMsg {
+            entity: 65_537,
+            part: 2,
+            method: crate::call::method_hash("open_door"),
+            verb: crate::call::Verb::Peer,
+            target: 7,
+            sender: 3,
+            request: 42,
+            tick: 1 << 33,
+            unreliable: false,
+            args: crate::call::encode_args(&[crate::call::Arg::Int(7)]),
+        };
+        let msg = Message::Call(call.clone());
+        assert_eq!(msg.channel(), Channel::Reliable);
+        roundtrip(msg);
+        let msg = Message::Call(crate::call::CallMsg {
+            unreliable: true,
+            ..call
+        });
+        assert_eq!(msg.channel(), Channel::Unreliable);
+        roundtrip(msg);
+        for ret in [
+            crate::call::CallReturn {
+                request: 42,
+                ok: true,
+                value: crate::call::encode_value(&crate::call::Arg::Bool(true)),
+                error: String::new(),
+            },
+            crate::call::CallReturn {
+                request: 43,
+                ok: false,
+                value: Vec::new(),
+                error: "refused ✗".into(),
+            },
+        ] {
+            let msg = Message::CallReturn(ret);
+            assert_eq!(msg.channel(), Channel::Reliable);
+            roundtrip(msg);
+        }
+        assert_eq!(channel_of_kind(kind::CALL), Channel::Reliable);
+        assert_eq!(channel_of_kind(kind::CALL_RETURN), Channel::Reliable);
     }
 
     #[test]

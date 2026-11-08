@@ -16,6 +16,7 @@
 //! (`NetSession.new()`), one per branch.
 
 use crate::api_ext::NetMultiplayerApi;
+use crate::call::{self as net_call, NetArg, NetCall};
 use crate::emulation::{settings_of, NetEmulation};
 use crate::interp;
 use crate::manager::{NetManager, TickCtx, MANAGERS_GROUP};
@@ -32,6 +33,7 @@ use godot::classes::{
 };
 use godot::global::Error;
 use godot::prelude::*;
+use netcore::call::Verb;
 use netcore::session::EntityEvent;
 use netcore::{EmulSettings, Event, Reliability, Session, SessionConfig, StateUpdate};
 use std::collections::HashMap;
@@ -121,6 +123,13 @@ pub struct NetSession {
     jitter_buffer_ticks: i64,
     /// WP5: owned offsets were shown in the last render frame (restore them before the next tick).
     owned_active: bool,
+    /// WP6: calls waiting for their `CallReturn`, by request id.
+    calls: HashMap<u32, Gd<NetCall>>,
+    /// Test hook (WP6): `"<part path>:<method>"` adds a method to that part's method table on this side
+    /// only, so a spawn fails the check with a reason naming the scene and part. Set it before the first
+    /// spawn.
+    #[var(rename = _debug_extra_method, get = get_debug_extra_method, set = set_debug_extra_method)]
+    debug_extra_method: GString,
 }
 
 /// Byte and timing counters behind `stats()` (2.7, the WP8 meter's source).
@@ -142,6 +151,9 @@ struct Counters {
     replayed_ticks: u64,
     window_start_rollbacks: u64,
     rollbacks_per_s: u64,
+    /// WP6: per-second call counters (sent, received, refused, dropped).
+    window_start_calls: [u64; 4],
+    calls_per_s: [u64; 4],
     /// WP5.
     window_start_late: u64,
     late_per_s: u64,
@@ -226,6 +238,179 @@ impl NetSession {
     /// `from_tick`.
     #[signal]
     fn rolled_back(node: Gd<Node>, from_tick: i64, to_tick: i64);
+    /// WP6 (server): a call from `sender` on `node` was refused (D14: the sender does not own the entity
+    /// and the part's `_net_allow` did not admit it). The caller's `NetCall` fails.
+    #[signal]
+    fn call_refused(node: Gd<Node>, method: StringName, sender: i64);
+
+    /// WP6 (rung 2): runs `callable` (a method of a part of a managed entity) on the authority, then on
+    /// every peer that has the entity in scope. From a client it goes to the server only, which checks
+    /// that the caller owns the entity (or the part's `_net_allow(method, sender)` admits it), runs it
+    /// and sends it to everyone, the caller included. Up to eight arguments; bound arguments count.
+    /// Returns a `NetCall` (`ok` / `error` once `completed`). Without a session it just runs.
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn sync(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Sync,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        )
+    }
+
+    /// WP6: `sync` on the unreliable channel (no answer, may be lost; for cosmetic effects).
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn sync_unreliable(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Sync,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            true,
+        )
+    }
+
+    /// WP6: runs `callable` on the server (any peer may call it; the method may take a trailing
+    /// `NetCallInfo` to learn the sender) and returns the `completed` signal of its `NetCall`, so
+    /// `var v = await Net.server(try_buy, 3)` is the server's return value (null on an error; the
+    /// signal's object is the `NetCall`).
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn server(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Signal {
+        let call = net_call::make_call(
+            Verb::Server,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        );
+        Signal::from_object_signal(&call, "completed")
+    }
+
+    /// WP6: runs `callable` on the entity's owner only.
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn owner(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Owner,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        )
+    }
+
+    /// WP6: runs `callable` on every peer but the caller (the server included when a client calls).
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn others(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Others,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        )
+    }
+
+    /// WP6: runs `callable` on peer `id` only (1 = the server; a client's call goes via the server).
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn peer(
+        &mut self,
+        id: i64,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Peer,
+            id.max(0) as u32,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        )
+    }
+
+    #[func]
+    fn get_debug_extra_method(&self) -> GString {
+        self.debug_extra_method.clone()
+    }
+
+    #[func]
+    fn set_debug_extra_method(&mut self, v: GString) {
+        self.debug_extra_method = v;
+    }
 
     #[func]
     fn get_budget_bytes_per_s(&self) -> i64 {
@@ -334,6 +519,22 @@ impl NetSession {
         d.set("offset_corrections", i.corrections as i64);
         d.set("offset_corrections_per_s", c.corrections_per_s as i64);
         d.set("interp_teleports", i.teleports as i64);
+        let cs = self
+            .core
+            .as_ref()
+            .map(|c| c.call_stats())
+            .unwrap_or_default();
+        d.set("calls_sent", cs.sent as i64);
+        d.set("calls_received", cs.received as i64);
+        d.set("calls_refused", cs.refused as i64);
+        d.set("calls_dropped", cs.dropped as i64);
+        d.set("calls_unknown_method", cs.unknown_method as i64);
+        d.set("calls_timed_out", cs.timeouts as i64);
+        d.set("calls_pending", self.calls.len() as i64);
+        d.set("calls_sent_per_s", c.calls_per_s[0] as i64);
+        d.set("calls_received_per_s", c.calls_per_s[1] as i64);
+        d.set("calls_refused_per_s", c.calls_per_s[2] as i64);
+        d.set("calls_dropped_per_s", c.calls_per_s[3] as i64);
         d
     }
 
@@ -690,6 +891,7 @@ impl NetSession {
             }
             core.tick(now);
         }
+        self.resolve_calls();
         self.sync_managers();
         self.input_step();
         let (events, tick) = {
@@ -849,6 +1051,14 @@ impl NetSession {
                 c.corrections_per_s = i.corrections - c.window_start_corrections;
                 c.window_start_corrections = i.corrections;
             }
+            if let Some(core) = self.core.as_ref() {
+                let cs = core.call_stats();
+                let now = [cs.sent, cs.received, cs.refused, cs.dropped];
+                for (i, n) in now.iter().enumerate() {
+                    c.calls_per_s[i] = n - c.window_start_calls[i];
+                }
+                c.window_start_calls = now;
+            }
             c.poll_ms_avg = c.poll_us_window as f64 / 1000.0 / f64::from(c.window_ticks);
             c.poll_us_window = 0;
             c.window_ticks = 0;
@@ -873,6 +1083,30 @@ impl NetSession {
 
     pub fn debug_perturb_property(&self) -> String {
         self.debug_perturb_property.to_string()
+    }
+
+    /// WP6: a sent call waits for the `CallReturn` of request `request` (or its timeout).
+    pub fn register_call(&mut self, request: u32, call: Gd<NetCall>) {
+        self.calls.insert(request, call);
+    }
+
+    /// WP6: resolves the calls netcore answered (or timed out).
+    fn resolve_calls(&mut self) {
+        let mut done = Vec::new();
+        if let Some(core) = self.core.as_mut() {
+            while let Some(r) = core.poll_call_result() {
+                done.push(r);
+            }
+        }
+        for r in done {
+            if let Some(call) = self.calls.remove(&r.request) {
+                NetCall::resolve(&call, r.result.map(|v| net_call::decode_return(&v)));
+            }
+        }
+    }
+
+    pub fn debug_extra_method(&self) -> String {
+        self.debug_extra_method.to_string()
     }
 
     /// The session's generation (a new one per `start()`).
@@ -964,6 +1198,7 @@ impl NetSession {
                 EntityEvent::Destroy { record, .. } => record.parent.manager,
                 EntityEvent::Reparent { from_manager, .. } => *from_manager,
                 EntityEvent::SetOwner { manager, .. } => *manager,
+                EntityEvent::Call(c) => c.manager,
             };
             if managers.iter().any(|(k, _)| *k == key) {
                 routed.entry(key).or_default().push(e);
@@ -1092,6 +1327,14 @@ impl NetSession {
     fn stop(&mut self) {
         if self.core.is_none() {
             return;
+        }
+        for (_, call) in self.calls.drain() {
+            NetCall::resolve(
+                &call,
+                Err(String::from(
+                    "the session ended before the call was answered",
+                )),
+            );
         }
         self.restore_owned_offsets();
         let Some(_core) = self.core.take() else {

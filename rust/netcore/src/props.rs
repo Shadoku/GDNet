@@ -249,6 +249,11 @@ pub struct ScenePropsTable {
     /// WP4: the input actions of the scene's entities, in index order (an input frame's pressed bits
     /// index this list, so both peers must agree on it). Empty when no input is replicated.
     pub inputs: Vec<String>,
+    /// WP6: per part, the hash of its exposed method names (`call::method_table_hash`), so a peer whose
+    /// scripts expose other methods is caught at the first spawn, naming the part. Empty when not
+    /// registered.
+    #[serde(default)]
+    pub methods: Vec<u64>,
 }
 
 impl ScenePropsTable {
@@ -256,6 +261,7 @@ impl ScenePropsTable {
         Self {
             parts,
             inputs: Vec::new(),
+            methods: Vec::new(),
         }
     }
 
@@ -299,6 +305,13 @@ impl ScenePropsTable {
                 bytes.push(0);
             }
         }
+        // WP6: tables without method hashes hash as before.
+        if !self.methods.is_empty() {
+            bytes.extend_from_slice(b"methods");
+            for m in &self.methods {
+                bytes.extend_from_slice(&m.to_le_bytes());
+            }
+        }
         fnv1a64(&bytes)
     }
 
@@ -316,6 +329,17 @@ impl ScenePropsTable {
             return None;
         }
         let head = std::format!("protocol mismatch: the property table of scene {scene} differs");
+        if self.parts == theirs.parts && self.inputs == theirs.inputs {
+            // WP6: only the method tables differ.
+            let n = self.methods.len().max(theirs.methods.len());
+            let i = (0..n)
+                .find(|&i| self.methods.get(i) != theirs.methods.get(i))
+                .unwrap_or(0);
+            return Some(std::format!(
+                "protocol mismatch: the method table of scene {scene} differs at part {}; both peers need the same scripts on that part (its public methods are network-callable)",
+                part_name(i)
+            ));
+        }
         if self.parts == theirs.parts && self.inputs != theirs.inputs {
             return Some(std::format!(
                 "{head} in its input actions ({local_label} [{}]; {remote_label} [{}]); every peer must have the same InputMap actions and input_actions settings",
@@ -482,6 +506,26 @@ mod tests {
         let r = b.diff(&c, "s", &name, "client", "server").unwrap();
         assert!(
             r.contains("input actions (client [left, right]; server [right, left])"),
+            "{r}"
+        );
+        assert_eq!(b.diff(&b.clone(), "s", &name, "a", "b"), None);
+    }
+
+    #[test]
+    fn method_tables_are_part_of_the_table() {
+        let a = table();
+        let h = a.hash();
+        let mut b = table();
+        b.methods = std::vec![1, 2, 3];
+        assert_ne!(b.hash(), h);
+        let mut c = b.clone();
+        c.methods[2] = 9;
+        let name = |i: usize| [".", "Anim", "Label"][i].to_string();
+        let r = b
+            .diff(&c, "res://door.tscn", &name, "client", "server")
+            .unwrap();
+        assert!(
+            r.starts_with("protocol mismatch: the method table of scene res://door.tscn differs at part Label"),
             "{r}"
         );
         assert_eq!(b.diff(&b.clone(), "s", &name, "a", "b"), None);

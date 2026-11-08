@@ -32,15 +32,18 @@
 //! are frozen once.
 
 use crate::apply;
+use crate::call::{self as net_call, NetCall, NetCallInfo};
 use crate::entity_node::{NetEntity, Simulate};
 use crate::infer::{self, RuntimeProps};
 use crate::input::{self as net_input, ActionTable, NetInput};
+use crate::methods::{self, MethodTable};
 use crate::parts::{self, SceneInfo};
 use crate::profiles::{self, NetProfiles, Profiles};
 use crate::session::NetSession;
 use crate::tick::{self, Gate};
 use godot::classes::{Engine, INode, Node, SceneTree};
 use godot::prelude::*;
+use netcore::call::{method_hash, CallIn, OutCall, Verb};
 use netcore::input::{name_hash, InputFrame};
 use netcore::session::EntityEvent;
 use netcore::{NetId, ParentRef, Policy, Spawn, StateUpdate, Value, MANAGER_ROOT};
@@ -120,6 +123,8 @@ struct Entry {
     predicted: Option<Policy>,
     /// The scripts were checked for global `Input` use (once, when a client owns it).
     input_checked: bool,
+    /// WP6: the scene's method tables (methods.rs), once derived.
+    methods: Option<Rc<MethodTable>>,
 }
 
 impl Entry {
@@ -144,6 +149,7 @@ impl Entry {
             input_props: Vec::new(),
             predicted: None,
             input_checked: false,
+            methods: None,
         }
     }
 }
@@ -204,6 +210,29 @@ pub struct NetManager {
     /// WP5: owned fields showing an offset this render frame: (node, field, the simulated value to put
     /// back before the next tick).
     owned_shown: HashMap<(NetId, u16, u16), Shown>,
+    /// WP6: calls on entities that have no net id yet (spawned this tick, or a client's static content
+    /// before the server's create), dispatched once they have one.
+    queued_calls: Vec<Queued>,
+}
+
+/// WP6: a call checked at the call site, on its way out.
+pub struct CallReq {
+    pub verb: Verb,
+    pub target: u32,
+    pub method: StringName,
+    pub args: Vec<Variant>,
+    pub bytes: Vec<u8>,
+    pub unreliable: bool,
+    pub call: Gd<NetCall>,
+}
+
+/// WP6: a call waiting for its entity's net id.
+struct Queued {
+    iid: InstanceId,
+    part: u16,
+    hash: u32,
+    wants_info: bool,
+    req: CallReq,
 }
 
 #[godot_api]
@@ -636,10 +665,12 @@ impl NetManager {
             self.apply_event(&session, key, salt, ev);
         }
         self.announce(&session, key, salt);
+        self.flush_queued(&session);
     }
 
     fn apply_event(&mut self, session: &Gd<NetSession>, key: u64, salt: u64, ev: EntityEvent) {
         match ev {
+            EntityEvent::Call(ci) => self.on_call(session, ci),
             EntityEvent::Create {
                 create,
                 scene_path,
@@ -1071,14 +1102,25 @@ impl NetManager {
         let actions = self.actions_for(node, &scene.path);
         let mut table = inferred.table.clone();
         table.inputs = actions.strings.clone();
+        // WP6: the per-part method table hashes join the table (a difference names the part).
+        let mt = {
+            let nodes = part_node_list(scene, node);
+            methods::table_for(scene, &nodes)
+        };
+        let extra = session.bind().debug_extra_method();
+        table.methods = mt.hashes(&inferred.part_names, &extra);
+        let lists = mt.lists();
         let mut s = session.clone();
         s.bind_mut().with_core(|c, _| {
-            if c.props(netcore::entity::scene_hash(&scene.path)) != Some(&table) {
+            let hash = netcore::entity::scene_hash(&scene.path);
+            if c.props(hash) != Some(&table) {
                 c.register_props(&scene.path, table, inferred.part_names.clone());
             }
+            c.register_methods(hash, lists);
         });
         if let Some(e) = self.entries.get_mut(&node.instance_id()) {
             e.actions = actions;
+            e.methods = Some(mt);
         }
         Some(rt)
     }
@@ -1185,8 +1227,8 @@ impl NetManager {
         }
     }
 
-    /// The hook WP6's `Net.sync` will call: poll the entity's cold properties at the next record.
-    #[allow(dead_code)]
+    /// Polls the entity's cold properties at the next record (WP6: after a call ran on it, so a changed
+    /// `@export` reaches the replicas on the next tick).
     pub fn mark_cold_dirty(&mut self, root: &Gd<Node>) {
         if let Some(e) = self.entries.get_mut(&root.instance_id()) {
             e.cold_force = true;
@@ -1981,4 +2023,308 @@ pub fn priority_of(root: &Gd<Node>) -> f32 {
         }
     }
     net_entity_of(root).map_or(1.0, |ne| ne.bind().get_priority() as f32)
+}
+
+/// WP6: calls (docs/PLAN_NETCODE.md 2.1 "Auto-exposed methods"; the verbs are in call.rs, the routing in
+/// netcore/src/call.rs). Outgoing: `call_out` resolves the part and the method, then runs the call
+/// locally (no session: single player), queues it (the entity has no net id yet), or asks netcore for
+/// the route and runs it here when the route says so. Incoming: `on_call` (an `EntityEvent::Call`, in
+/// order with the entity events) checks trust on the server (D14: the sender owns the entity, or the
+/// part's `_net_allow(method, sender)` says yes), runs the method with `callv` (a trailing
+/// `NetCallInfo` appended when the method declares one), marks the entity's cold properties dirty and
+/// reports back to netcore. User code runs under the base guard; core access in short `with_core`
+/// borrows.
+impl NetManager {
+    /// The method tables of the entity rooted at `iid` (derived now when the entity was not spawned yet).
+    fn methods_of(&mut self, iid: InstanceId) -> Option<Rc<MethodTable>> {
+        let e = self.entries.get(&iid)?;
+        if let Some(m) = &e.methods {
+            return Some(m.clone());
+        }
+        let scene = e.scene.clone();
+        let root = Gd::<Node>::try_from_instance_id(iid).ok()?;
+        let nodes = part_node_list(&scene, &root);
+        let mt = methods::table_for(&scene, &nodes);
+        if let Some(e) = self.entries.get_mut(&iid) {
+            e.methods = Some(mt.clone());
+        }
+        Some(mt)
+    }
+
+    /// A call on `node`, a part of the entity rooted at `root` (call.rs checked the Callable and
+    /// encoded the arguments). Errors are the call site's.
+    pub fn call_out(
+        &mut self,
+        root: &Gd<Node>,
+        node: &Gd<Node>,
+        req: CallReq,
+    ) -> Result<(), String> {
+        let iid = root.instance_id();
+        let Some(e) = self.entries.get(&iid) else {
+            return Err(std::format!("{} is not enrolled", root.get_path()));
+        };
+        let rel = root.get_path_to(node).to_string();
+        let Some(part) = e.scene.table.index_of(&rel) else {
+            return Err(std::format!(
+                "{} is inside the entity {} but is not one of its parts (a node added at run time); call a method of a part of the scene",
+                node.get_path(),
+                root.get_path()
+            ));
+        };
+        let id = e.id;
+        let Some(mt) = self.methods_of(iid) else {
+            return Err(std::format!("{} has no method table", root.get_path()));
+        };
+        let hash = method_hash(&req.method.to_string());
+        let Some(mi) = mt.lookup(part, hash).cloned() else {
+            return Err(std::format!(
+                "{} has no network-callable method {} (its script and class methods are, except those beginning with _)",
+                node.get_path(),
+                req.method
+            ));
+        };
+        // Read the session now: a manager added this tick has not synced yet.
+        let online = self.session().is_some_and(|s| s.bind().is_connected());
+        if !online {
+            // Single player (or no session yet in this branch): it just runs.
+            let info = mi.wants_info.then(|| NetCallInfo::make(1, 0, true));
+            let v = {
+                let _guard = self.base_mut();
+                invoke(node, &StringName::from(mi.name.as_str()), &req.args, info)
+            };
+            NetCall::resolve(&req.call, Ok(v));
+            return Ok(());
+        }
+        let queued = Queued {
+            iid,
+            part,
+            hash,
+            wants_info: mi.wants_info,
+            req,
+        };
+        match id {
+            Some(id) => self.dispatch(id, queued),
+            None => self.queued_calls.push(queued),
+        }
+        Ok(())
+    }
+
+    /// Hands a call on a spawned entity to netcore and runs it here when the route says so.
+    fn dispatch(&mut self, id: NetId, q: Queued) {
+        let Some(mut session) = self.session() else {
+            NetCall::resolve(&q.req.call, Err(String::from("no session")));
+            return;
+        };
+        let out = OutCall {
+            entity: id,
+            part: q.part,
+            method: q.hash,
+            verb: q.req.verb,
+            target: q.req.target,
+            args: q.req.bytes.clone(),
+            unreliable: q.req.unreliable,
+        };
+        let plan = session
+            .bind_mut()
+            .with_core(|c, now| c.call(out, now).map(|p| (p, c.current_tick())));
+        let (plan, tick) = match plan {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => {
+                NetCall::resolve(&q.req.call, Err(e));
+                return;
+            }
+            None => {
+                NetCall::resolve(&q.req.call, Err(String::from("no session")));
+                return;
+            }
+        };
+        let mut value = Variant::nil();
+        if plan.run_local {
+            let node = Gd::<Node>::try_from_instance_id(q.iid)
+                .ok()
+                .and_then(|root| {
+                    self.entries
+                        .get(&q.iid)
+                        .and_then(|e| e.scene.part_node(&root, q.part))
+                });
+            if let Some(node) = node {
+                let local = session.bind().unique_id() as u32;
+                let info = q.wants_info.then(|| NetCallInfo::make(local, tick, true));
+                let name = StringName::from(q.req.method.to_string().as_str());
+                value = {
+                    let _guard = self.base_mut();
+                    invoke(&node, &name, &q.req.args, info)
+                };
+                self.cold_dirty(q.iid);
+            }
+        }
+        match plan.request {
+            Some(r) => session.bind_mut().register_call(r, q.req.call.clone()),
+            None => NetCall::resolve(&q.req.call, Ok(value)),
+        }
+    }
+
+    /// Dispatches queued calls whose entity got its net id; drops those whose entity is gone.
+    fn flush_queued(&mut self, _session: &Gd<NetSession>) {
+        if self.queued_calls.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.queued_calls);
+        for q in queued {
+            match self.entries.get(&q.iid).map(|e| e.id) {
+                Some(Some(id)) => self.dispatch(id, q),
+                Some(None) => self.queued_calls.push(q),
+                None => NetCall::resolve(
+                    &q.req.call,
+                    Err(String::from(
+                        "the entity was removed before it was spawned; the call was dropped",
+                    )),
+                ),
+            }
+        }
+    }
+
+    fn cold_dirty(&mut self, iid: InstanceId) {
+        if let Ok(root) = Gd::<Node>::try_from_instance_id(iid) {
+            self.mark_cold_dirty(&root);
+        }
+    }
+
+    /// A received call (in order with the entity events).
+    fn on_call(&mut self, session: &Gd<NetSession>, ci: CallIn) {
+        let mut s = session.clone();
+        let respond = |s: &mut Gd<NetSession>, result: Result<Vec<u8>, String>| {
+            if ci.handle != 0 {
+                s.bind_mut()
+                    .with_core(|c, now| c.finish_call(ci.handle, result, now));
+            }
+        };
+        let Some(iid) = self.by_id.get(&ci.entity).copied() else {
+            respond(&mut s, Err(std::format!("entity {} is gone", ci.entity)));
+            return;
+        };
+        let node = Gd::<Node>::try_from_instance_id(iid).ok().and_then(|root| {
+            self.entries
+                .get(&iid)
+                .and_then(|e| e.scene.part_node(&root, ci.part))
+        });
+        let (Some(node), Some(mt)) = (node, self.methods_of(iid)) else {
+            respond(
+                &mut s,
+                Err(std::format!(
+                    "part {} of entity {} is missing",
+                    ci.part,
+                    ci.entity
+                )),
+            );
+            return;
+        };
+        let Some(mi) = mt.lookup(ci.part, ci.method).cloned() else {
+            respond(
+                &mut s,
+                Err(std::format!(
+                    "unknown method (hash {:08x}) on {}",
+                    ci.method,
+                    node.get_path()
+                )),
+            );
+            return;
+        };
+        if ci.check {
+            let allowed = {
+                let mut n = node.clone();
+                let _guard = self.base_mut();
+                n.has_method("_net_allow")
+                    && n.call(
+                        "_net_allow",
+                        &[
+                            StringName::from(mi.name.as_str()).to_variant(),
+                            i64::from(ci.sender).to_variant(),
+                        ],
+                    )
+                    .try_to::<bool>()
+                    .unwrap_or(false)
+            };
+            if !allowed {
+                let reason = std::format!(
+                    "refused: peer {} may not call {} on {}: it does not own the entity and _net_allow did not admit it",
+                    ci.sender,
+                    mi.name,
+                    node.get_path()
+                );
+                {
+                    let mut obj = s.clone().upcast::<Node>();
+                    let _guard = self.base_mut();
+                    obj.emit_signal(
+                        "call_refused",
+                        &[
+                            node.to_variant(),
+                            StringName::from(mi.name.as_str()).to_variant(),
+                            i64::from(ci.sender).to_variant(),
+                        ],
+                    );
+                }
+                s.bind_mut()
+                    .with_core(|c, now| c.refuse_call(ci.handle, &reason, now));
+                return;
+            }
+        }
+        if !ci.run_local {
+            respond(&mut s, Ok(Vec::new()));
+            return;
+        }
+        let Some(args) = net_call::decode(&ci.args) else {
+            respond(&mut s, Err(String::from("malformed arguments")));
+            return;
+        };
+        let info = mi
+            .wants_info
+            .then(|| NetCallInfo::make(ci.sender, ci.tick, ci.sender == self.local_id));
+        let value = {
+            let _guard = self.base_mut();
+            invoke(&node, &StringName::from(mi.name.as_str()), &args, info)
+        };
+        self.cold_dirty(iid);
+        let bytes = if ci.verb == Verb::Server {
+            net_call::encode_return(&value)
+        } else {
+            Vec::new()
+        };
+        respond(&mut s, Ok(bytes));
+    }
+}
+
+/// Calls `method` on `node` with `args` (and a trailing `NetCallInfo` when given). The caller holds its
+/// base guard (user code runs).
+pub fn invoke(
+    node: &Gd<Node>,
+    method: &StringName,
+    args: &[Variant],
+    info: Option<Gd<NetCallInfo>>,
+) -> Variant {
+    let mut arr = VarArray::new();
+    for a in args {
+        arr.push(a);
+    }
+    if let Some(i) = info {
+        arr.push(&i.to_variant());
+    }
+    let mut n = node.clone();
+    n.callv(method, &arr)
+}
+
+/// The session serving `node`'s branch, if one runs there.
+pub fn session_of(node: &Gd<Node>) -> Option<Gd<NetSession>> {
+    if !node.is_inside_tree() {
+        return None;
+    }
+    let api = node.get_multiplayer()?;
+    if !api.has_meta(crate::session::META_SESSION) {
+        return None;
+    }
+    let iid = api
+        .get_meta(crate::session::META_SESSION)
+        .try_to::<i64>()
+        .ok()?;
+    Gd::<NetSession>::try_from_instance_id(InstanceId::from_i64(iid)).ok()
 }

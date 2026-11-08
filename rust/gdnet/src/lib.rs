@@ -7,6 +7,7 @@ use godot::prelude::*;
 
 mod api_ext;
 mod apply;
+mod call;
 mod configure;
 mod emulation;
 mod entity_node;
@@ -14,6 +15,7 @@ mod infer;
 mod input;
 mod interp;
 mod manager;
+mod methods;
 mod net;
 mod parts;
 mod pipe_peer;

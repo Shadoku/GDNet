@@ -18,6 +18,10 @@
 //!
 //! `now` is microseconds since any epoch, supplied by the caller.
 
+use crate::call::{
+    CallIn, CallMsg, CallPlan, CallResult, CallReturn, CallStats, OutCall, Verb,
+    DEFAULT_CALL_TIMEOUT_US,
+};
 use crate::clock::TickClock;
 use crate::delta::{ReplStats, Replication, StateUpdate};
 use crate::emul::{EmulSettings, Emulator};
@@ -100,6 +104,8 @@ pub enum EntityEvent {
         manager: u64,
         owner: PeerId,
     },
+    /// WP6: a call to run (or, on the server, to check and route), in order with the entity events.
+    Call(CallIn),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -203,6 +209,24 @@ pub struct Session {
     input_stats: InputStats,
     /// WP5 client side: the render timeline, replicas' sample buffers, error and owned offsets.
     interp: Interp,
+    /// WP6: requests, inbound calls awaiting gdnet's verdict, method tables, counters.
+    calls: CallState,
+}
+
+/// WP6: the session's call state.
+#[derive(Default)]
+struct CallState {
+    next_request: u32,
+    next_handle: u64,
+    /// Requests awaiting their `CallReturn`, with the deadline (microseconds).
+    pending: BTreeMap<u32, u64>,
+    /// Server: received calls gdnet has not finished yet, with their sender.
+    inbound: BTreeMap<u64, (CallMsg, PeerId)>,
+    results: VecDeque<CallResult>,
+    /// Per scene hash, per part: the sorted method hashes (local only; the wire carries their hash).
+    methods: BTreeMap<u64, Vec<Vec<u32>>>,
+    stats: CallStats,
+    timeout_us: u64,
 }
 
 /// WP4 input counters.
@@ -292,6 +316,10 @@ impl Session {
             interaction: false,
             input_stats: InputStats::default(),
             interp: Interp::new(rate),
+            calls: CallState {
+                timeout_us: DEFAULT_CALL_TIMEOUT_US,
+                ..CallState::default()
+            },
         }
     }
 
@@ -546,6 +574,10 @@ impl Session {
             Message::Ack(a) if self.role == Role::Server && self.peers.is_joined(peer) => {
                 self.repl.on_ack(peer, a, tick);
             }
+            Message::Call(c) => self.on_call(peer, c, now_us),
+            Message::CallReturn(r) if self.role == Role::Client && peer == SERVER => {
+                self.on_call_return(r);
+            }
             Message::Pong(p) => {
                 let rtt = now_us.saturating_sub(p.echo_us) as f64;
                 if let Some(state) = self.peers.get_mut(peer) {
@@ -702,6 +734,7 @@ impl Session {
             });
         }
         self.input_tick(tick);
+        self.expire_calls(now_us);
         self.flush_emulated(now_us);
     }
 
@@ -785,6 +818,7 @@ fn held_description(a: &EntityAction, paths: &BTreeMap<u64, String>) -> String {
         }
         EntityAction::SetOwner { id, .. } => std::format!("the owner change of entity {id}"),
         EntityAction::Scene { path, .. } => std::format!("the scene {path}"),
+        EntityAction::Call(c) => std::format!("a call on entity {}", c.entity),
     }
 }
 
@@ -1129,6 +1163,8 @@ impl Session {
                             && self.entities.get(*id).is_none_or(|r| r.owner == peer)
                     }
                     EntityAction::SetOwner { .. } | EntityAction::Scene { .. } => false,
+                    // WP6: admitted by `on_call` (sender set from the transport).
+                    EntityAction::Call(_) => true,
                 }
             }
         }
@@ -1153,6 +1189,7 @@ impl Session {
     fn apply(&mut self, from: PeerId, action: EntityAction, now_us: u64) {
         match action {
             EntityAction::Scene { .. } => {}
+            EntityAction::Call(c) => self.deliver_call(from, c, now_us),
             EntityAction::Create(create) => {
                 let scene_path = self
                     .scene_paths
@@ -1222,6 +1259,350 @@ impl Session {
                 }
             }
         }
+    }
+}
+
+/// Calls (WP6, call.rs): routing, trust hand-off to gdnet, request ids and timeouts.
+impl Session {
+    /// Registers this side's method tables for a scene (per part, the hashes of its exposed method
+    /// names). A received call naming a hash its part does not have is answered with an error (and
+    /// counted), not delivered. Scenes without a table are delivered unchecked.
+    pub fn register_methods(&mut self, scene: u64, mut parts: Vec<Vec<u32>>) {
+        for p in &mut parts {
+            p.sort_unstable();
+            p.dedup();
+        }
+        self.calls.methods.insert(scene, parts);
+    }
+
+    /// Changes how long a request waits for its answer (default 10 s).
+    pub fn set_call_timeout_us(&mut self, us: u64) {
+        self.calls.timeout_us = us.max(1);
+    }
+
+    pub fn call_stats(&self) -> CallStats {
+        self.calls.stats
+    }
+
+    /// Requests waiting for a `CallReturn`.
+    pub fn pending_requests(&self) -> usize {
+        self.calls.pending.len()
+    }
+
+    /// The next resolved request (its `CallReturn`, or a timeout).
+    pub fn poll_call_result(&mut self) -> Option<CallResult> {
+        self.calls.results.pop_front()
+    }
+
+    /// Makes a call from this side: decides who runs it (the module table of call.rs), sends what must
+    /// be sent, and says whether the caller runs it now. Errors (not connected, an unknown entity, a
+    /// target peer that is not connected) send nothing.
+    pub fn call(&mut self, c: OutCall, now_us: u64) -> Result<CallPlan, String> {
+        if !self.is_connected() {
+            return Err(String::from("the session is not connected"));
+        }
+        let Some(owner) = self.entities.get(c.entity).map(|r| r.owner) else {
+            return Err(std::format!(
+                "entity {} is not spawned on this peer",
+                c.entity
+            ));
+        };
+        let local = self.local_id;
+        let mut msg = CallMsg {
+            entity: c.entity,
+            part: c.part,
+            method: c.method,
+            verb: c.verb,
+            target: if c.verb == Verb::Peer { c.target } else { 0 },
+            sender: local,
+            request: 0,
+            tick: self.clock.tick(),
+            unreliable: c.unreliable,
+            args: c.args,
+        };
+        let mut plan = CallPlan::default();
+        match self.role {
+            Role::Server => match c.verb {
+                Verb::Sync => {
+                    plan.run_local = true;
+                    plan.sent = self.broadcast_call(&msg, None, now_us);
+                }
+                Verb::Server => plan.run_local = true,
+                Verb::Others => plan.sent = self.broadcast_call(&msg, None, now_us),
+                Verb::Owner | Verb::Peer => {
+                    let to = if c.verb == Verb::Owner {
+                        owner
+                    } else {
+                        c.target
+                    };
+                    if to == SERVER {
+                        plan.run_local = true;
+                    } else if self.peers.is_joined(to) {
+                        self.send_call(to, msg, now_us);
+                        plan.sent = true;
+                    } else {
+                        return Err(std::format!("peer {to} is not connected"));
+                    }
+                }
+            },
+            Role::Client => {
+                let mine = match c.verb {
+                    Verb::Owner => owner == local,
+                    Verb::Peer => c.target == local,
+                    _ => false,
+                };
+                if mine {
+                    plan.run_local = true;
+                    return Ok(plan);
+                }
+                if !msg.unreliable {
+                    self.calls.next_request = self.calls.next_request.wrapping_add(1).max(1);
+                    let r = self.calls.next_request;
+                    self.calls
+                        .pending
+                        .insert(r, now_us.saturating_add(self.calls.timeout_us));
+                    msg.request = r;
+                    plan.request = Some(r);
+                }
+                self.send_call(SERVER, msg, now_us);
+                plan.sent = true;
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Server: gdnet ran (or checked) the call `handle` it was given; `result` is the encoded return
+    /// value, or an error for the caller. On success the call goes on as its verb says (a `Sync` to
+    /// every peer in scope, the caller included; `Others` to everyone but the caller; `Owner` / `Peer`
+    /// to their target) and the caller's request is answered.
+    pub fn finish_call(&mut self, handle: u64, result: Result<Vec<u8>, String>, now_us: u64) {
+        let Some((c, from)) = self.calls.inbound.remove(&handle) else {
+            return;
+        };
+        let value = match result {
+            Err(e) => {
+                if c.request != 0 {
+                    self.send_return(from, c.request, Err(e), now_us);
+                }
+                return;
+            }
+            Ok(v) => v,
+        };
+        let relay = CallMsg {
+            request: 0,
+            sender: from,
+            ..c.clone()
+        };
+        match c.verb {
+            Verb::Sync => {
+                self.broadcast_call(&relay, None, now_us);
+            }
+            Verb::Others => {
+                self.broadcast_call(&relay, Some(from), now_us);
+            }
+            Verb::Server => {}
+            Verb::Owner | Verb::Peer => {
+                let to = if c.verb == Verb::Owner {
+                    self.entities.get(c.entity).map_or(SERVER, |r| r.owner)
+                } else {
+                    c.target
+                };
+                if to != SERVER && self.peers.is_joined(to) {
+                    self.send_call(to, relay, now_us);
+                }
+            }
+        }
+        if c.request != 0 {
+            let v = if c.verb == Verb::Server {
+                value
+            } else {
+                Vec::new()
+            };
+            self.send_return(from, c.request, Ok(v), now_us);
+        }
+    }
+
+    /// Server: gdnet refused the call `handle` (the trust check of D14); the caller gets `reason`.
+    pub fn refuse_call(&mut self, handle: u64, reason: &str, now_us: u64) {
+        if self.calls.inbound.contains_key(&handle) {
+            self.calls.stats.refused += 1;
+            self.finish_call(handle, Err(String::from(reason)), now_us);
+        }
+    }
+
+    /// Interest hook: whether `peer` has entity `id` in scope (every joined peer until WP7/WP13 add
+    /// interest management).
+    fn in_scope(&self, _peer: PeerId, _id: NetId) -> bool {
+        true
+    }
+
+    fn send_call(&mut self, peer: PeerId, msg: CallMsg, now_us: u64) {
+        self.calls.stats.sent += 1;
+        self.send(peer, &Message::Call(msg), now_us);
+    }
+
+    /// The server sends `msg` to every joined peer in scope but `except`. True when any was sent.
+    fn broadcast_call(&mut self, msg: &CallMsg, except: Option<PeerId>, now_us: u64) -> bool {
+        let targets: Vec<PeerId> = self
+            .peers
+            .joined()
+            .into_iter()
+            .filter(|p| Some(*p) != except && self.in_scope(*p, msg.entity))
+            .collect();
+        for &p in &targets {
+            self.send_call(p, msg.clone(), now_us);
+        }
+        !targets.is_empty()
+    }
+
+    fn send_return(
+        &mut self,
+        peer: PeerId,
+        request: u32,
+        result: Result<Vec<u8>, String>,
+        now_us: u64,
+    ) {
+        let ret = match result {
+            Ok(value) => CallReturn {
+                request,
+                ok: true,
+                value,
+                error: String::new(),
+            },
+            Err(error) => CallReturn {
+                request,
+                ok: false,
+                value: Vec::new(),
+                error,
+            },
+        };
+        self.send(peer, &Message::CallReturn(ret), now_us);
+    }
+
+    /// A received call: a client takes calls from the server only; the server takes them from joined
+    /// peers and stamps the sender from the transport. It then goes through the held queue, so it waits
+    /// behind its entity's pending `Create`.
+    fn on_call(&mut self, peer: PeerId, mut c: CallMsg, now_us: u64) {
+        match self.role {
+            Role::Client => {
+                if peer != SERVER || !self.is_connected() {
+                    return;
+                }
+            }
+            Role::Server => {
+                if !self.peers.is_joined(peer) {
+                    return;
+                }
+                c.sender = peer;
+            }
+        }
+        self.calls.stats.received += 1;
+        self.on_entity(peer, EntityAction::Call(c), now_us);
+    }
+
+    fn on_call_return(&mut self, r: CallReturn) {
+        self.calls.stats.returns += 1;
+        if self.calls.pending.remove(&r.request).is_some() {
+            let result = if r.ok { Ok(r.value) } else { Err(r.error) };
+            self.calls.results.push_back(CallResult {
+                request: r.request,
+                result,
+            });
+        }
+    }
+
+    fn expire_calls(&mut self, now_us: u64) {
+        let expired: Vec<u32> = self
+            .calls
+            .pending
+            .iter()
+            .filter(|(_, d)| now_us >= **d)
+            .map(|(r, _)| *r)
+            .collect();
+        let secs = self.calls.timeout_us as f64 / 1_000_000.0;
+        for r in expired {
+            self.calls.pending.remove(&r);
+            self.calls.stats.timeouts += 1;
+            self.calls.results.push_back(CallResult {
+                request: r,
+                result: Err(std::format!(
+                    "the call timed out after {secs} s without an answer from the server"
+                )),
+            });
+        }
+    }
+
+    fn method_known(&self, scene: u64, part: u16, method: u32) -> bool {
+        match self.calls.methods.get(&scene) {
+            None => true,
+            Some(parts) => parts
+                .get(usize::from(part))
+                .is_some_and(|p| p.binary_search(&method).is_ok()),
+        }
+    }
+
+    /// A call whose entity is ready (or gone): checks it and hands it to gdnet.
+    fn deliver_call(&mut self, from: PeerId, c: CallMsg, now_us: u64) {
+        let Some((manager, owner, scene)) = self
+            .entities
+            .get(c.entity)
+            .map(|r| (r.parent.manager, r.owner, r.scene))
+        else {
+            self.calls.stats.dropped += 1;
+            if self.role == Role::Server && c.request != 0 {
+                let e = std::format!("entity {} was destroyed before the call arrived", c.entity);
+                self.send_return(from, c.request, Err(e), now_us);
+            }
+            return;
+        };
+        if !self.method_known(scene, c.part, c.method) {
+            self.calls.stats.unknown_method += 1;
+            if self.role == Role::Server && c.request != 0 {
+                let path = self
+                    .scene_paths
+                    .get(&scene)
+                    .cloned()
+                    .unwrap_or_else(|| std::format!("{scene:016x}"));
+                let e = std::format!(
+                    "unknown method (hash {:08x}) on part {} of entity {} ({path}); methods beginning with _ are never callable",
+                    c.method, c.part, c.entity
+                );
+                self.send_return(from, c.request, Err(e), now_us);
+            }
+            return;
+        }
+        let mut inc = CallIn {
+            handle: 0,
+            manager,
+            entity: c.entity,
+            part: c.part,
+            method: c.method,
+            verb: c.verb,
+            sender: c.sender,
+            tick: c.tick,
+            args: c.args.clone(),
+            check: false,
+            run_local: true,
+        };
+        if self.role == Role::Server {
+            if c.verb == Verb::Peer && c.target != SERVER && !self.peers.is_joined(c.target) {
+                if c.request != 0 {
+                    let e = std::format!("peer {} is not connected", c.target);
+                    self.send_return(from, c.request, Err(e), now_us);
+                }
+                return;
+            }
+            inc.run_local = match c.verb {
+                Verb::Sync | Verb::Server | Verb::Others => true,
+                Verb::Owner => owner == SERVER,
+                Verb::Peer => c.target == SERVER,
+            };
+            inc.check = c.verb != Verb::Server && owner != from;
+            self.calls.next_handle += 1;
+            inc.handle = self.calls.next_handle;
+            self.calls.inbound.insert(inc.handle, (c, from));
+        }
+        self.entity_events.push_back(EntityEvent::Call(inc));
     }
 }
 

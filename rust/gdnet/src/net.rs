@@ -26,7 +26,13 @@
 //! from the default session) and `global_input_warnings()`.
 //!
 //! WP5: the read-only `jitter_buffer_ticks` (interp.rs) and the `teleport_distance` key of `configure()`.
+//!
+//! WP6: the call verbs `sync`, `sync_unreliable`, `server`, `owner`, `others`, `peer` (call.rs) and the
+//! signal `call_refused(node, method, sender)` (relayed from the default session). gdext has no
+//! varargs `#[func]`, so each verb takes up to eight optional Variant arguments (the left-out slots hold
+//! a private RID sentinel); they serve any branch, through the node's manager.
 
+use crate::call::{self as net_call, NetArg, NetCall};
 use crate::configure::{self, Op};
 use crate::emulation::NetEmulation;
 use crate::input::NetInput;
@@ -41,6 +47,7 @@ use godot::classes::node::InternalMode;
 use godot::classes::{ENetMultiplayerPeer, Engine, MultiplayerPeer, Node, PackedScene, SceneTree};
 use godot::global::Error;
 use godot::prelude::*;
+use netcore::call::Verb;
 
 /// Name of the default session's node under the tree's root.
 pub const SESSION_NODE: &str = "__NetSession";
@@ -62,7 +69,7 @@ fn scene_root_of(node: &Gd<Node>) -> Gd<Node> {
     node.clone()
 }
 
-const RELAYED: [(&str, &str); 9] = [
+const RELAYED: [(&str, &str); 10] = [
     ("peer_joined", "_on_peer_joined"),
     ("peer_left", "_on_peer_left"),
     ("connected", "_on_connected"),
@@ -72,6 +79,7 @@ const RELAYED: [(&str, &str); 9] = [
     ("entity_despawning", "_on_entity_despawning"),
     ("spawn_refused", "_on_spawn_refused"),
     ("rolled_back", "_on_rolled_back"),
+    ("call_refused", "_on_call_refused"),
 ];
 
 #[derive(GodotClass)]
@@ -363,6 +371,9 @@ impl Net {
     /// up to `from_tick` (relayed from the default session).
     #[signal]
     fn rolled_back(node: Gd<Node>, from_tick: i64, to_tick: i64);
+    /// WP6 (server): a call was refused (relayed from the default session).
+    #[signal]
+    fn call_refused(node: Gd<Node>, method: StringName, sender: i64);
 
     /// Enrols `node`'s subtree as if `node` were a `NetManager` (its scene instances become entities).
     /// For nodes outside any manager; call it on every peer, at the same path, before spawning under it.
@@ -635,6 +646,173 @@ impl Net {
                 from_tick.to_variant(),
                 to_tick.to_variant(),
             ],
+        );
+    }
+
+    /// WP6 (rung 2): runs `callable` (a method of a part of a managed entity) on the authority, then on
+    /// every peer that has the entity in scope. From a client it goes to the server only, which checks
+    /// that the caller owns the entity (or the part's `_net_allow(method, sender)` admits it), runs it
+    /// and sends it to everyone, the caller included. Up to eight arguments; bound arguments count.
+    /// Returns a `NetCall` (`ok` / `error` once `completed`). Without a session it just runs.
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn sync(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Sync,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        )
+    }
+
+    /// WP6: `sync` on the unreliable channel (no answer, may be lost; for cosmetic effects).
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn sync_unreliable(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Sync,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            true,
+        )
+    }
+
+    /// WP6: runs `callable` on the server (any peer may call it; the method may take a trailing
+    /// `NetCallInfo` to learn the sender) and returns the `completed` signal of its `NetCall`, so
+    /// `var v = await Net.server(try_buy, 3)` is the server's return value (null on an error; the
+    /// signal's object is the `NetCall`).
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn server(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Signal {
+        let call = net_call::make_call(
+            Verb::Server,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        );
+        Signal::from_object_signal(&call, "completed")
+    }
+
+    /// WP6: runs `callable` on the entity's owner only.
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn owner(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Owner,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        )
+    }
+
+    /// WP6: runs `callable` on every peer but the caller (the server included when a client calls).
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn others(
+        &mut self,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Others,
+            0,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        )
+    }
+
+    /// WP6: runs `callable` on peer `id` only (1 = the server; a client's call goes via the server).
+    // One slot per optional argument: gdext 0.5.5 has no varargs #[func].
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn peer(
+        &mut self,
+        id: i64,
+        callable: Callable,
+        #[opt(default = net_call::NetArg::absent())] a0: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a1: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a2: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a3: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a4: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a5: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a6: NetArg,
+        #[opt(default = net_call::NetArg::absent())] a7: NetArg,
+    ) -> Gd<NetCall> {
+        net_call::make_call(
+            Verb::Peer,
+            id.max(0) as u32,
+            &callable,
+            net_call::collect_args([a0, a1, a2, a3, a4, a5, a6, a7]),
+            false,
+        )
+    }
+
+    #[func]
+    fn _on_call_refused(&mut self, node: Gd<Node>, method: StringName, sender: i64) {
+        self.base_mut().emit_signal(
+            "call_refused",
+            &[node.to_variant(), method.to_variant(), sender.to_variant()],
         );
     }
 
