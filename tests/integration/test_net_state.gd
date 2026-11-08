@@ -11,6 +11,8 @@ var net: NetFixture
 
 
 func after_each() -> void:
+	Net.budget_bytes_per_s = 0
+	Net.hash_sample = -1
 	if net != null:
 		net.teardown()
 		net = null
@@ -322,6 +324,34 @@ func test_g4_moving_entities_stay_within_the_budget() -> void:
 	assert_eq(stats["budget_bytes_per_s"], 32768)
 	assert_lt(snap, 32768 + 1200, "within the 32 KB/s budget")
 	assert_gt(snap, 16000, "and the budget is used")
+
+
+## Review 2026-11-08: `Net.budget_bytes_per_s` and `Net.hash_sample` reach sessions that are already
+## running (sessions whose own value is 0 / -1 follow `Net`, and re-read it every tick).
+func test_net_budget_and_hash_sample_apply_to_running_sessions() -> void:
+	net = NetFixture.new(self, 1)
+	net.start()
+	assert_true(await net.wait_connected())
+	_moving_crates(100)
+	assert_true(await net.wait_until(func() -> bool: return net.session(net.clients[0]).entity_count() == 100))
+	Net.budget_bytes_per_s = 8192
+	Net.hash_sample = 0
+	await _frames(Engine.physics_ticks_per_second + 2)
+	var hashes_before: int = net.server_session.stats()["hashes_sent"]
+	await _frames(Engine.physics_ticks_per_second + 2)
+	var stats: Dictionary = net.server_session.stats()
+	var snap: int = (stats["bytes_sent_per_s"] as PackedInt64Array)[1]
+	print("live budget: %d B/s of snapshots after Net.budget_bytes_per_s = 8192" % snap)
+	assert_eq(stats["budget_bytes_per_s"], 8192)
+	assert_lt(snap, 8192 + 1200, "the running session took the new budget")
+	assert_gt(snap, 4000, "and uses it")
+	assert_eq(Net.hash_sample, 0)
+	assert_eq(stats["hash_sample"], 0)
+	assert_eq(int(stats["hashes_sent"]) - hashes_before, 0, "no hashes sampled at hash_sample 0")
+	Net.hash_sample = -1
+	assert_eq(Net.hash_sample, 16, "-1 reads back as the project setting's value")
+	await _frames(10)
+	assert_gt(int(net.server_session.stats()["hashes_sent"]), hashes_before, "sampling again")
 
 
 func test_g4_a_halved_budget_updates_far_entities_less_often() -> void:

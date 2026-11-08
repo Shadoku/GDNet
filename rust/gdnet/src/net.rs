@@ -116,9 +116,17 @@ pub struct Net {
     /// Cold properties are polled every this many ticks (0 = `gdnet/sync/cold_poll_ticks`, default 6).
     #[var(get = get_cold_poll_ticks, set = set_cold_poll_ticks)]
     cold_poll_ticks: i64,
-    /// Snapshot bytes per second per peer (0 = `gdnet/budget/bytes_per_second`, default 32,768).
+    /// Snapshot bytes per second per peer (0 = `gdnet/budget/bytes_per_second`, default 32,768) for
+    /// sessions whose own `budget_bytes_per_s` is 0 (`Net`'s among them). Applies to running sessions
+    /// at their next tick (review 2026-11-08; WP14 had it read only at session start).
     #[var(get = get_budget_bytes_per_s, set = set_budget_bytes_per_s)]
     budget_bytes_per_s: i64,
+    /// Review 2026-11-08: entities hash telemetry samples per tick on sessions whose own `hash_sample`
+    /// is -1 (`Net`'s among them). Reads as the effective value; -1 written = back to
+    /// `gdnet/debug/hash_sample` (default 16). Applies to running sessions at their next tick.
+    #[var(get = get_hash_sample, set = set_hash_sample)]
+    #[allow(dead_code)]
+    hash_sample: i64,
     /// WP4: owners apply the input they sample this many ticks later (and stamp it accordingly), which
     /// trades responsiveness for fewer rollbacks. Default 0; applies to every session at once.
     #[var(get = get_input_delay_ticks, set = set_input_delay_ticks)]
@@ -190,6 +198,16 @@ impl Net {
     fn set_budget_bytes_per_s(&mut self, v: i64) {
         self.budget_bytes_per_s = v.max(0);
         profiles::set_budget((v > 0).then_some(v as u32));
+    }
+
+    #[func]
+    fn get_hash_sample(&self) -> i64 {
+        i64::from(crate::hash::sample())
+    }
+
+    #[func]
+    fn set_hash_sample(&mut self, v: i64) {
+        crate::hash::set_net_sample((v >= 0).then(|| v.min(1024) as u32));
     }
 
     #[func]

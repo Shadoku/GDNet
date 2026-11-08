@@ -461,7 +461,7 @@ func _ready() -> void:
 		pit.ball_count = int(v)
 		_show_values())
 	$Budget.value_changed.connect(func(v: float) -> void:
-		Net.session_for(pit).budget_bytes_per_s = int(v)
+		Net.budget_bytes_per_s = int(v)
 		_show_values())
 	$Trusted.toggled.connect(pit.set_trusted_paddles)
 	$Shake.pressed.connect(pit.shake)
@@ -477,7 +477,7 @@ func start() -> void:
 	$Trusted.disabled = not host
 	$Shake.disabled = not host
 	$Balls.set_value_no_signal(pit.ball_count)
-	$Budget.set_value_no_signal(session.budget_bytes_per_s)
+	$Budget.set_value_no_signal(Net.budget_bytes_per_s)
 	Net.show_meter($Meter.button_pressed)
 	_show_values()
 
@@ -487,8 +487,8 @@ func _show_values() -> void:
 	$BudgetLabel.text = "Budget: %d B/s per peer" % int($Budget.value)
 ```
 
-The budget slider sets `budget_bytes_per_s` on the host's session (`Net.session_for(pit)` is `Net`'s own
-session in a game): snapshot bytes per second per peer, applied at once.
+The budget slider sets `Net.budget_bytes_per_s`: snapshot bytes per second per peer, applied to the
+running session at its next tick.
 
 ## Bandwidth
 

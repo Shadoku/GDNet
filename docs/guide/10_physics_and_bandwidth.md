@@ -97,7 +97,8 @@ NetSession.entity_sends(node, peer)   # how many snapshots carried that entity t
 
 ## The budget and degradation
 
-`Net.budget_bytes_per_s` (or `NetSession.budget_bytes_per_s`, applied at once; the project setting
+`Net.budget_bytes_per_s` (or `NetSession.budget_bytes_per_s`; both apply to a running session at once;
+the project setting
 `gdnet/budget/bytes_per_second`, 32,768) is a token bucket per client: it fills by budget / tick rate
 each tick and holds at most two MTUs of slack, so the average stays within the budget while a full MTU is
 still possible now and then. When more is pending than fits, the low-weight entities wait: they
@@ -140,6 +141,7 @@ hot properties (a body whose `scale` never changes costs nothing for it: only ch
 ## Hash telemetry with many bodies
 
 Hash telemetry samples `gdnet/debug/hash_sample` entities a tick (16). With hundreds of moving bodies
-that can be a noticeable share of a small budget, so a busy scene lowers it per session:
-`Net.session_for(self).hash_sample = 2`. The Ballpit demo does; its channel 2 (hashes and pings) stays at
-about 66 B/s with 300 shaken balls, 0.4 % of a 16 KB/s budget.
+that can be a noticeable share of a small budget, so a busy scene lowers it: `Net.hash_sample = 2` (every
+session that has no value of its own, at its next tick), or per session
+`Net.session_for(self).hash_sample = 2`. The Ballpit demo does the latter; its channel 2 (hashes and
+pings) stays at about 88 B/s with 300 shaken balls, 0.5 % of a 16 KB/s budget.

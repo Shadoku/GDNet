@@ -102,8 +102,8 @@ pub struct NetSession {
     branch_root: Option<Gd<Node>>,
     /// Entity events for a manager not found yet, with the tick they arrived and whether reported.
     unrouted: Vec<(u64, bool, EntityEvent)>,
-    /// WP3: snapshot bytes per second per peer; 0 = `Net.budget_bytes_per_s` / the project setting.
-    /// Changes apply at once.
+    /// WP3: snapshot bytes per second per peer; 0 = `Net.budget_bytes_per_s` / the project setting
+    /// (re-read every tick). Changes apply at once.
     #[var(get = get_budget_bytes_per_s, set = set_budget_bytes_per_s)]
     budget_bytes_per_s: i64,
     /// WP3: cold properties are polled every this many ticks; 0 = `Net.cold_poll_ticks` / the project
@@ -160,8 +160,8 @@ pub struct NetSession {
     interacting: HashMap<u32, BTreeSet<NetId>>,
     /// WP14: microseconds the last interaction pass took.
     interaction_us: u64,
-    /// WP14: entities hash telemetry samples per tick on this server; -1 = the project setting
-    /// `gdnet/debug/hash_sample` (default 16). Changes apply at once.
+    /// WP14: entities hash telemetry samples per tick on this server; -1 = `Net.hash_sample`, else the
+    /// project setting `gdnet/debug/hash_sample` (default 16). Changes apply at once.
     #[var(get = get_hash_sample, set = set_hash_sample)]
     #[init(val = -1)]
     hash_sample: i64,
@@ -1317,6 +1317,7 @@ impl NetSession {
             return;
         }
         let now = now_us();
+        self.refresh_live_settings();
         if self.is_server() && self.is_connected() {
             let t0 = now_us();
             let tick = self.core.as_ref().map_or(0, |c| c.current_tick());
@@ -1643,6 +1644,22 @@ impl NetSession {
         }
         self.interacting = next;
         self.interaction_us = now_us().saturating_sub(t0);
+    }
+
+    /// Review 2026-11-08: the budget and the hash sample follow `Net` / the project settings while
+    /// this session's own value is unset, so a write to `Net.budget_bytes_per_s` or `Net.hash_sample`
+    /// reaches a running session at its next tick (the cold poll interval and the input delay were
+    /// already read every tick).
+    fn refresh_live_settings(&mut self) {
+        let budget = self.effective_budget();
+        let sample = self.effective_hash_sample();
+        if let Some(c) = self.core.as_mut() {
+            if c.budget() != budget {
+                c.set_budget(budget);
+            }
+            let on = c.hash_telemetry();
+            c.set_hash_telemetry(on, sample);
+        }
     }
 
     fn effective_hash_sample(&self) -> u32 {
