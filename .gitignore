@@ -16,3 +16,7 @@ junit.xml
 .DS_Store
 Thumbs.db
 __pycache__/
+
+# gdnet (docs/PLAN_NETCODE.md D7): build outputs are never committed
+rust/target/
+addons/gdnet/bin/

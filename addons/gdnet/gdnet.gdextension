@@ -1,0 +1,16 @@
+[configuration]
+
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.3
+reloadable = true
+
+[libraries]
+
+linux.debug.x86_64 = "res://addons/gdnet/bin/linux-x86_64/libgdnet.so"
+linux.release.x86_64 = "res://addons/gdnet/bin/linux-x86_64/libgdnet.so"
+linux.debug.arm64 = "res://addons/gdnet/bin/linux-arm64/libgdnet.so"
+linux.release.arm64 = "res://addons/gdnet/bin/linux-arm64/libgdnet.so"
+windows.debug.x86_64 = "res://addons/gdnet/bin/windows-x86_64/gdnet.dll"
+windows.release.x86_64 = "res://addons/gdnet/bin/windows-x86_64/gdnet.dll"
+macos.debug = "res://addons/gdnet/bin/macos/libgdnet.dylib"
+macos.release = "res://addons/gdnet/bin/macos/libgdnet.dylib"

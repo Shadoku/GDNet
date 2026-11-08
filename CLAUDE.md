@@ -4,11 +4,20 @@ Godot 4 project set up for AI-assisted development: every change is verified by
 `python3 tools/check.py`, which runs headless without the editor. Trust its
 output over your own reasoning about whether code works.
 
+The project is the sample game and test bed for **gdnet**, a Rust GDExtension for
+multiplayer that stays close to single-player development. Its design and work
+packages are in `docs/PLAN_NETCODE.md` (approved 2026-11-08; the status table at
+its end says what is built); the research behind it is
+`docs/reports/Rust GDExtension multiplayer design.md` and `docs/research_notes/`.
+Follow the plan's packages in order and update its status table when one lands.
+
 ## Commands
 
 | What | Command |
 |---|---|
-| Everything (import, validate, tests, smoke) | `python3 tools/check.py` |
+| Everything (build gdnet, import, validate, rust tests, tests, smoke) | `python3 tools/check.py` |
+| Skip the Rust build (reuse `addons/gdnet/bin`) | `python3 tools/check.py --no-build` |
+| Only the Rust unit tests | `python3 tools/check.py --only rust-test` |
 | Only the unit tests | `python3 tools/check.py --only test` |
 | One test file or method | `python3 tools/check.py --only test --filter=health` |
 | Fastest loop (no new files since last import) | `python3 tools/check.py --only test --no-import` |
@@ -19,7 +28,12 @@ output over your own reasoning about whether code works.
 `check.py` finds Godot via `$GODOT`, then `godot` on PATH, then
 `~/.cache/godot/<version>/godot` (installed by `tools/install_godot.sh`, which
 the Claude Code session hook and CI both use). The pinned version is in
-`.godot-version`.
+`.godot-version`. It finds cargo via `$CARGO`, PATH, then `~/.cargo/bin/cargo`;
+without cargo the Rust stages are skipped with a notice. The `build` stage runs
+`cargo build --release -p gdnet` in `rust/` and copies the library to
+`addons/gdnet/bin/<platform>/`, where `addons/gdnet/gdnet.gdextension` expects it
+(never committed). A first build compiles gdext and takes several minutes;
+later ones are incremental.
 
 ## The development loop
 
@@ -45,6 +59,10 @@ Never say a change works without a passing check. If you cannot run Godot
 | `timed out after 10.0s` | the test awaits something that never fires | check the signal or use `await_signal(sig, timeout)` |
 | `[FAIL] smoke` | main scene printed an error in its first frames | the block shows file:line; often a bad node path or missing resource |
 | `test did not finish (inner process died)` | Godot crashed | run with `--verbose` and look for the last line before the crash |
+| `[FAIL] build` + `error[E...]` | the Rust side does not compile | fix the cited `rust/...` line; `cargo build -p gdnet` in `rust/` for the full output |
+| `[FAIL] rust-test` + `panicked at rust/netcore/...` | a netcore unit test failed | `cargo test -p netcore <name>` in `rust/` |
+| `GDExtension dynamic library not found: 'res://addons/gdnet/gdnet.gdextension'` | the library was not built or copied | run without `--no-build`; check `addons/gdnet/bin/<platform>/` |
+| `NetVersion is missing` in `test_gdnet_loads` | the extension loaded but registered nothing, or an older library is installed | rebuild; check `rust/gdnet/src/lib.rs` registers the class |
 
 ## Writing tests
 
@@ -79,6 +97,9 @@ src/                   GDScript: logic classes and node scripts
 tests/framework/       test runner + TestCase base (no addons required)
 tests/unit/            fast tests of plain classes
 tests/integration/     tests that instantiate scenes
+rust/                  Cargo workspace: netcore (sans-IO protocol engine, no godot dep),
+                       gdnet (the GDExtension); rust/target/ is ignored
+addons/gdnet/          gdnet.gdextension + bin/<platform>/ (built, ignored) + addon assets
 tools/check.py         the one command to verify the project
 tools/validate_scripts.gd   compiles every script; used by check.py
 tools/install_godot.sh downloads the pinned Godot into ~/.cache/godot
@@ -93,6 +114,12 @@ tools/install_godot.sh downloads the pinned Godot into ~/.cache/godot
 - After adding a `class_name` or a new resource, `check.py` re-imports
   automatically. If you run Godot by hand, run `godot --headless --import` first.
 - Prefer editing `.tscn` files through small, reviewable diffs; they are text.
+- Rust (`rust/`): `cargo fmt` and `cargo clippy -D warnings` clean; `netcore` never
+  depends on `godot`, `std::net` or `std::thread` (a unit test enforces it) and must
+  keep building for `wasm32-unknown-emscripten` (CI's `wasm-check` job); `gdnet` never
+  enables gdext's `experimental-threads`, and every `Gd<T>` is touched on the main
+  thread. Keep the `godot` crate pinned to its minor version. Register every new
+  Godot-visible class in a module listed from `rust/gdnet/src/lib.rs`.
 
 ## This repository also hosts the skill
 

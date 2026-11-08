@@ -627,5 +627,5 @@ Package status (updated as each lands):
 
 | WP | status |
 |---|---|
-| WP0 scaffolding | in progress |
+| WP0 scaffolding | built 2026-11-08: workspace `rust/` (netcore, gdnet on gdext 0.5.5 `api-4-3`), `addons/gdnet/gdnet.gdextension`, `NetVersion`, `check.py` `build` + `rust-test` stages and `--no-build`, CI with Rust and the `wasm-check` job, `tests/unit/test_gdnet_loads.gd`; `CHECK: PASS` (TESTS: 9 passed) |
 | WP1-WP15 | not started |

@@ -1,0 +1,9 @@
+[package]
+name = "netcore"
+description = "Sans-IO multiplayer protocol engine for the gdnet Godot extension. No godot, no sockets, no threads."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
