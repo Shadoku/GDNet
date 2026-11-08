@@ -30,7 +30,9 @@ mod profiles;
 mod replay;
 mod session;
 mod tick;
+mod travel;
 mod version;
+mod world;
 
 struct GdNetExtension;
 

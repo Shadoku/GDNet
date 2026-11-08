@@ -504,6 +504,14 @@ impl Replication {
         }
     }
 
+    /// WP13: `id` left `peer`'s scope: forget what that peer held of it (a later `Create` brings it
+    /// back with full state).
+    pub fn forget_peer_entity(&mut self, peer: PeerId, id: NetId) {
+        if let Some(p) = self.peers.get_mut(&peer) {
+            p.entities.remove(&id);
+        }
+    }
+
     /// The hook WP14 scores: marks `id` as interacting with `peer` (weight 100 instead of 1).
     pub fn set_interacting(&mut self, peer: PeerId, id: NetId, on: bool) {
         let n = self.entities.get(&id).map_or(0, |s| s.fields.len());

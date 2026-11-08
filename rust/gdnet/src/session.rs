@@ -37,6 +37,7 @@ use godot::prelude::*;
 use netcore::call::Verb;
 use netcore::session::EntityEvent;
 use netcore::{EmulSettings, Event, KeyEvent, Reliability, Session, SessionConfig, StateUpdate};
+use netcore::{NetId, ParentRef};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -142,6 +143,19 @@ pub struct NetSession {
     pub(crate) net_default: bool,
     /// WP8: ticks since the editor debugger was last fed.
     debugger_ticks: u32,
+    /// WP13: the levels this session loaded (travel.rs).
+    pub(crate) levels: Vec<crate::travel::Level>,
+    /// WP13, server: queued `Net.travel` requests (applied at the next step).
+    pub(crate) travels: Vec<crate::travel::TravelReq>,
+    /// WP13, server: a level is unloaded this many seconds after its last player left; 0 =
+    /// `Net.empty_level_timeout`, else the project setting `gdnet/levels/empty_timeout_s` (30).
+    #[var(get = get_empty_level_timeout, set = set_empty_level_timeout)]
+    pub(crate) empty_level_timeout: f64,
+    /// WP13, client: the level the last `Travel` named, its room, and whether this client's own
+    /// entities have not arrived there yet.
+    pub(crate) travel_target: Option<String>,
+    pub(crate) local_room: String,
+    pub(crate) travelling_client: bool,
 }
 
 /// WP8: the group every session joins (the overlay and the meter find sessions through it).
@@ -290,6 +304,121 @@ impl NetSession {
     /// the writer (`sender` = its own id): the fields were put back to the server's values.
     #[signal]
     fn write_rejected(node: Gd<Node>, sender: i64);
+
+    /// WP13: an entity moved from room `from` to room `to` (`Net.travel`), after its
+    /// `_net_travelled(from, to)` ran; on the server and on every client that still sees it.
+    #[signal]
+    fn travelled(player: Gd<Node>, from: GString, to: GString);
+
+    #[func]
+    fn get_empty_level_timeout(&self) -> f64 {
+        self.empty_level_timeout
+    }
+
+    #[func]
+    fn set_empty_level_timeout(&mut self, v: f64) {
+        self.empty_level_timeout = v.max(0.0);
+    }
+
+    /// WP13: loads the level scene `scene_path` under the World node (`Net.set_world`, else this
+    /// branch's root), named after its file, unless it is loaded; returns its root. On the server the
+    /// session then uses rooms strictly (a peer without a room sees only `"*"` managers).
+    #[func]
+    pub fn load_level(&mut self, scene_path: GString) -> Option<Gd<Node>> {
+        self.do_load_level(&scene_path.to_string())
+    }
+
+    /// WP13: frees a loaded level (the server destroys its entities first). False when not loaded.
+    #[func]
+    pub fn unload_level(&mut self, scene_path: GString) -> bool {
+        self.do_unload_level(&scene_path.to_string())
+    }
+
+    /// WP13: the scene paths of the levels this session holds, in load order.
+    #[func]
+    pub fn levels(&mut self) -> PackedStringArray {
+        let paths: Vec<GString> = self
+            .level_paths()
+            .iter()
+            .map(|p| GString::from(p.as_str()))
+            .collect();
+        PackedStringArray::from(&paths[..])
+    }
+
+    /// WP13, server: sends the entity `player` belongs to into the level `scene_path` (loaded if
+    /// needed), at the node named `spawn_point` inside it (else its origin). Applied at the next tick.
+    #[func]
+    pub fn travel(
+        &mut self,
+        player: Gd<Node>,
+        scene_path: GString,
+        #[opt(default = "")] spawn_point: GString,
+    ) -> bool {
+        if !self.is_server() {
+            godot_error!("gdnet: Net.travel runs on the server");
+            return false;
+        }
+        self.travels.retain(|r| r.player != player);
+        self.travels.push(crate::travel::TravelReq {
+            player,
+            scene_path: scene_path.to_string(),
+            spawn_point: spawn_point.to_string(),
+        });
+        true
+    }
+
+    /// WP13, server: puts peer `peer` in room `name` whatever its player's room (empty: back to its
+    /// player's room).
+    #[func]
+    pub fn set_room(&mut self, peer: i64, name: GString) {
+        let name = name.to_string();
+        let peer = peer.max(0) as u32;
+        self.with_core(|c, now| c.set_room(peer, (!name.is_empty()).then_some(name.as_str()), now));
+    }
+
+    /// WP13, server: the entity `node` belongs to is `peer`'s player (its manager's room is the peer's
+    /// room). Before it is spawned, it becomes the player when it is.
+    #[func]
+    pub fn set_player(&mut self, peer: i64, node: Gd<Node>) -> bool {
+        let peer = peer.max(0) as u32;
+        let Some((root, m)) = entity_root_of(&node) else {
+            let mut n = node;
+            n.set_meta(crate::manager::META_PLAYER, &2i64.to_variant());
+            return true;
+        };
+        let id = m.bind().net_id_of(&root);
+        if id == 0 {
+            let mut r = root;
+            r.set_meta(crate::manager::META_PLAYER, &2i64.to_variant());
+            return true;
+        }
+        self.with_core(|c, now| c.set_player(peer, id, now))
+            .unwrap_or(false)
+    }
+
+    /// WP13: the room of peer `peer`: on the server the room its scope follows ("" without one); on a
+    /// client its own room (the last `Travel`'s) for its own id.
+    #[func]
+    pub fn room_of(&self, peer: i64) -> GString {
+        let Some(core) = self.core.as_ref() else {
+            return GString::new();
+        };
+        let room = if core.role() == netcore::Role::Server {
+            core.peer_room(peer.max(0) as u32).unwrap_or_default()
+        } else if peer == i64::from(core.local_id()) {
+            self.local_room.clone()
+        } else {
+            String::new()
+        };
+        GString::from(room.as_str())
+    }
+
+    /// WP13: the node levels are loaded under (the World `Net.set_world` registered in this branch, else
+    /// the branch root).
+    #[func]
+    pub fn get_world(&self) -> Option<Gd<Node>> {
+        self.world()
+    }
 
     /// WP7: the keyed state (`NetKeyedState`) of this session.
     #[func]
@@ -678,6 +807,7 @@ impl NetSession {
         let now = Time::singleton().get_ticks_msec();
         let mut seen = std::collections::HashSet::new();
         for (_, m) in self.managers() {
+            let room = GString::from(self.room_name(&m).as_str());
             for e in m.bind().overlay_entries() {
                 if !seen.insert(e.id) {
                     continue;
@@ -699,6 +829,7 @@ impl NetSession {
                         .map_or(0, |c| c.divergences_of(e.id) as i64),
                 );
                 d.set("node", &e.node);
+                d.set("room", &room);
                 out.push(&d.to_variant());
             }
         }
@@ -1064,6 +1195,11 @@ impl NetSession {
         }
         self.resolve_calls();
         self.sync_managers();
+        if self.is_server() && self.is_connected() {
+            // WP13: travels queued since the last step, then the empty-level timer.
+            self.process_travels();
+            self.check_empty_levels();
+        }
         self.input_step();
         self.keyed_step();
         let (events, tick) = {
@@ -1236,8 +1372,45 @@ impl NetSession {
         };
         d.set("snapshot_bytes_per_s", snap as i64);
         d.set("keyed_bytes_per_s", c.keyed_bytes_per_s as i64);
-        // WP13 narrows scope to rooms; until then every entity is in scope.
+        // WP13: a client's scope is what it holds; the server sees everything and reports each peer's.
         d.set("entities_in_scope", core.entities().len() as i64);
+        let mut by_peer = VarDictionary::new();
+        if server {
+            for p in &peers {
+                by_peer.set(i64::from(*p), core.scope_len(*p) as i64);
+            }
+        }
+        d.set("entities_in_scope_by_peer", &by_peer);
+        let local_room = if server {
+            String::new()
+        } else {
+            self.local_room.clone()
+        };
+        d.set("room", &GString::from(local_room.as_str()));
+        let mut rooms = VarDictionary::new();
+        for (key, m) in self.managers() {
+            let name = core.manager_room(key).unwrap_or_else(|| self.room_name(&m));
+            let n = m.bind().entity_count_pub();
+            let prev = rooms
+                .get(name.as_str())
+                .and_then(|v| v.try_to::<i64>().ok())
+                .unwrap_or(0);
+            rooms.set(name.as_str(), prev + n);
+        }
+        d.set("rooms", &rooms);
+        d.set("levels", self.levels.len() as i64);
+        d.set(
+            "travelling",
+            if server {
+                core.travelling() as i64
+            } else {
+                i64::from(self.travelling_client)
+            },
+        );
+        let sc = core.scope_stats();
+        d.set("travels", (sc.travels_sent + sc.travels_received) as i64);
+        d.set("scope_left", (sc.left + sc.freed) as i64);
+        d.set("scope_entered", sc.entered as i64);
         let budget = f64::from(core.budget()) * peers.len().max(1) as f64;
         d.set(
             "budget_use",
@@ -1541,8 +1714,16 @@ impl NetSession {
         netcore::entity::fnv1a64(rel.as_bytes())
     }
 
+    /// WP13: this session's branch root while valid.
+    pub(crate) fn branch(&self) -> Option<Gd<Node>> {
+        self.branch_root
+            .as_ref()
+            .filter(|b| b.is_instance_valid())
+            .cloned()
+    }
+
     /// The managers serving this session's branch, with their keys.
-    fn managers(&self) -> Vec<(u64, Gd<NetManager>)> {
+    pub(crate) fn managers(&self) -> Vec<(u64, Gd<NetManager>)> {
         let (Some(tree), Some(api)) = (scene_tree(), self.api.as_ref()) else {
             return Vec::new();
         };
@@ -1573,6 +1754,24 @@ impl NetSession {
                 events.push((tick, false, e));
             }
         }
+        // WP13: the server's managers register their rooms; a client's `Travel` loads its level first,
+        // so the events after it find the level's managers.
+        let is_server = self.is_server();
+        if is_server && self.is_connected() {
+            self.register_rooms();
+        }
+        let mut travelled = false;
+        let mut rest = Vec::with_capacity(events.len());
+        for (since, reported, e) in events {
+            match e {
+                EntityEvent::Travel { scene_path, room } => {
+                    travelled = true;
+                    self.on_travel_event(&scene_path, &room);
+                }
+                e => rest.push((since, reported, e)),
+            }
+        }
+        let events = rest;
         let managers = self.managers();
         let updates: Vec<StateUpdate> = self
             .core
@@ -1580,15 +1779,38 @@ impl NetSession {
             .map(|c| c.drain_state_updates())
             .unwrap_or_default();
         if managers.is_empty() && events.is_empty() {
+            if travelled {
+                self.free_stale_levels();
+            }
             return;
         }
         let mut routed: HashMap<u64, Vec<EntityEvent>> = HashMap::new();
+        let mut moves: Vec<(NetId, u64, ParentRef)> = Vec::new();
         let tick = self.core.as_ref().map_or(0, |c| c.current_tick());
         let rate = u64::from(tick_rate());
-        let mut keep = Vec::new();
+        let mut keep: Vec<(u64, bool, EntityEvent)> = Vec::new();
+        let present = |k: u64| managers.iter().any(|(mk, _)| *mk == k);
         for (since, reported, e) in events {
             let key = e.manager();
-            if managers.iter().any(|(k, _)| *k == key) {
+            let waiting = |k: u64, keep: &Vec<(u64, bool, EntityEvent)>| {
+                keep.iter().any(|(_, _, w)| w.manager() == k)
+            };
+            // WP13: a move between managers applies once both exist (the client loaded the level).
+            if let Some((id, from, parent)) = crate::travel::is_cross_move(&e) {
+                if present(from) && present(parent.manager) && !waiting(from, &keep) {
+                    moves.push((id, from, parent));
+                    continue;
+                }
+            }
+            // WP13: a destroy (or a scope leave) for a level this client already freed frees nothing.
+            if matches!(e, EntityEvent::Destroy { .. })
+                && !is_server
+                && !present(key)
+                && !waiting(key, &keep)
+            {
+                continue;
+            }
+            if present(key) && !waiting(key, &keep) {
                 routed.entry(key).or_default().push(e);
             } else {
                 let mut reported = reported;
@@ -1612,13 +1834,22 @@ impl NetSession {
         }
         let me = self.to_gd();
         let _guard = self.base_mut();
-        for (key, mut m) in managers {
+        for (key, mut m) in managers.clone() {
             let evs = routed.remove(&key).unwrap_or_default();
             let sts = states.remove(&key).unwrap_or_default();
             m.bind_mut().sync(me.clone(), key, evs);
             if !sts.is_empty() {
                 m.bind_mut().apply_states(sts);
             }
+        }
+        drop(_guard);
+        // WP13: moves between managers, after the managers applied this tick's events.
+        let moved = !moves.is_empty();
+        for (id, from, parent) in moves {
+            self.apply_move(&managers, id, from, parent);
+        }
+        if travelled || moved {
+            self.free_stale_levels();
         }
     }
 

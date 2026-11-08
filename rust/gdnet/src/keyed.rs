@@ -26,7 +26,7 @@ use netcore::KeyEvent;
 use std::collections::BTreeMap;
 
 #[derive(GodotClass)]
-#[class(init, base = RefCounted)]
+#[class(tool, init, base = RefCounted)]
 pub struct NetKeyedState {
     base: Base<RefCounted>,
     /// The session whose map this is (None: the local map).

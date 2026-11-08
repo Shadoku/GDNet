@@ -61,6 +61,9 @@ pub const META_REPLICA: &str = "_net_replica";
 pub const META_MANAGER: &str = "_net_manager";
 /// Meta read at enrolment for the owner when the entity has no `NetEntity` (`Net.spawn_for`).
 pub const META_OWNER: &str = "_net_owner";
+/// WP13: meta on an entity root: 1 = becomes its owner's player when it has none (`Net.spawn_for`),
+/// 2 = becomes its owner's player (`Net.set_player` before the spawn).
+pub const META_PLAYER: &str = "_net_player";
 /// Meta on an entity root: its priority set by `Net.configure(node, {"priority": p})`.
 pub const META_PRIORITY: &str = "_net_priority";
 
@@ -189,6 +192,11 @@ pub struct NetManager {
     /// they sit in (a `NetEntity` child does the same per instance).
     #[export]
     split_scenes: PackedStringArray,
+    /// WP13 (2.11): the room this manager's entities are in. A peer sees the entities of its player's
+    /// room (and of `"*"` managers, visible from every room). Empty: the scene this manager sits in
+    /// (its owner's `scene_file_path`), else its path relative to the session's branch.
+    #[export]
+    room: GString,
     /// Profiles laid over the global ones for this manager's entities (3.1).
     #[export]
     #[var(get = get_profiles, set = set_profiles)]
@@ -322,6 +330,11 @@ impl NetManager {
     #[func]
     fn get_entities(&self) -> i64 {
         self.entries.values().filter(|e| e.id.is_some()).count() as i64
+    }
+
+    /// The spawned entities under this manager (WP13's per-room counts).
+    pub fn entity_count_pub(&self) -> i64 {
+        self.get_entities()
     }
 
     /// The node whose subtree this manager manages (itself unless created by `Net.manage()`).
@@ -536,7 +549,7 @@ impl NetManager {
     }
 
     /// The node a parent reference names.
-    fn resolve_parent(&self, parent: &ParentRef) -> Option<Gd<Node>> {
+    pub fn resolve_parent(&self, parent: &ParentRef) -> Option<Gd<Node>> {
         if parent.entity == MANAGER_ROOT {
             return Some(self.get_managed_root());
         }
@@ -682,6 +695,8 @@ impl NetManager {
 
     fn apply_event(&mut self, session: &Gd<NetSession>, key: u64, salt: u64, ev: EntityEvent) {
         match ev {
+            // WP13: handled by the session (travel.rs) before routing.
+            EntityEvent::Travel { .. } => {}
             EntityEvent::Call(ci) => self.on_call(session, ci),
             EntityEvent::Create {
                 create,
@@ -1192,6 +1207,17 @@ impl NetManager {
             // WP7: the transfer rule, client_owned, and whether the owner is inherited from the
             // enclosing entity (2.6).
             let (transfer, client_owned, inherit) = authority_of(&node);
+            // WP13: whether it becomes its owner's player.
+            let mark = if node.has_meta(META_PLAYER) {
+                node.get_meta(META_PLAYER).try_to::<i64>().unwrap_or(0)
+            } else {
+                0
+            };
+            let player = match mark {
+                1 => netcore::PlayerMark::IfNone,
+                2 => netcore::PlayerMark::Always,
+                _ => netcore::PlayerMark::No,
+            };
             let result = s.bind_mut().with_core(|c, now| {
                 let spec = Spawn::new(parent, &name, owner, scene.part_count(), Vec::new())
                     .with_authority(transfer, client_owned);
@@ -1204,7 +1230,7 @@ impl NetManager {
                     Some(v) => spec.with_values(v),
                     None => spec,
                 };
-                let r = c.spawn(&scene.path, spec, now);
+                let r = c.spawn(&scene.path, spec.as_player(player), now);
                 r.map(|id| {
                     c.set_entity_priority(id, priority);
                     let rec = c.entities().get(id);
@@ -2687,4 +2713,138 @@ pub fn session_of(node: &Gd<Node>) -> Option<Gd<NetSession>> {
         .try_to::<i64>()
         .ok()?;
     Gd::<NetSession>::try_from_instance_id(InstanceId::from_i64(iid)).ok()
+}
+
+/// WP13: an entity's entries on their way from one manager to another (`Net.travel`).
+pub struct MovedEntries {
+    root: InstanceId,
+    entries: Vec<(InstanceId, Entry)>,
+}
+
+/// Rooms and travel (WP13, docs/PLAN_NETCODE.md 2.11; the session side is travel.rs and world.rs).
+impl NetManager {
+    /// The room set in the inspector, else the scene this manager was saved in; None when neither
+    /// (the session then uses the manager's branch-relative path).
+    pub fn room_setting(&self) -> Option<String> {
+        if !self.room.is_empty() {
+            return Some(self.room.to_string());
+        }
+        self.base()
+            .get_owner()
+            .map(|o| o.get_scene_file_path().to_string())
+            .filter(|p| !p.is_empty())
+    }
+
+    /// Takes the entries of the entity rooted at `root` and of the entities below it out of this
+    /// manager (nothing is announced). None when `root` is not a spawned entity here.
+    pub fn take_entries(&mut self, root: &Gd<Node>) -> Option<MovedEntries> {
+        let riid = root.instance_id();
+        self.entries.get(&riid)?.id?;
+        let iids: Vec<InstanceId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|i| {
+                *i == riid
+                    || Gd::<Node>::try_from_instance_id(*i)
+                        .is_ok_and(|n| self.entries.contains_key(i) && root.is_ancestor_of(&n))
+            })
+            .collect();
+        let mut entries = Vec::new();
+        for iid in iids {
+            if let Some(e) = self.entries.remove(&iid) {
+                if let Some(id) = e.id {
+                    self.by_id.remove(&id);
+                    self.owned_shown.retain(|k, _| k.0 != id);
+                }
+                entries.push((iid, e));
+            }
+        }
+        self.order.retain(|i| self.entries.contains_key(i));
+        Some(MovedEntries {
+            root: riid,
+            entries,
+        })
+    }
+
+    /// Adopts entries another manager gave up: the root hangs under `parent` now, the entities below
+    /// it follow to this manager. Prediction restarts (the owner re-tracks at the next tick).
+    /// `generation` is the session's: a manager loaded this tick has not synced yet and would otherwise
+    /// treat the moved ids as a previous session's.
+    pub fn put_entries(&mut self, moved: MovedEntries, generation: u64) -> Vec<NetId> {
+        self.generation = generation;
+        let me = self.to_gd().instance_id().to_i64();
+        let mut ids = Vec::new();
+        for (iid, mut e) in moved.entries {
+            if iid == moved.root {
+                e.parent = None;
+            }
+            e.predicted = None;
+            e.dirty = false;
+            if let Some(id) = e.id {
+                self.by_id.insert(id, iid);
+                ids.push(id);
+            }
+            self.entries.insert(iid, e);
+            self.order.push(iid);
+            if let Ok(mut n) = Gd::<Node>::try_from_instance_id(iid) {
+                n.set_meta(META_MANAGER, &me.to_variant());
+            }
+        }
+        ids
+    }
+
+    /// Records where the moved root hangs now (after it was added under this manager).
+    pub fn set_entry_parent(&mut self, root: &Gd<Node>, parent: ParentRef) {
+        if let Some(e) = self.entries.get_mut(&root.instance_id()) {
+            e.parent = Some(parent);
+            e.dirty = false;
+        }
+        let key = parent.manager;
+        for e in self.entries.values_mut() {
+            if let Some(p) = e.parent.as_mut() {
+                p.manager = key;
+            }
+        }
+    }
+
+    /// The root node of entity `id` under this manager.
+    pub fn root_of_id(&self, id: NetId) -> Option<Gd<Node>> {
+        self.entry_of_id(id).map(|(_, n)| n)
+    }
+
+    /// The part nodes of the entity rooted at `root`.
+    pub fn parts_of(&self, root: &Gd<Node>) -> Vec<Gd<Node>> {
+        self.entries
+            .get(&root.instance_id())
+            .map(|e| e.scene.part_nodes(root))
+            .unwrap_or_default()
+    }
+
+    /// True when an entity under this manager is owned by `peer`.
+    pub fn holds_owned_by(&self, peer: u32) -> bool {
+        self.entries
+            .values()
+            .any(|e| e.id.is_some() && e.owner == peer)
+    }
+
+    /// Server, before its level is unloaded: destroys every entity under this manager (announced to
+    /// the peers that see them) and forgets them.
+    pub fn destroy_all(&mut self, session: &Gd<NetSession>) {
+        let tops: Vec<NetId> = self
+            .entries
+            .values()
+            .filter(|e| e.parent.is_none_or(|p| p.entity == MANAGER_ROOT))
+            .filter_map(|e| e.id)
+            .collect();
+        let mut s = session.clone();
+        for id in tops {
+            s.bind_mut().with_core(|c, now| c.destroy(id, now));
+        }
+        let iids: Vec<InstanceId> = self.entries.keys().copied().collect();
+        for iid in iids {
+            self.forget(iid);
+        }
+        self.order.clear();
+    }
 }

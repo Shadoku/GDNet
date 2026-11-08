@@ -77,7 +77,7 @@ fn scene_root_of(node: &Gd<Node>) -> Gd<Node> {
     node.clone()
 }
 
-const RELAYED: [(&str, &str); 12] = [
+const RELAYED: [(&str, &str); 13] = [
     ("peer_joined", "_on_peer_joined"),
     ("peer_left", "_on_peer_left"),
     ("connected", "_on_connected"),
@@ -90,6 +90,7 @@ const RELAYED: [(&str, &str); 12] = [
     ("call_refused", "_on_call_refused"),
     ("owner_changed", "_on_owner_changed"),
     ("write_rejected", "_on_write_rejected"),
+    ("travelled", "_on_travelled"),
 ];
 
 #[derive(GodotClass)]
@@ -136,6 +137,11 @@ pub struct Net {
     #[allow(dead_code)]
     state: Option<Gd<NetKeyedState>>,
     state_cell: std::cell::OnceCell<Gd<NetKeyedState>>,
+    /// WP13: a server's level is unloaded this many seconds after its last player left (0 = the project
+    /// setting `gdnet/levels/empty_timeout_s`, default 30). Applies to every session at once.
+    #[var(get = get_empty_level_timeout, set = set_empty_level_timeout)]
+    #[allow(dead_code)]
+    empty_level_timeout: f64,
     /// WP8: the meter and the overlay layers while shown.
     meter: Option<Gd<Node>>,
     overlay: Option<Gd<Node>>,
@@ -514,6 +520,10 @@ impl Net {
             node.set_name(&name);
         }
         node.set_meta(META_OWNER, &peer.max(0).to_variant());
+        // WP13: the first entity spawned for a peer is its player (its room is the peer's room).
+        if !node.has_meta(crate::manager::META_PLAYER) {
+            node.set_meta(crate::manager::META_PLAYER, &1i64.to_variant());
+        }
         if let Some(mut ne) = net_entity_of(&node) {
             ne.bind_mut().set_owner_peer(peer.max(0));
         }
@@ -970,6 +980,111 @@ impl Net {
             "call_refused",
             &[node.to_variant(), method.to_variant(), sender.to_variant()],
         );
+    }
+
+    #[signal]
+    fn travelled(player: Gd<Node>, from: GString, to: GString);
+
+    #[func]
+    fn _on_travelled(&mut self, player: Gd<Node>, from: GString, to: GString) {
+        self.base_mut().emit_signal(
+            "travelled",
+            &[player.to_variant(), from.to_variant(), to.to_variant()],
+        );
+    }
+
+    #[func]
+    fn get_empty_level_timeout(&self) -> f64 {
+        crate::world::net_timeout()
+    }
+
+    #[func]
+    fn set_empty_level_timeout(&mut self, v: f64) {
+        crate::world::set_net_timeout(v);
+    }
+
+    /// WP13 (2.11), server: sends the entity `player` belongs to into the level `scene_path`, at the
+    /// node named `spawn_point` inside it (else the level's origin). The level is loaded under the World
+    /// if needed; the player's client loads it too and frees its previous level. Applied at the next
+    /// tick, so it is safe from a physics callback (a door's `body_entered`). Works in any branch.
+    #[func]
+    fn travel(
+        &mut self,
+        player: Gd<Node>,
+        scene_path: GString,
+        #[opt(default = "")] spawn_point: GString,
+    ) -> bool {
+        match session_of(&player) {
+            Some(mut s) => s.bind_mut().travel(player, scene_path, spawn_point),
+            None => {
+                godot_error!("gdnet: Net.travel needs a session (host, join or offline first)");
+                false
+            }
+        }
+    }
+
+    /// WP13, server: loads a level under the World of `Net`'s session (see `NetSession.load_level`).
+    #[func]
+    fn load_level(&mut self, scene_path: GString) -> Option<Gd<Node>> {
+        let Some(mut s) = self.session.clone() else {
+            godot_error!("gdnet: Net.load_level needs a session (host, join or offline first)");
+            return None;
+        };
+        let level = s.bind_mut().load_level(scene_path);
+        level
+    }
+
+    /// WP13: frees a level `Net`'s session loaded.
+    #[func]
+    fn unload_level(&mut self, scene_path: GString) -> bool {
+        let Some(mut s) = self.session.clone() else {
+            return false;
+        };
+        let done = s.bind_mut().unload_level(scene_path);
+        done
+    }
+
+    /// WP13: the levels `Net`'s session holds (scene paths, in load order).
+    #[func]
+    fn levels(&self) -> PackedStringArray {
+        self.session
+            .clone()
+            .map_or_else(PackedStringArray::new, |mut s| s.bind_mut().levels())
+    }
+
+    /// WP13, server: puts `peer` in room `name` (for peers without a player, e.g. spectators; empty:
+    /// back to its player's room).
+    #[func]
+    fn set_room(&mut self, peer: i64, name: GString) {
+        if let Some(mut s) = self.session.clone() {
+            s.bind_mut().set_room(peer, name);
+        }
+    }
+
+    /// WP13, server: the entity `node` belongs to is `peer`'s player: the peer's room is that entity's
+    /// manager's room (the first entity `spawn_for`'d to a peer is its player without this call).
+    #[func]
+    fn set_player(&mut self, peer: i64, mut node: Gd<Node>) -> bool {
+        match session_of(&node) {
+            Some(mut s) => s.bind_mut().set_player(peer, node),
+            None => {
+                node.set_meta(crate::manager::META_PLAYER, &2i64.to_variant());
+                true
+            }
+        }
+    }
+
+    /// WP13: registers the game's World node, the node levels are loaded under (in its branch).
+    #[func]
+    fn set_world(&mut self, mut node: Gd<Node>) {
+        node.add_to_group(crate::world::WORLD_GROUP);
+    }
+
+    /// WP13: the session serving `node`'s branch (`Net`'s own session in a game; a fixture branch's
+    /// session in the headless tests), or null without one.
+    #[func]
+    fn session_for(&self, node: Gd<Node>) -> Option<Gd<NetSession>> {
+        session_of(&node).or_else(|| self.session.clone())
     }
 
     #[func]

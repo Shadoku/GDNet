@@ -14,7 +14,7 @@ var last_stats: Dictionary = {}
 
 const LINES: Array[String] = [
 	"rtt", "tick", "buffer", "in", "out", "entities", "state", "budget", "calls", "prediction",
-	"poll", "hashes", "authority",
+	"poll", "hashes", "authority", "rooms",
 ]
 
 var _labels: Dictionary = {}
@@ -80,6 +80,18 @@ func refresh() -> void:
 	_put("poll", "poll %.3f ms (avg %.3f)" % [d.get("poll_ms", 0.0), d.get("poll_ms_avg", 0.0)])
 	_put("hashes", "hashes out %d  in %d  divergences %d (%d/s)%s" % [d.get("hashes_sent", 0), d.get("hashes_received", 0), d.get("divergences", 0), d.get("divergences_per_s", 0), "" if d.get("hash_telemetry", true) else "  (off)"])
 	_put("authority", "owner changes %d  rejected writes %d" % [d.get("owner_changes", 0), d.get("writes_rejected", 0)])
+	_put("rooms", _rooms_text(d))
+
+
+## WP13: the local room (a client's), the entities per room, and a travel in flight.
+func _rooms_text(d: Dictionary) -> String:
+	var parts: PackedStringArray = []
+	var rooms: Dictionary = d.get("rooms", {})
+	for room: String in rooms:
+		parts.append("%s %d" % [room.get_file().get_basename() if room.begins_with("res://") else room, rooms[room]])
+	var here: String = d.get("room", "")
+	var head := "room %s" % (here.get_file().get_basename() if not here.is_empty() else "-")
+	return "%s  [%s]  travelling %d" % [head, ", ".join(parts), d.get("travelling", 0)]
 
 
 ## Every label's text, one per line (for tests and tools).

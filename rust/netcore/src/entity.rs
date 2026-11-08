@@ -172,6 +172,21 @@ pub enum EntityAction {
         id: NetId,
         granted: bool,
     },
+    /// WP13, server to a client: the client's room becomes `room`, a level: load `scene_path` (under
+    /// the game's World node) before the actions that follow, then answer `TravelAck`.
+    Travel {
+        scene_path: String,
+        room: String,
+    },
+    /// WP13, client to server: the level of `room` (its hash) is loaded.
+    TravelAck {
+        room: u64,
+    },
+    /// WP13, server to a client: these entities left the client's scope (its room changed, or they
+    /// moved to another room); the client forgets them and frees their replicas.
+    Scope {
+        leave: Vec<NetId>,
+    },
     /// WP6: a received call (it travels as its own message, kind 11, never as an `EntityAction`). It is
     /// kept here so a call waits behind its entity's pending `Create` in the same held queue, in order.
     #[serde(skip)]
@@ -182,7 +197,10 @@ impl EntityAction {
     /// The entity this action creates or targets.
     pub fn subject(&self) -> Option<NetId> {
         match self {
-            EntityAction::Scene { .. } => None,
+            EntityAction::Scene { .. }
+            | EntityAction::Travel { .. }
+            | EntityAction::TravelAck { .. }
+            | EntityAction::Scope { .. } => None,
             EntityAction::Create(c) => Some(c.id),
             EntityAction::Destroy { id }
             | EntityAction::SetOwner { id, .. }
@@ -200,7 +218,10 @@ impl EntityAction {
     pub fn needs(&self) -> (Option<NetId>, Option<NetId>) {
         let parent = |p: &ParentRef| (p.entity != MANAGER_ROOT).then_some(p.entity);
         match self {
-            EntityAction::Scene { .. } => (None, None),
+            EntityAction::Scene { .. }
+            | EntityAction::Travel { .. }
+            | EntityAction::TravelAck { .. }
+            | EntityAction::Scope { .. } => (None, None),
             EntityAction::Create(c) => (None, parent(&c.parent)),
             EntityAction::Destroy { id }
             | EntityAction::SetOwner { id, .. }
@@ -321,20 +342,52 @@ impl EntityTable {
         false
     }
 
-    /// Moves `id` under `parent`. False for an unknown entity or parent, or a move under itself.
+    /// Moves `id` under `parent`. False for an unknown entity or parent, or a move under itself. A
+    /// move to another manager (WP13) moves every entity below `id` to that manager too.
     pub fn reparent(&mut self, id: NetId, parent: ParentRef) -> bool {
-        if !self.records.contains_key(&id) {
+        let Some(old) = self.records.get(&id).map(|r| r.parent.manager) else {
             return false;
-        }
+        };
         if parent.entity != MANAGER_ROOT
             && (!self.records.contains_key(&parent.entity) || self.is_ancestor(id, parent.entity))
         {
             return false;
         }
+        if old != parent.manager {
+            for d in self.subtree(id) {
+                if let Some(r) = self.records.get_mut(&d) {
+                    r.parent.manager = parent.manager;
+                }
+            }
+        }
         if let Some(r) = self.records.get_mut(&id) {
             r.parent = parent;
         }
         true
+    }
+
+    /// `id` and every entity below it, children before their parents (`id` last); empty when unknown.
+    pub fn subtree(&self, id: NetId) -> Vec<NetId> {
+        if !self.records.contains_key(&id) {
+            return Vec::new();
+        }
+        let mut order = Vec::new();
+        self.post_order(id, &mut order);
+        order
+    }
+
+    /// The topmost entity above `id` (itself when it hangs at a manager root).
+    pub fn root_of(&self, id: NetId) -> Option<&EntityRecord> {
+        let mut cur = self.records.get(&id)?;
+        let mut steps = 0;
+        while cur.parent.entity != MANAGER_ROOT {
+            steps += 1;
+            match self.records.get(&cur.parent.entity) {
+                Some(p) if steps <= self.records.len() => cur = p,
+                _ => break,
+            }
+        }
+        Some(cur)
     }
 
     pub fn set_owner(&mut self, id: NetId, owner: PeerId) -> bool {

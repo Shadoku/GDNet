@@ -15,7 +15,8 @@
 //! render timeline, the adaptive jitter buffer, sample buffers, error offsets). WP6: [`call`] (calls and
 //! returns, the argument encoding, the routing verbs). WP7: [`authority`] (transfer rules, owner state
 //! acceptance, rejected writes), [`keyed`] (the keyed state map, permissions, views). WP8: [`hash`] (hash
-//! telemetry: per-entity hashes, sampling, the client's comparison).
+//! telemetry: per-entity hashes, sampling, the client's comparison). WP13: [`rooms`] (rooms, interest by
+//! room, travel).
 
 #![forbid(unsafe_code)]
 
@@ -34,6 +35,7 @@ pub mod predict;
 pub mod priority;
 pub mod props;
 pub mod quant;
+pub mod rooms;
 pub mod session;
 pub mod snapshot;
 pub mod wire;
@@ -53,7 +55,10 @@ pub use keyed::{KeyEvent, KeyMsg, KeyedState, Who};
 pub use peers::{PeerId, SERVER};
 pub use predict::{Policy, Rollback};
 pub use props::{PropDesc, Quant, ScenePropsTable, Schedule, TypeTag, Value};
-pub use session::{EntityEvent, Event, Outgoing, Role, Session, SessionConfig, Spawn};
+pub use rooms::{room_hash, Rooms, GLOBAL};
+pub use session::{
+    EntityEvent, Event, Outgoing, PlayerMark, Role, ScopeStats, Session, SessionConfig, Spawn,
+};
 pub use wire::{Channel, Reliability};
 
 /// The protocol engine version, kept equal to the gdnet crate version by `tests/unit/test_gdnet_loads.gd`.
