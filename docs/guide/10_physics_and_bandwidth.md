@@ -82,8 +82,13 @@ entity `Net.spawn_for`'d to it, or `Net.set_player`) the entities that interact 
   `get_colliding_bodies()`; a `CharacterBody2D/3D` player reports its last `move_and_slide()` collisions.
 
 The distance test runs on a coarse grid of cells as large as the largest radius, so it stays near linear
-in the number of entities: about 0.4 ms for 300 bodies per tick in the demo's test (`stats()` key
-`interaction_ms`). The server's own player (a host) is not scored: it receives no snapshots.
+in the number of entities: about 0.4 ms for 300 bodies per tick in the demo's test (`stats()` keys
+`interaction_ms`, the last pass, and `interaction_ms_avg`, the mean per tick over the last second). Most
+of it is engine calls (each root's global position). The server's own player (a host) is not scored: it
+receives no snapshots, and a peer without a player costs nothing. A manager with a negative radius has its
+positions skipped. To trade reaction for time, `gdnet/budget/interaction_every_ticks` (default 1) runs the
+pass every N server ticks and keeps the last sets in between: at 4 the demo's test measures 0.11 ms per
+tick instead of 0.41.
 
 Choose the radius by the budget: every interacting body that moves costs a full update each tick. In the
 Ballpit demo a body update is about 15.8 bytes, so the halved 16 KB/s budget carries about 17 updates a
@@ -125,7 +130,8 @@ budget 100% of 16384 B/s per peer  deferred: 17205 ent/s  interacting 4
 
 `stats()` keys: `deferred_entities`, `deferred_fields` (totals), `deferred_entities_per_s`,
 `deferred_fields_per_s`, `deferred_entities_tick`, `deferred_fields_tick` (the last tick's, all peers),
-`interacting`, `interaction_ms`, `hash_sample` (the effective sample).
+`interacting`, `interaction_ms`, `interaction_ms_avg`, `interaction_passes`, `hash_sample` (the effective
+sample).
 
 ## What a body update costs
 

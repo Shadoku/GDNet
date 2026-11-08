@@ -160,6 +160,10 @@ pub struct NetSession {
     interacting: HashMap<u32, BTreeSet<NetId>>,
     /// WP14: microseconds the last interaction pass took.
     interaction_us: u64,
+    /// Review 2026-11-08: interaction passes run so far, and the per-tick mean cost over the last full
+    /// second (skipped ticks count as 0): (window sum in µs, window ticks, last mean in ms).
+    interaction_passes: u64,
+    interaction_window: (u64, u32, f64),
     /// WP14: entities hash telemetry samples per tick on this server; -1 = `Net.hash_sample`, else the
     /// project setting `gdnet/debug/hash_sample` (default 16). Changes apply at once.
     #[var(get = get_hash_sample, set = set_hash_sample)]
@@ -731,6 +735,8 @@ impl NetSession {
             let n: usize = self.interacting.values().map(BTreeSet::len).sum();
             d.set("interacting", n as i64);
             d.set("interaction_ms", self.interaction_us as f64 / 1000.0);
+            d.set("interaction_ms_avg", self.interaction_window.2);
+            d.set("interaction_passes", self.interaction_passes as i64);
             d.set("hash_sample", i64::from(self.effective_hash_sample()));
             let i = core.input_stats();
             let p = core.predict_stats();
@@ -1604,6 +1610,34 @@ impl NetSession {
     /// WP14, server: scores interaction (physics.rs) and hands the changes to netcore, before this
     /// tick's snapshots are built.
     fn interaction_pass(&mut self) {
+        let spent = self.interaction_pass_inner();
+        let rate = tick_rate().max(1);
+        let w = &mut self.interaction_window;
+        w.0 += spent;
+        w.1 += 1;
+        if w.1 >= rate {
+            w.2 = w.0 as f64 / f64::from(w.1) / 1000.0;
+            w.0 = 0;
+            w.1 = 0;
+        }
+    }
+
+    /// The pass itself; returns the microseconds it took (0 when skipped).
+    fn interaction_pass_inner(&mut self) -> u64 {
+        let tick = self.core.as_ref().map_or(0, |c| c.current_tick());
+        let every = crate::physics::every_ticks();
+        if every > 1 && !tick.is_multiple_of(every) {
+            // A skipped tick: the last sets stay, re-asserted (an entity that came back into a peer's
+            // scope gets a fresh per-peer record), with no engine calls.
+            if let Some(core) = self.core.as_mut() {
+                for (peer, set) in &self.interacting {
+                    for id in set {
+                        core.set_interacting(*peer, *id, true);
+                    }
+                }
+            }
+            return 0;
+        }
         let t0 = now_us();
         // The server's own player (a host) receives no snapshots: nothing to score for it.
         let players: Vec<(u32, NetId)> = self
@@ -1616,8 +1650,9 @@ impl NetSession {
             .collect();
         if players.is_empty() && self.interacting.is_empty() {
             self.interaction_us = 0;
-            return;
+            return 0;
         }
+        self.interaction_passes += 1;
         let managers = self.managers();
         let sets = crate::physics::interacting_sets(&managers, &players);
         let mut next: HashMap<u32, BTreeSet<NetId>> = HashMap::new();
@@ -1644,6 +1679,7 @@ impl NetSession {
         }
         self.interacting = next;
         self.interaction_us = now_us().saturating_sub(t0);
+        self.interaction_us
     }
 
     /// Review 2026-11-08: the budget and the hash sample follow `Net` / the project settings while

@@ -9,7 +9,8 @@
 //! The radius: `NetManager.interaction_radius` for the manager's entities (in their units: pixels in
 //! 2D, metres in 3D), 0 = the project setting `gdnet/budget/interaction_radius` (default 300, in
 //! pixels; 3D reads it at 100 px per metre, i.e. 3 m). A negative radius turns proximity off for that
-//! manager. The distance test is netcore's `priority::near` (a coarse grid); this module reads the
+//! manager (its roots' positions are not read). `gdnet/budget/interaction_every_ticks` (default 1)
+//! runs the pass every N server ticks, keeping the last sets in between. The distance test is netcore's `priority::near` (a coarse grid); this module reads the
 //! engine's positions and contacts, main thread only.
 
 use crate::manager::{entity_root_of, NetManager};
@@ -22,10 +23,14 @@ use netcore::NetId;
 use std::collections::{BTreeSet, HashMap};
 
 pub const SETTING_RADIUS: &str = "gdnet/budget/interaction_radius";
+/// Review 2026-11-08: run the pass every this many server ticks (default 1); on the ticks between, the
+/// last sets are kept.
+pub const SETTING_EVERY: &str = "gdnet/budget/interaction_every_ticks";
 /// The default radius in pixels (2D); 3D divides by [`PX_PER_M`].
 pub const DEFAULT_RADIUS: f64 = 300.0;
-/// Pixels per metre, the convention the interpolation thresholds use too (WP5).
-pub const PX_PER_M: f64 = 100.0;
+/// Pixels per metre, the convention the interpolation thresholds (WP5) and the 2D quantisers (D17)
+/// use too.
+pub const PX_PER_M: f64 = netcore::quant::PX_PER_METRE;
 
 /// `gdnet/budget/interaction_radius` (pixels), default 300.
 pub fn setting_radius() -> f64 {
@@ -34,6 +39,16 @@ pub fn setting_radius() -> f64 {
         return DEFAULT_RADIUS;
     }
     crate::profiles::number(&ps.get_setting(SETTING_RADIUS)).unwrap_or(DEFAULT_RADIUS)
+}
+
+/// `gdnet/budget/interaction_every_ticks`, default 1 (every tick), at least 1.
+pub fn every_ticks() -> u64 {
+    let ps = ProjectSettings::singleton();
+    if !ps.has_setting(SETTING_EVERY) {
+        return 1;
+    }
+    crate::profiles::number(&ps.get_setting(SETTING_EVERY))
+        .map_or(1, |n| (n.round() as i64).clamp(1, 600) as u64)
 }
 
 /// The position of an entity root and whether it is 3D; None for a root that is neither a `Node2D`
@@ -98,6 +113,12 @@ pub fn interacting_sets(
             let b = m.bind();
             (b.interaction_radius_setting(), b.roots())
         };
+        if radius < 0.0 {
+            // Proximity off for this manager: its roots matter only as contact targets (and as the
+            // player itself), which need no position here.
+            roots.extend(list);
+            continue;
+        }
         for (id, root) in list {
             let Some((pos, is_3d)) = position_of(&root) else {
                 roots.insert(id, root);
@@ -105,8 +126,6 @@ pub fn interacting_sets(
             };
             let r = if radius > 0.0 {
                 radius
-            } else if radius < 0.0 {
-                0.0
             } else if is_3d {
                 default / PX_PER_M
             } else {

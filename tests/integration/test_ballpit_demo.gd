@@ -8,11 +8,13 @@ extends TestCase
 const PIT := preload("res://demos/ballpit/pit.tscn")
 const MANY := 300
 const FEW := 120
+const EVERY := "gdnet/budget/interaction_every_ticks"
 
 var net: NetFixture
 
 
 func after_each() -> void:
+	ProjectSettings.set_setting(EVERY, null)
 	Input.action_release("down")
 	Input.action_release("up")
 	if net != null:
@@ -284,6 +286,25 @@ func test_a_halved_budget_degrades_far_balls_and_keeps_near_ones() -> void:
 	assert_gt(near_rate, 0.8, "interacting balls update (nearly) every tick")
 	assert_lt(far_rate, near_rate / 4.0, "far balls are degraded")
 	assert_lt(per_s[2], budget / 10, "hash telemetry and pings stay under a tenth of the budget")
+	# Review 2026-11-08: `gdnet/budget/interaction_every_ticks` runs the pass every N ticks; the sets are
+	# kept (and re-asserted) on the ticks between.
+	var cost_every_tick: float = net.server_session.stats()["interaction_ms_avg"]
+	ProjectSettings.set_setting(EVERY, 4)
+	await _frames(Engine.physics_ticks_per_second + 2)
+	var passes_before: int = net.server_session.stats()["interaction_passes"]
+	var kept := true
+	for t in 40:
+		if t % 20 == 0:
+			pit.shake()
+		await get_tree().physics_frame
+		if net.server_session.interacting(cid).is_empty():
+			kept = false
+	var every4: Dictionary = net.server_session.stats()
+	var passes := int(every4["interaction_passes"]) - passes_before
+	print("ballpit interaction pass: %.3f ms per tick every tick, %.3f ms per tick at interaction_every_ticks = 4 (%d passes in 40 ticks)" % [cost_every_tick, every4["interaction_ms_avg"], passes])
+	assert_true(passes >= 9 and passes <= 11, "one pass in four ticks: %d in 40" % passes)
+	assert_true(kept, "the interacting set holds between passes")
+	assert_lt(float(every4["interaction_ms_avg"]), cost_every_tick, "cheaper per tick")
 
 
 func test_g8_the_readme_listings_are_the_files() -> void:
