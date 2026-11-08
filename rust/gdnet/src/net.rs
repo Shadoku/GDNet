@@ -31,13 +31,20 @@
 //! signal `call_refused(node, method, sender)` (relayed from the default session). gdext has no
 //! varargs `#[func]`, so each verb takes up to eight optional Variant arguments (the left-out slots hold
 //! a private RID sentinel); they serve any branch, through the node's manager.
+//!
+//! WP7: `request_owner(node)` (a `NetCall` whose `completed` carries true when granted),
+//! `release_owner(node)`, the signals `owner_changed(node, old, new)` and `write_rejected(node, sender)`
+//! (relayed from the default session) and `state` (`NetKeyedState`: the default session's keyed state,
+//! a local map while no session runs).
 
+use crate::authority;
 use crate::call::{self as net_call, NetArg, NetCall};
 use crate::configure::{self, Op};
 use crate::emulation::NetEmulation;
 use crate::input::NetInput;
+use crate::keyed::NetKeyedState;
 use crate::manager::{
-    entity_root_of, net_entity_of, NetManager, LOCAL_GROUP, META_OWNER, META_PRIORITY,
+    entity_root_of, net_entity_of, session_of, NetManager, LOCAL_GROUP, META_OWNER, META_PRIORITY,
 };
 use crate::pipe_peer::NetPipePeer;
 use crate::profiles::{self, NetProfiles};
@@ -69,7 +76,7 @@ fn scene_root_of(node: &Gd<Node>) -> Gd<Node> {
     node.clone()
 }
 
-const RELAYED: [(&str, &str); 10] = [
+const RELAYED: [(&str, &str); 12] = [
     ("peer_joined", "_on_peer_joined"),
     ("peer_left", "_on_peer_left"),
     ("connected", "_on_connected"),
@@ -80,6 +87,8 @@ const RELAYED: [(&str, &str); 10] = [
     ("spawn_refused", "_on_spawn_refused"),
     ("rolled_back", "_on_rolled_back"),
     ("call_refused", "_on_call_refused"),
+    ("owner_changed", "_on_owner_changed"),
+    ("write_rejected", "_on_write_rejected"),
 ];
 
 #[derive(GodotClass)]
@@ -121,6 +130,11 @@ pub struct Net {
     #[var(get = get_jitter_buffer_ticks, no_set)]
     #[allow(dead_code)]
     jitter_buffer_ticks: i64,
+    /// WP7: the keyed state (`NetKeyedState`): the default session's while one runs, else a local map.
+    #[var(get = get_state, no_set)]
+    #[allow(dead_code)]
+    state: Option<Gd<NetKeyedState>>,
+    state_cell: std::cell::OnceCell<Gd<NetKeyedState>>,
 }
 
 #[godot_api]
@@ -374,6 +388,67 @@ impl Net {
     /// WP6 (server): a call was refused (relayed from the default session).
     #[signal]
     fn call_refused(node: Gd<Node>, method: StringName, sender: i64);
+    /// WP7: an entity's owner changed (relayed from the default session).
+    #[signal]
+    fn owner_changed(node: Gd<Node>, old: i64, new: i64);
+    /// WP7: a write was rejected (relayed from the default session; on the writer `sender` is itself).
+    #[signal]
+    fn write_rejected(node: Gd<Node>, sender: i64);
+
+    /// WP7: the keyed state.
+    #[func]
+    fn get_state(&self) -> Option<Gd<NetKeyedState>> {
+        Some(self.state_cell.get_or_init(NetKeyedState::new_gd).clone())
+    }
+
+    /// WP7: asks for ownership of the entity `node` belongs to (its `NetEntity.transfer` decides:
+    /// `fixed` refuses, `take` grants, `request` asks the current owner). Returns a `NetCall`:
+    /// `await Net.request_owner(node).completed` is true when granted. Already the owner, or without a
+    /// session: true at once.
+    #[func]
+    fn request_owner(&mut self, node: Gd<Node>) -> Gd<NetCall> {
+        let Some((root, mut m)) = entity_root_of(&node) else {
+            return authority::resolved(true);
+        };
+        let r = m.bind_mut().request_owner(&root);
+        match r {
+            Ok(Some(granted)) => authority::resolved(granted),
+            Ok(None) => {
+                let id = m.bind().net_id_of(&root);
+                let call = NetCall::fresh();
+                match session_of(&root) {
+                    Some(mut s) => s.bind_mut().register_owner_request(id, call.clone()),
+                    None => NetCall::resolve(&call, Err(String::from("no session"))),
+                }
+                call
+            }
+            Err(e) => authority::failed(std::format!("Net.request_owner: {e}")),
+        }
+    }
+
+    /// WP7: gives the entity `node` belongs to back to the server (a client must own it; on the server
+    /// it is `set_owner(node, 1)`). True when the release was made.
+    #[func]
+    fn release_owner(&mut self, node: Gd<Node>) -> bool {
+        match entity_root_of(&node) {
+            Some((root, mut m)) => m.bind_mut().release_owner(&root),
+            None => false,
+        }
+    }
+
+    #[func]
+    fn _on_owner_changed(&mut self, node: Gd<Node>, old: i64, new: i64) {
+        self.base_mut().emit_signal(
+            "owner_changed",
+            &[node.to_variant(), old.to_variant(), new.to_variant()],
+        );
+    }
+
+    #[func]
+    fn _on_write_rejected(&mut self, node: Gd<Node>, sender: i64) {
+        self.base_mut()
+            .emit_signal("write_rejected", &[node.to_variant(), sender.to_variant()]);
+    }
 
     /// Enrols `node`'s subtree as if `node` were a `NetManager` (its scene instances become entities).
     /// For nodes outside any manager; call it on every peer, at the same path, before spawning under it.
@@ -869,6 +944,8 @@ impl Net {
             session.free();
             return err;
         }
+        let state = self.state_cell.get_or_init(NetKeyedState::new_gd).clone();
+        session.bind_mut().set_state_object(state);
         let me = self.to_gd();
         for (signal, method) in RELAYED {
             session.connect(signal, &Callable::from_object_method(&me, method));
@@ -879,6 +956,9 @@ impl Net {
     }
 
     fn drop_session(&mut self, mut session: Gd<NetSession>, stop: bool) {
+        if let Some(state) = self.state_cell.get() {
+            state.clone().bind_mut().attach(None);
+        }
         let me = self.to_gd();
         for (signal, method) in RELAYED {
             let cb = Callable::from_object_method(&me, method);

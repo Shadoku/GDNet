@@ -616,6 +616,7 @@ mod session_tests {
                 owner: 1,
                 parts: 2,
                 initial_state: Vec::new(),
+                ..CreateAction::default()
             }))
         };
         let call = |id: NetId| {

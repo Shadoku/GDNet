@@ -12,6 +12,11 @@
 //! travel in the input frame: read on the owner after `_net_input()`, written on the server before the
 //! tick) and the signal `rolled_back(from_tick, to_tick)`.
 //!
+//! WP7: `transfer` (how ownership may move: `fixed`, `request`, `take`), `client_owned` (the owner's state
+//! is accepted and relayed: shared authority, D9), `inherit_owner` (a nested entity takes its enclosing
+//! entity's owner at creation unless it sets its own) and the signal `owner_changed(old, new)`, emitted on
+//! every peer once per change (parts get `_net_owner_changed(old, new)`).
+//!
 //! Scripts that extend `NetEntity` may override `_net_spawned(info)` and `_net_despawning()`; scripts on
 //! any other part get the same calls when they define those methods.
 
@@ -47,6 +52,37 @@ impl Predict {
             Predict::Check => netcore::Policy::Check,
             Predict::Always => netcore::Policy::Always,
             Predict::Disabled => netcore::Policy::Disabled,
+        }
+    }
+}
+
+/// `NetEntity.transfer`: how ownership of the entity may move (2.6).
+#[derive(GodotConvert, Var, Export, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[godot(via = i64)]
+pub enum Transfer {
+    /// Only the server moves it (`Net.set_owner`).
+    #[default]
+    Fixed = 0,
+    /// A client may ask (`Net.request_owner`); the current owner decides (`_net_grant_owner`).
+    Request = 1,
+    /// A client may take it at any time.
+    Take = 2,
+}
+
+impl Transfer {
+    pub fn rule(self) -> netcore::Transfer {
+        match self {
+            Transfer::Fixed => netcore::Transfer::Fixed,
+            Transfer::Request => netcore::Transfer::Request,
+            Transfer::Take => netcore::Transfer::Take,
+        }
+    }
+
+    pub fn from_rule(t: netcore::Transfer) -> Self {
+        match t {
+            netcore::Transfer::Fixed => Transfer::Fixed,
+            netcore::Transfer::Request => Transfer::Request,
+            netcore::Transfer::Take => Transfer::Take,
         }
     }
 }
@@ -96,6 +132,22 @@ pub struct NetEntity {
     #[var(pub)]
     #[init(val = 1.0)]
     priority: f64,
+    /// WP7: how ownership may move: `fixed` (default: only the server's `Net.set_owner`), `request`
+    /// (`Net.request_owner`; the current owner decides) or `take` (any client may take it).
+    #[export]
+    #[var(pub)]
+    transfer: Transfer,
+    /// WP7: the owner simulates the entity and its state is accepted and relayed to everyone (shared
+    /// authority: the server trusts that client for this entity; D9). Off by default.
+    #[export]
+    #[var(pub)]
+    client_owned: bool,
+    /// WP7: a nested entity takes its enclosing entity's owner at creation (default), unless this is
+    /// off or `owner_peer` is set to another value than 1.
+    #[export]
+    #[var(pub)]
+    #[init(val = true)]
+    inherit_owner: bool,
     /// The entity's net id once spawned (0 before). Read only.
     #[var(get = get_net_id, no_set)]
     net_id: i64,
@@ -118,6 +170,14 @@ impl NetEntity {
     /// `from_tick` (the predicted tick it was at).
     #[signal]
     fn rolled_back(from_tick: i64, to_tick: i64);
+
+    /// WP7: the entity's owner changed from `old` to `new` (on every peer, once per change).
+    #[signal]
+    fn owner_changed(old: i64, new: i64);
+
+    /// WP7: called on every part (that defines it) when the owner changed from `old` to `new`.
+    #[func(virtual)]
+    fn net_owner_changed(&self, _old: i64, _new: i64) {}
 
     /// Called on every part of an entity just before it is freed by gdnet (on a client) or when its
     /// despawn is announced (on the authority).

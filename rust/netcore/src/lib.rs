@@ -13,10 +13,12 @@
 //! WP4: [`input`] (input frames, redundancy, the server's input buffer, adaptive delay), [`predict`]
 //! (prediction histories, mismatch detection, rollback requests, the tick lead). WP5: [`interp`] (the
 //! render timeline, the adaptive jitter buffer, sample buffers, error offsets). WP6: [`call`] (calls and
-//! returns, the argument encoding, the routing verbs).
+//! returns, the argument encoding, the routing verbs). WP7: [`authority`] (transfer rules, owner state
+//! acceptance, rejected writes), [`keyed`] (the keyed state map, permissions, views).
 
 #![forbid(unsafe_code)]
 
+pub mod authority;
 pub mod call;
 pub mod clock;
 pub mod delta;
@@ -24,6 +26,7 @@ pub mod emul;
 pub mod entity;
 pub mod input;
 pub mod interp;
+pub mod keyed;
 pub mod peers;
 pub mod predict;
 pub mod priority;
@@ -33,6 +36,7 @@ pub mod session;
 pub mod snapshot;
 pub mod wire;
 
+pub use authority::{AuthorityStats, Transfer};
 pub use call::{Arg, CallIn, CallMsg, CallPlan, CallResult, CallStats, OutCall, Verb};
 pub use delta::{Ack, FieldMsg, ReplStats, Replication, StateUpdate};
 pub use emul::{EmulSettings, Emulator, Pcg32};
@@ -42,6 +46,7 @@ pub use entity::{
 };
 pub use input::{InputFrame, InputMsg, TakenFrame};
 pub use interp::{Interp, InterpStats};
+pub use keyed::{KeyEvent, KeyMsg, KeyedState, Who};
 pub use peers::{PeerId, SERVER};
 pub use predict::{Policy, Rollback};
 pub use props::{PropDesc, Quant, ScenePropsTable, Schedule, TypeTag, Value};

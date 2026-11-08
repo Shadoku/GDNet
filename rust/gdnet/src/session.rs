@@ -19,6 +19,7 @@ use crate::api_ext::NetMultiplayerApi;
 use crate::call::{self as net_call, NetArg, NetCall};
 use crate::emulation::{settings_of, NetEmulation};
 use crate::interp;
+use crate::keyed::{self as net_keyed, NetKeyedState};
 use crate::manager::{NetManager, TickCtx, MANAGERS_GROUP};
 use crate::pipe_peer::NetPipePeer;
 use crate::poll::{NetPoller, POLLER_NODE};
@@ -35,7 +36,7 @@ use godot::global::Error;
 use godot::prelude::*;
 use netcore::call::Verb;
 use netcore::session::EntityEvent;
-use netcore::{EmulSettings, Event, Reliability, Session, SessionConfig, StateUpdate};
+use netcore::{EmulSettings, Event, KeyEvent, Reliability, Session, SessionConfig, StateUpdate};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -130,6 +131,12 @@ pub struct NetSession {
     /// spawn.
     #[var(rename = _debug_extra_method, get = get_debug_extra_method, set = set_debug_extra_method)]
     debug_extra_method: GString,
+    /// WP7: the keyed state of this session (`Net.state` is the default session's).
+    #[var(get = get_state, no_set)]
+    #[init(val = NetKeyedState::new_gd())]
+    state: Gd<NetKeyedState>,
+    /// WP7: `Net.request_owner` calls waiting for their reply, by entity.
+    owner_requests: HashMap<u32, Vec<Gd<NetCall>>>,
 }
 
 /// Byte and timing counters behind `stats()` (2.7, the WP8 meter's source).
@@ -242,6 +249,21 @@ impl NetSession {
     /// and the part's `_net_allow` did not admit it). The caller's `NetCall` fails.
     #[signal]
     fn call_refused(node: Gd<Node>, method: StringName, sender: i64);
+
+    /// WP7: the entity `node`'s owner changed from `old` to `new` (on every peer, once per change).
+    #[signal]
+    fn owner_changed(node: Gd<Node>, old: i64, new: i64);
+
+    /// WP7: a write to `node` was rejected. On the server: `sender` wrote state it does not own. On
+    /// the writer (`sender` = its own id): the fields were put back to the server's values.
+    #[signal]
+    fn write_rejected(node: Gd<Node>, sender: i64);
+
+    /// WP7: the keyed state (`NetKeyedState`) of this session.
+    #[func]
+    pub fn get_state(&self) -> Gd<NetKeyedState> {
+        self.state.clone()
+    }
 
     /// WP6 (rung 2): runs `callable` (a method of a part of a managed entity) on the authority, then on
     /// every peer that has the entity in scope. From a client it goes to the server only, which checks
@@ -535,6 +557,22 @@ impl NetSession {
         d.set("calls_received_per_s", c.calls_per_s[1] as i64);
         d.set("calls_refused_per_s", c.calls_per_s[2] as i64);
         d.set("calls_dropped_per_s", c.calls_per_s[3] as i64);
+        // WP7.
+        if let Some(core) = self.core.as_ref() {
+            let a = core.authority_stats();
+            d.set("owner_changes", a.owner_changes as i64);
+            d.set("writes_rejected", a.writes_rejected as i64);
+            d.set("writes_sent", a.writes_sent as i64);
+            d.set("owner_states_sent", a.owner_states_sent as i64);
+            d.set("owner_states_received", a.owner_states_received as i64);
+            d.set("ownership_requests_granted", a.requests_granted as i64);
+            d.set("ownership_requests_refused", a.requests_refused as i64);
+            let k = core.keyed().stats;
+            d.set("keyed_bytes_sent", k.bytes_sent as i64);
+            d.set("keyed_bytes_received", k.bytes_received as i64);
+            d.set("keyed_writes_rejected", k.rejected as i64);
+            d.set("keyed_entries", core.keyed().len() as i64);
+        }
         d
     }
 
@@ -696,6 +734,8 @@ impl NetSession {
         self.stats = Counters::default();
         self.last_ptick = None;
         self.owned_active = false;
+        let iid = me.instance_id();
+        self.state.bind_mut().attach(Some(iid));
         if !hosting {
             let cb = Callable::from_object_method(&me, PHYSICS_FRAME_HOOK.1);
             if !tree.is_connected(PHYSICS_FRAME_HOOK.0, &cb) {
@@ -894,6 +934,7 @@ impl NetSession {
         self.resolve_calls();
         self.sync_managers();
         self.input_step();
+        self.keyed_step();
         let (events, tick) = {
             let Some(core) = self.core.as_mut() else {
                 return;
@@ -986,6 +1027,27 @@ impl NetSession {
                 }
                 for (id, f) in frames {
                     core.local_input(id, f);
+                }
+            }
+            // WP7: the state of the client_owned entities this client owns, and writes to replicas.
+            let tick = self.core.as_ref().map_or(0, |c| c.current_tick());
+            let cold = self.effective_cold_poll();
+            let managers = self.managers();
+            let (mut owned, mut polled) = (Vec::new(), Vec::new());
+            {
+                let _guard = self.base_mut();
+                for (_, mut m) in managers {
+                    let mut b = m.bind_mut();
+                    b.record_client_owned(tick, cold, &mut owned);
+                    b.poll_writes(tick, cold, &mut polled);
+                }
+            }
+            if let Some(core) = self.core.as_mut() {
+                for (id, part, values) in &owned {
+                    core.record_part(*id, *part, values);
+                }
+                for (id, part, values) in &polled {
+                    core.check_writes(*id, *part, values);
                 }
             }
         }
@@ -1105,6 +1167,107 @@ impl NetSession {
         }
     }
 
+    /// WP7: a `Net.request_owner` call waits for the reply about entity `id`.
+    pub fn register_owner_request(&mut self, id: u32, call: Gd<NetCall>) {
+        self.owner_requests.entry(id).or_default().push(call);
+    }
+
+    /// WP7: resolves the `Net.request_owner` calls waiting on `id` with `granted`.
+    pub fn resolve_owner_request(&mut self, id: u32, granted: bool) {
+        for call in self.owner_requests.remove(&id).unwrap_or_default() {
+            NetCall::resolve(&call, Ok(granted.to_variant()));
+        }
+    }
+
+    /// WP7: a running netcore session exists (the keyed state uses it; else the local map).
+    pub fn has_core(&self) -> bool {
+        self.core.is_some()
+    }
+
+    /// WP7: the encoded value at `path` of the keyed state.
+    pub fn keyed_get(&self, path: &str) -> Option<Vec<u8>> {
+        self.core.as_ref()?.keyed().get(path).cloned()
+    }
+
+    pub fn keyed_keys(&self, prefix: &str) -> Vec<String> {
+        self.core
+            .as_ref()
+            .map(|c| c.keyed().keys(prefix))
+            .unwrap_or_default()
+    }
+
+    /// WP7: runs a keyed-state operation on the core and returns the events it queued (the caller
+    /// emits them).
+    pub fn keyed_op(
+        &mut self,
+        f: impl FnOnce(&mut Session, u64) -> Result<(), String>,
+    ) -> Result<Vec<KeyEvent>, String> {
+        let now = now_us();
+        let Some(core) = self.core.as_mut() else {
+            return Err(String::from("no session"));
+        };
+        f(core, now)?;
+        let mut events = Vec::new();
+        while let Some(e) = core.poll_key_event() {
+            events.push(e);
+        }
+        Ok(events)
+    }
+
+    /// Makes `state` this session's keyed state object (`Net` passes its `Net.state`).
+    pub fn set_state_object(&mut self, mut state: Gd<NetKeyedState>) {
+        let iid = self.to_gd().instance_id();
+        state.bind_mut().attach(Some(iid));
+        self.state = state;
+    }
+
+    /// WP7, per tick: the server re-evaluates the keyed state's view filters for every joined peer;
+    /// then every side emits the keyed state's signals for what changed.
+    fn keyed_step(&mut self) {
+        let is_server = self.is_server() && self.is_connected();
+        if is_server {
+            let views = self.state.bind().views();
+            if !views.is_empty() {
+                let peers: Vec<u32> = self
+                    .core
+                    .as_ref()
+                    .map(|c| c.joined_peers())
+                    .unwrap_or_default();
+                let mut decisions = Vec::new();
+                {
+                    let _guard = self.base_mut();
+                    for (prefix, filter) in &views {
+                        for p in &peers {
+                            decisions.push((
+                                prefix.clone(),
+                                *p,
+                                net_keyed::call_filter(filter, *p),
+                            ));
+                        }
+                    }
+                }
+                let now = now_us();
+                if let Some(core) = self.core.as_mut() {
+                    for (prefix, p, vis) in decisions {
+                        core.keyed_set_visible(&prefix, p, vis, now);
+                    }
+                }
+            }
+        }
+        let mut events = Vec::new();
+        if let Some(core) = self.core.as_mut() {
+            while let Some(e) = core.poll_key_event() {
+                events.push(e);
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        let mut state = self.state.clone();
+        let _guard = self.base_mut();
+        state.bind_mut().emit_events(events);
+    }
+
     pub fn debug_extra_method(&self) -> String {
         self.debug_extra_method.to_string()
     }
@@ -1193,13 +1356,7 @@ impl NetSession {
         let rate = u64::from(tick_rate());
         let mut keep = Vec::new();
         for (since, reported, e) in events {
-            let key = match &e {
-                EntityEvent::Create { create, .. } => create.parent.manager,
-                EntityEvent::Destroy { record, .. } => record.parent.manager,
-                EntityEvent::Reparent { from_manager, .. } => *from_manager,
-                EntityEvent::SetOwner { manager, .. } => *manager,
-                EntityEvent::Call(c) => c.manager,
-            };
+            let key = e.manager();
             if managers.iter().any(|(k, _)| *k == key) {
                 routed.entry(key).or_default().push(e);
             } else {
@@ -1335,6 +1492,16 @@ impl NetSession {
                     "the session ended before the call was answered",
                 )),
             );
+        }
+        for (_, calls) in self.owner_requests.drain() {
+            for call in calls {
+                NetCall::resolve(
+                    &call,
+                    Err(String::from(
+                        "the session ended before the ownership request was answered",
+                    )),
+                );
+            }
         }
         self.restore_owned_offsets();
         let Some(_core) = self.core.take() else {

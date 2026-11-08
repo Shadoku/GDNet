@@ -102,9 +102,12 @@ pub struct EntityRecord {
     pub parts: u16,
     /// Creation order on this peer (the burst is sent parents first, then by this).
     pub seq: u64,
+    /// WP7: how ownership may move, and whether the owner's state is accepted (2.6).
+    pub transfer: crate::authority::Transfer,
+    pub client_owned: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CreateAction {
     pub id: NetId,
     pub scene_hash: u64,
@@ -114,6 +117,10 @@ pub struct CreateAction {
     pub parts: u16,
     /// The initial state of every part, opaque to the entity layer (empty until WP3 fills it).
     pub initial_state: Vec<u8>,
+    /// WP7: the entity's transfer rule.
+    pub transfer: crate::authority::Transfer,
+    /// WP7: the owner's state is accepted and relayed (shared authority, D9).
+    pub client_owned: bool,
 }
 
 /// `EntityAction` (2.4): one reliable ordered message per action.
@@ -141,6 +148,30 @@ pub enum EntityAction {
         id: NetId,
         owner: PeerId,
     },
+    /// WP7, client to server: the sender asks to own `id` (its transfer rule decides).
+    RequestOwner {
+        id: NetId,
+    },
+    /// WP7, client to server: the owner gives `id` back to the server.
+    ReleaseOwner {
+        id: NetId,
+    },
+    /// WP7, server to the owner of a `request` entity: may `requester` have it?
+    OwnerQuery {
+        id: NetId,
+        requester: PeerId,
+    },
+    /// WP7, the owner's answer to an `OwnerQuery`.
+    OwnerAnswer {
+        id: NetId,
+        requester: PeerId,
+        grant: bool,
+    },
+    /// WP7, server to a requester: the outcome of its `RequestOwner` (after the `SetOwner` of a grant).
+    OwnerReply {
+        id: NetId,
+        granted: bool,
+    },
     /// WP6: a received call (it travels as its own message, kind 11, never as an `EntityAction`). It is
     /// kept here so a call waits behind its entity's pending `Create` in the same held queue, in order.
     #[serde(skip)]
@@ -155,7 +186,12 @@ impl EntityAction {
             EntityAction::Create(c) => Some(c.id),
             EntityAction::Destroy { id }
             | EntityAction::SetOwner { id, .. }
-            | EntityAction::Reparent { id, .. } => Some(*id),
+            | EntityAction::Reparent { id, .. }
+            | EntityAction::RequestOwner { id }
+            | EntityAction::ReleaseOwner { id }
+            | EntityAction::OwnerQuery { id, .. }
+            | EntityAction::OwnerAnswer { id, .. }
+            | EntityAction::OwnerReply { id, .. } => Some(*id),
             EntityAction::Call(c) => Some(c.entity),
         }
     }
@@ -166,7 +202,13 @@ impl EntityAction {
         match self {
             EntityAction::Scene { .. } => (None, None),
             EntityAction::Create(c) => (None, parent(&c.parent)),
-            EntityAction::Destroy { id } | EntityAction::SetOwner { id, .. } => (Some(*id), None),
+            EntityAction::Destroy { id }
+            | EntityAction::SetOwner { id, .. }
+            | EntityAction::RequestOwner { id }
+            | EntityAction::ReleaseOwner { id }
+            | EntityAction::OwnerQuery { id, .. }
+            | EntityAction::OwnerAnswer { id, .. }
+            | EntityAction::OwnerReply { id, .. } => (Some(*id), None),
             EntityAction::Call(c) => (Some(c.entity), None),
             EntityAction::Reparent { id, parent: p } => (Some(*id), parent(p)),
         }
@@ -220,6 +262,8 @@ impl EntityTable {
                 owner: c.owner,
                 parts: c.parts,
                 seq: self.seq,
+                transfer: c.transfer,
+                client_owned: c.client_owned,
             },
         );
         true
@@ -324,6 +368,8 @@ impl EntityTable {
                     owner: r.owner,
                     parts: r.parts,
                     initial_state: Vec::new(),
+                    transfer: r.transfer,
+                    client_owned: r.client_owned,
                 });
             }
             for child in self.children_of(id).into_iter().rev() {
@@ -476,6 +522,7 @@ mod tests {
             owner: 1,
             parts: 3,
             initial_state: Vec::new(),
+            ..CreateAction::default()
         }
     }
 

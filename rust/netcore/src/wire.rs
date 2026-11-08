@@ -2,6 +2,7 @@
 //! WP1 defines the session messages: `Hello` / `Welcome` / `Reject` (the handshake) and `Time`
 //! ping/pong. Later packages add kinds; a receiver that does not know a kind reports it as an error.
 
+use crate::authority::{StateMsg, WriteReject};
 use crate::call::{CallMsg, CallReturn};
 use crate::delta::{Ack, FieldMsg};
 use crate::entity::EntityAction;
@@ -114,6 +115,14 @@ pub enum Message {
     Call(CallMsg),
     /// WP6: the answer to a call's request id.
     CallReturn(CallReturn),
+    /// WP7: a `client_owned` entity's state from its owner (unreliable; authority.rs).
+    OwnerState(StateMsg),
+    /// WP7: a client's change of an entity it does not own (reliable; answered by `WriteReject`).
+    Write(StateMsg),
+    /// WP7: the server refused a write; the writer restores the server's values.
+    WriteReject(WriteReject),
+    /// WP7: keyed state (keyed.rs).
+    Keyed(crate::keyed::KeyMsg),
 }
 
 /// The kind bytes. 0 is never used, so a zeroed buffer is not a message.
@@ -130,13 +139,17 @@ pub mod kind {
     pub const INPUT: u8 = 10;
     pub const CALL: u8 = 11;
     pub const CALL_RETURN: u8 = 12;
+    pub const OWNER_STATE: u8 = 13;
+    pub const WRITE: u8 = 14;
+    pub const WRITE_REJECT: u8 = 15;
+    pub const KEYED: u8 = 16;
 }
 
 /// The channel a message of kind `k` travels on (for byte counters of received packets).
 pub fn channel_of_kind(k: u8) -> Channel {
     match k {
         kind::PING | kind::PONG => Channel::Diagnostics,
-        kind::SNAPSHOT | kind::ACK | kind::INPUT => Channel::Unreliable,
+        kind::SNAPSHOT | kind::ACK | kind::INPUT | kind::OWNER_STATE => Channel::Unreliable,
         _ => Channel::Reliable,
     }
 }
@@ -174,6 +187,10 @@ impl Message {
             Message::Input(_) => kind::INPUT,
             Message::Call(_) => kind::CALL,
             Message::CallReturn(_) => kind::CALL_RETURN,
+            Message::OwnerState(_) => kind::OWNER_STATE,
+            Message::Write(_) => kind::WRITE,
+            Message::WriteReject(_) => kind::WRITE_REJECT,
+            Message::Keyed(_) => kind::KEYED,
         }
     }
 
@@ -185,10 +202,15 @@ impl Message {
             | Message::Reject(_)
             | Message::Entity(_)
             | Message::Field(_)
-            | Message::CallReturn(_) => Channel::Reliable,
+            | Message::CallReturn(_)
+            | Message::Write(_)
+            | Message::WriteReject(_)
+            | Message::Keyed(_) => Channel::Reliable,
             Message::Call(c) if c.unreliable => Channel::Unreliable,
             Message::Call(_) => Channel::Reliable,
-            Message::Snapshot(_) | Message::Ack(_) | Message::Input(_) => Channel::Unreliable,
+            Message::Snapshot(_) | Message::Ack(_) | Message::Input(_) | Message::OwnerState(_) => {
+                Channel::Unreliable
+            }
             Message::Ping(_) | Message::Pong(_) => Channel::Diagnostics,
         }
     }
@@ -226,6 +248,10 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         }
         Message::Call(m) => body(kind::CALL, m),
         Message::CallReturn(m) => body(kind::CALL_RETURN, m),
+        Message::OwnerState(m) => body(kind::OWNER_STATE, m),
+        Message::Write(m) => body(kind::WRITE, m),
+        Message::WriteReject(m) => body(kind::WRITE_REJECT, m),
+        Message::Keyed(m) => body(kind::KEYED, m),
     }
 }
 
@@ -249,6 +275,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         kind::INPUT => Message::Input(rest.to_vec()),
         kind::CALL => Message::Call(parse(k, rest)?),
         kind::CALL_RETURN => Message::CallReturn(parse(k, rest)?),
+        kind::OWNER_STATE => Message::OwnerState(parse(k, rest)?),
+        kind::WRITE => Message::Write(parse(k, rest)?),
+        kind::WRITE_REJECT => Message::WriteReject(parse(k, rest)?),
+        kind::KEYED => Message::Keyed(parse(k, rest)?),
         other => return Err(WireError::UnknownKind(other)),
     })
 }
@@ -450,10 +480,32 @@ mod tests {
                 owner: 4,
                 parts: 3,
                 initial_state: std::vec![1, 2, 3],
+                ..CreateAction::default()
             }),
             EntityAction::Destroy { id: 1 },
             EntityAction::Reparent { id: 1, parent },
             EntityAction::SetOwner { id: 1, owner: 9 },
+            EntityAction::RequestOwner { id: 1 },
+            EntityAction::ReleaseOwner { id: 1 },
+            EntityAction::OwnerQuery {
+                id: 1,
+                requester: 9,
+            },
+            EntityAction::OwnerAnswer {
+                id: 1,
+                requester: 9,
+                grant: true,
+            },
+            EntityAction::OwnerReply {
+                id: 1,
+                granted: false,
+            },
+            EntityAction::Create(CreateAction {
+                id: 2,
+                transfer: crate::authority::Transfer::Take,
+                client_owned: true,
+                ..CreateAction::default()
+            }),
         ] {
             let msg = Message::Entity(action);
             assert_eq!(msg.channel(), Channel::Reliable);
@@ -473,6 +525,43 @@ mod tests {
             data: std::vec![1, 2],
         }));
         roundtrip(Message::Input(std::vec![4, 5]));
+        // WP7: owner state (unreliable), writes and rejects, keyed state (reliable).
+        let st = crate::authority::StateMsg {
+            tick: 7,
+            entities: std::vec![(3, std::vec![1, 2])],
+        };
+        roundtrip(Message::OwnerState(st.clone()));
+        assert_eq!(
+            Message::OwnerState(st.clone()).channel(),
+            Channel::Unreliable
+        );
+        assert_eq!(channel_of_kind(kind::OWNER_STATE), Channel::Unreliable);
+        roundtrip(Message::Write(st));
+        roundtrip(Message::WriteReject(crate::authority::WriteReject {
+            id: 3,
+            fields: std::vec![(0, 2)],
+        }));
+        for m in [
+            crate::keyed::KeyMsg::Set {
+                path: "score/5".into(),
+                value: std::vec![1],
+            },
+            crate::keyed::KeyMsg::Erase { path: "a".into() },
+            crate::keyed::KeyMsg::Full {
+                entries: std::vec![("a".into(), std::vec![])],
+                rules: std::vec![("chat/".into(), crate::keyed::Who::All)],
+            },
+            crate::keyed::KeyMsg::Rules {
+                rules: std::vec![("s/".into(), crate::keyed::Who::Peer(4))],
+            },
+            crate::keyed::KeyMsg::Rejected {
+                path: "x".into(),
+                value: None,
+            },
+        ] {
+            assert_eq!(Message::Keyed(m.clone()).channel(), Channel::Reliable);
+            roundtrip(Message::Keyed(m));
+        }
         assert_eq!(Message::Input(Vec::new()).channel(), Channel::Unreliable);
         assert_eq!(channel_of_kind(kind::INPUT), Channel::Unreliable);
         assert_eq!(channel_of_kind(kind::SNAPSHOT), Channel::Unreliable);

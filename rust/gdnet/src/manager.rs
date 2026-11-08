@@ -32,8 +32,9 @@
 //! are frozen once.
 
 use crate::apply;
+use crate::authority;
 use crate::call::{self as net_call, NetCall, NetCallInfo};
-use crate::entity_node::{NetEntity, Simulate};
+use crate::entity_node::{NetEntity, Simulate, Transfer};
 use crate::infer::{self, RuntimeProps};
 use crate::input::{self as net_input, ActionTable, NetInput};
 use crate::methods::{self, MethodTable};
@@ -125,6 +126,11 @@ struct Entry {
     input_checked: bool,
     /// WP6: the scene's method tables (methods.rs), once derived.
     methods: Option<Rc<MethodTable>>,
+    /// WP7: the owner's state is accepted and relayed (the owner simulates it).
+    client_owned: bool,
+    transfer: netcore::Transfer,
+    /// WP7: the owner `owner_changed` last reported (callbacks fire when a change differs from it).
+    notified_owner: u32,
 }
 
 impl Entry {
@@ -150,6 +156,9 @@ impl Entry {
             predicted: None,
             input_checked: false,
             methods: None,
+            client_owned: false,
+            transfer: netcore::Transfer::Fixed,
+            notified_owner: owner,
         }
     }
 }
@@ -748,13 +757,18 @@ impl NetManager {
                     if let Some(e) = self.entries.get_mut(&iid) {
                         e.id = Some(create.id);
                         e.owner = create.owner;
+                        e.notified_owner = create.owner;
                         e.origin = Origin::Remote;
                         e.parent = Some(create.parent);
+                        e.client_owned = create.client_owned;
+                        e.transfer = create.transfer;
                     }
                 } else {
                     let mut entry = Entry::new(scene.clone(), create.owner, Origin::Remote);
                     entry.id = Some(create.id);
                     entry.parent = Some(create.parent);
+                    entry.client_owned = create.client_owned;
+                    entry.transfer = create.transfer;
                     self.entries.insert(iid, entry);
                     self.order.push(iid);
                     let mut n = node.clone();
@@ -765,6 +779,7 @@ impl NetManager {
                 }
                 self.by_id.insert(create.id, iid);
                 set_net_entity(&node, Some(create.owner), Some(create.id));
+                set_net_entity_authority(&node, create.transfer, create.client_owned);
                 if !adopted {
                     let _guard = self.base_mut();
                     parent.add_child(&node);
@@ -795,9 +810,11 @@ impl NetManager {
                         .flatten()
                         .unwrap_or_default();
                     // WP5: a replica's interpolated fields start their sample buffers from it.
+                    // WP7: and the values are the baseline of write detection.
                     if !self.is_server {
                         let id = create.id;
                         s.bind_mut().with_core(|c, _| {
+                            c.remember_received(id, &values);
                             for (p, f, v) in &values {
                                 c.interp_seed(id, *p, *f, v.clone());
                             }
@@ -878,13 +895,159 @@ impl NetManager {
                     s.bind_mut().with_core(|c, _| c.interp_reset(id));
                 }
                 self.owned_shown.retain(|k, _| k.0 != id);
+                let mut old = owner;
                 if let Some(e) = self.entries.get_mut(&iid) {
                     e.owner = owner;
+                    old = e.notified_owner;
+                    e.notified_owner = owner;
                 }
                 if let Ok(node) = Gd::<Node>::try_from_instance_id(iid) {
                     set_net_entity(&node, Some(owner), None);
+                    if old != owner {
+                        self.owner_changed_callbacks(session, &node, old, owner);
+                    }
                 }
             }
+            EntityEvent::OwnerQuery { id, requester, .. } => {
+                let Some((e, node)) = self.entry_of_id(id) else {
+                    let mut s = session.clone();
+                    s.bind_mut()
+                        .with_core(|c, now| c.answer_owner_query(id, requester, false, now));
+                    return;
+                };
+                // The default: an entity the server owns is granted, a client's is not.
+                let default = e.owner == netcore::SERVER;
+                let parts = e.scene.part_nodes(&node);
+                let grant = {
+                    let _guard = self.base_mut();
+                    authority::grant_owner(&parts, requester, default)
+                };
+                let mut s = session.clone();
+                s.bind_mut()
+                    .with_core(|c, now| c.answer_owner_query(id, requester, grant, now));
+            }
+            EntityEvent::OwnerReply { id, granted, .. } => {
+                let mut s = session.clone();
+                let _guard = self.base_mut();
+                s.bind_mut().resolve_owner_request(id, granted);
+            }
+            EntityEvent::WriteRejected {
+                id, peer, restore, ..
+            } => {
+                let Some(iid) = self.by_id.get(&id).copied() else {
+                    return;
+                };
+                let writes = self
+                    .entries
+                    .get(&iid)
+                    .and_then(|e| {
+                        e.props
+                            .as_ref()
+                            .map(|rt| state_writes(rt, &e.nodes, restore))
+                    })
+                    .unwrap_or_default();
+                let Ok(node) = Gd::<Node>::try_from_instance_id(iid) else {
+                    return;
+                };
+                let mut sobj = session.clone().upcast::<Node>();
+                let _guard = self.base_mut();
+                for (n, f, v) in writes {
+                    if n.is_instance_valid() {
+                        apply::write(&n, &f, &v);
+                    }
+                }
+                sobj.emit_signal(
+                    "write_rejected",
+                    &[node.to_variant(), i64::from(peer).to_variant()],
+                );
+            }
+        }
+    }
+
+    /// WP7: `_net_owner_changed(old, new)` on the parts, `NetEntity.owner_changed`, then the session's
+    /// `owner_changed(node, old, new)`. Holds the base guard.
+    fn owner_changed_callbacks(
+        &mut self,
+        session: &Gd<NetSession>,
+        node: &Gd<Node>,
+        old: u32,
+        new: u32,
+    ) {
+        let parts = self
+            .entries
+            .get(&node.instance_id())
+            .map(|e| e.scene.part_nodes(node))
+            .unwrap_or_default();
+        let ne = net_entity_of(node);
+        let mut sobj = session.clone().upcast::<Node>();
+        let _guard = self.base_mut();
+        authority::notify_owner_changed(&parts, ne, old, new);
+        sobj.emit_signal(
+            "owner_changed",
+            &[
+                node.to_variant(),
+                i64::from(old).to_variant(),
+                i64::from(new).to_variant(),
+            ],
+        );
+    }
+
+    /// WP7: `Net.request_owner(node)` for the entity rooted at `root`: Ok(None) when the request went
+    /// out (the reply resolves it), Ok(Some(granted)) when decided at once, Err for a call that cannot
+    /// be made.
+    pub fn request_owner(&mut self, root: &Gd<Node>) -> Result<Option<bool>, String> {
+        let Some(e) = self.entries.get(&root.instance_id()) else {
+            return Err(std::format!("{} is not enrolled", root.get_path()));
+        };
+        if !self.online {
+            return Ok(Some(true));
+        }
+        let Some(id) = e.id else {
+            return Err(std::format!(
+                "{} is not spawned yet; request its ownership after it was spawned",
+                root.get_path()
+            ));
+        };
+        if e.owner == self.local_id {
+            return Ok(Some(true));
+        }
+        let Some(mut s) = self.session() else {
+            return Err(String::from("no session"));
+        };
+        s.bind_mut()
+            .with_core(|c, now| c.request_owner(id, now))
+            .unwrap_or_else(|| Err(String::from("no session")))?;
+        Ok(None)
+    }
+
+    /// WP7: `Net.release_owner(node)`: gives the entity back to the server.
+    pub fn release_owner(&mut self, root: &Gd<Node>) -> bool {
+        let Some(e) = self.entries.get(&root.instance_id()) else {
+            return false;
+        };
+        if self.is_server || !self.online {
+            return self.set_entity_owner(root, netcore::SERVER);
+        }
+        let Some(id) = e.id else {
+            return false;
+        };
+        let Some(mut s) = self.session() else {
+            return false;
+        };
+        let released = s
+            .bind_mut()
+            .with_core(|c, now| c.release_owner(id, now))
+            .unwrap_or(false);
+        released
+    }
+
+    /// WP7: true when this peer's copy of the entity is the source of its state: on the server, every
+    /// entity but a `client_owned` one a client owns; on a client, a `client_owned` one it owns.
+    fn state_is_local(&self, e: &Entry) -> bool {
+        if self.is_server {
+            !(e.client_owned && e.owner != netcore::SERVER)
+        } else {
+            e.client_owned && e.owner == self.local_id
         }
     }
 
@@ -1020,28 +1183,45 @@ impl NetManager {
                 read_all(rt, &nodes)
             });
             let priority = priority_of(&node);
+            // WP7: the transfer rule, client_owned, and whether the owner is inherited from the
+            // enclosing entity (2.6).
+            let (transfer, client_owned, inherit) = authority_of(&node);
             let result = s.bind_mut().with_core(|c, now| {
-                let spec = Spawn::new(parent, &name, owner, scene.part_count(), Vec::new());
+                let spec = Spawn::new(parent, &name, owner, scene.part_count(), Vec::new())
+                    .with_authority(transfer, client_owned);
+                let spec = if inherit {
+                    spec.inheriting_owner()
+                } else {
+                    spec
+                };
                 let spec = match values {
                     Some(v) => spec.with_values(v),
                     None => spec,
                 };
                 let r = c.spawn(&scene.path, spec, now);
-                if let Ok(id) = r {
+                r.map(|id| {
                     c.set_entity_priority(id, priority);
-                }
-                r
+                    let rec = c.entities().get(id);
+                    let owner = rec.map_or(owner, |r| r.owner);
+                    let co = rec.is_some_and(|r| r.client_owned);
+                    (id, owner, co)
+                })
             });
             match result {
-                Some(Ok(id)) => {
+                Some(Ok((id, owner, client_owned))) => {
                     if let Some(e) = self.entries.get_mut(&iid) {
                         e.id = Some(id);
                         e.parent = Some(parent);
                         e.props = rt.clone();
                         e.nodes = nodes.clone();
+                        e.owner = owner;
+                        e.notified_owner = owner;
+                        e.client_owned = client_owned;
+                        e.transfer = transfer;
                     }
                     self.by_id.insert(id, iid);
                     set_net_entity(&node, Some(owner), Some(id));
+                    set_net_entity_authority(&node, transfer, client_owned);
                     let info = self.info(id, owner);
                     self.spawned_callbacks(&node, &scene, info, session);
                 }
@@ -1166,6 +1346,10 @@ impl NetManager {
             let (Some(id), Some(rt)) = (e.id, e.props.clone()) else {
                 continue;
             };
+            // WP7: a `client_owned` entity a client owns is recorded from its owner's state.
+            if e.client_owned && e.owner != netcore::SERVER {
+                continue;
+            }
             let due = e.cold_force || (tick + u64::from(id)).is_multiple_of(cold);
             e.cold_force = false;
             work.push((id, rt, e.nodes.clone(), due));
@@ -1194,14 +1378,15 @@ impl NetManager {
     }
 
     /// Applies snapshot values to replicas, snapping (WP5: netcore keeps a replica's `interpolate`
-    /// fields for `apply_interp` instead). Entities this peer spawned itself keep their own state.
+    /// fields for `apply_interp` instead). WP7: entities whose state this peer is the source of keep
+    /// their own; on the server these are the owners' states of `client_owned` entities.
     pub fn apply_states(&mut self, updates: Vec<StateUpdate>) {
         let mut writes = Vec::new();
         for u in updates {
             let Some(e) = self.by_id.get(&u.id).and_then(|i| self.entries.get(i)) else {
                 continue;
             };
-            if e.origin == Origin::Local {
+            if self.state_is_local(e) {
                 continue;
             }
             let Some(rt) = e.props.as_ref() else {
@@ -1307,16 +1492,21 @@ impl NetManager {
                 e.gate = Some(Gate::new(&nodes));
             }
             let owned = e.owner == local;
-            let simulate = if is_server || e.origin == Origin::Local {
+            // WP7: a `client_owned` entity is simulated by its owner only (the server applies and
+            // relays the owner's state); it is never predicted.
+            let simulate = if e.everywhere {
+                true
+            } else if e.client_owned {
+                owned
+            } else if is_server {
                 true
             } else if owned {
                 e.policy != Policy::Disabled
             } else {
-                e.everywhere
+                false
             };
-            let want =
-                (!is_server && owned && e.origin != Origin::Local && e.policy != Policy::Disabled)
-                    .then_some(e.policy);
+            let want = (!is_server && owned && !e.client_owned && e.policy != Policy::Disabled)
+                .then_some(e.policy);
             let track = (want != e.predicted).then_some(want);
             e.predicted = want;
             let check = !e.input_checked && e.owner != netcore::SERVER && (is_server || owned);
@@ -1386,7 +1576,7 @@ impl NetManager {
             let tick = ctx.tick as i64;
             let nodes = e.nodes.clone();
             let props = e.input_props.clone();
-            if e.owner == netcore::SERVER || (owned && e.origin == Origin::Local) {
+            if e.owner == netcore::SERVER || (owned && e.client_owned) {
                 inp.bind_mut().set_live(tick);
                 if owned {
                     self.call_net_input(&nodes);
@@ -1648,7 +1838,7 @@ impl NetManager {
                 continue;
             };
             let Some(id) = e.id else { continue };
-            if e.owner != self.local_id || e.origin == Origin::Local {
+            if e.owner != self.local_id || e.client_owned {
                 continue;
             }
             work.push((
@@ -1669,6 +1859,93 @@ impl NetManager {
             if let Some(mut inp) = inp {
                 if let Some(f) = inp.bind_mut().take_sample() {
                     frames.push((id, f.canonical()));
+                }
+            }
+        }
+    }
+
+    /// WP7, 2.2 step 5 on a client: the state of every `client_owned` entity it owns (hot fields every
+    /// tick, cold ones when due), for netcore to send to the server.
+    pub fn record_client_owned(&mut self, tick: u64, cold: u32, out: &mut Vec<Recorded>) {
+        if !self.online || self.is_server {
+            return;
+        }
+        let cold = u64::from(cold.max(1));
+        let mut work = Vec::new();
+        for iid in &self.order {
+            let Some(e) = self.entries.get_mut(iid) else {
+                continue;
+            };
+            let (Some(id), Some(rt)) = (e.id, e.props.clone()) else {
+                continue;
+            };
+            if !(e.client_owned && e.owner == self.local_id) {
+                continue;
+            }
+            let due = e.cold_force || (tick + u64::from(id)).is_multiple_of(cold);
+            e.cold_force = false;
+            work.push((id, rt, e.nodes.clone(), due));
+        }
+        let _guard = self.base_mut();
+        for (id, rt, nodes, cold_due) in work {
+            for (p, node) in nodes.iter().enumerate() {
+                let Some(node) = node else { continue };
+                if !node.is_instance_valid() {
+                    continue;
+                }
+                let colds = if cold_due { rt.cold[p].as_slice() } else { &[] };
+                let vals: Vec<(u16, Value)> = rt.hot[p]
+                    .iter()
+                    .chain(colds)
+                    .map(|&f| (f, apply::read(node, &rt.fields[p][usize::from(f)])))
+                    .collect();
+                if !vals.is_empty() {
+                    out.push((id, p as u16, vals));
+                }
+            }
+        }
+    }
+
+    /// WP7: on a client, the polled values of the replicas it does not own and does not simulate
+    /// (every `cold` ticks, staggered by id; non-interpolated fields only), for netcore to compare
+    /// with the server's values: a difference is a write, which the server rejects.
+    pub fn poll_writes(&mut self, tick: u64, cold: u32, out: &mut Vec<Recorded>) {
+        if !self.online || self.is_server {
+            return;
+        }
+        let cold = u64::from(cold.max(1));
+        let mut work = Vec::new();
+        for iid in &self.order {
+            let Some(e) = self.entries.get(iid) else {
+                continue;
+            };
+            let (Some(id), Some(rt)) = (e.id, e.props.clone()) else {
+                continue;
+            };
+            let simulating = e.gate.as_ref().is_some_and(|g| g.simulating == Some(true));
+            if e.owner == self.local_id || simulating || e.everywhere {
+                continue;
+            }
+            if !(tick + u64::from(id)).is_multiple_of(cold) {
+                continue;
+            }
+            work.push((id, rt, e.nodes.clone()));
+        }
+        let _guard = self.base_mut();
+        for (id, rt, nodes) in work {
+            for (p, node) in nodes.iter().enumerate() {
+                let Some(node) = node else { continue };
+                if !node.is_instance_valid() {
+                    continue;
+                }
+                let vals: Vec<(u16, Value)> = rt.fields[p]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| !f.interp)
+                    .map(|(i, f)| (i as u16, apply::read(node, f)))
+                    .collect();
+                if !vals.is_empty() {
+                    out.push((id, p as u16, vals));
                 }
             }
         }
@@ -1702,7 +1979,7 @@ impl NetManager {
         field: u16,
     ) -> Option<(Gd<Node>, crate::infer::RtField)> {
         let e = self.by_id.get(&id).and_then(|i| self.entries.get(i))?;
-        if e.origin == Origin::Local {
+        if e.origin == Origin::Local || (!self.is_server && self.state_is_local(e)) {
             return None;
         }
         let rt = e.props.as_ref()?;
@@ -1950,6 +2227,32 @@ fn set_net_entity(node: &Gd<Node>, owner: Option<u32>, id: Option<NetId>) {
         if let Some(i) = id {
             b.set_net_id(i64::from(i));
         }
+    }
+}
+
+/// WP7: mirrors the entity's transfer rule and `client_owned` flag on its `NetEntity` (a replica's
+/// copy shows what the server decided).
+fn set_net_entity_authority(node: &Gd<Node>, transfer: netcore::Transfer, client_owned: bool) {
+    if let Some(mut ne) = net_entity_of(node) {
+        let mut b = ne.bind_mut();
+        b.set_transfer(Transfer::from_rule(transfer));
+        b.set_client_owned(client_owned);
+    }
+}
+
+/// WP7: (transfer rule, `client_owned`, inherit the enclosing entity's owner) of an entity about to be
+/// spawned: from its `NetEntity`; without one: fixed, not client_owned, inherited. An owner set with
+/// `Net.set_owner` / `spawn_for` (the `_net_owner` meta) or a `NetEntity.owner_peer` other than 1 is
+/// the entity's own.
+fn authority_of(node: &Gd<Node>) -> (netcore::Transfer, bool, bool) {
+    let explicit_meta = node.has_meta(META_OWNER);
+    match net_entity_of(node) {
+        Some(ne) => {
+            let b = ne.bind();
+            let inherit = b.get_inherit_owner() && b.get_owner_peer() == 1 && !explicit_meta;
+            (b.get_transfer().rule(), b.get_client_owned(), inherit)
+        }
+        None => (netcore::Transfer::Fixed, false, !explicit_meta),
     }
 }
 

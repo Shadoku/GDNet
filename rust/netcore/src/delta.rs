@@ -352,6 +352,47 @@ impl Replication {
         w.into_bytes()
     }
 
+    /// WP7: `values` (`(part, field, value)`) of entity `id` encoded with `scene`'s table as a
+    /// header-less entry, like [`Replication::encode_full`] but for the given fields only (a client's
+    /// write). Empty when the table is unknown.
+    pub fn encode_values(&self, id: NetId, scene: u64, values: &[(u16, u16, Value)]) -> Vec<u8> {
+        let Some(table) = self.tables.get(&scene) else {
+            return Vec::new();
+        };
+        let mut sorted: Vec<&(u16, u16, Value)> = values
+            .iter()
+            .filter(|(p, f, _)| table.get(*p, *f).is_some())
+            .collect();
+        sorted.sort_by_key(|(p, f, _)| (*p, *f));
+        sorted.dedup_by_key(|(p, f, _)| (*p, *f));
+        let encs: Vec<(u16, u16, Encoded)> = sorted
+            .iter()
+            .filter_map(|(p, f, v)| {
+                let d = table.get(*p, *f)?;
+                let mut w = BitWriter::new();
+                encode(&mut w, d.ty, d.quant, v);
+                Some((*p, *f, Encoded::of(&w)))
+            })
+            .collect();
+        let fields: Vec<(u16, u16, &Encoded)> = encs.iter().map(|(p, f, e)| (*p, *f, e)).collect();
+        let mut w = BitWriter::new();
+        snapshot::write_entity(&mut w, id, table, &fields);
+        snapshot::write_end(&mut w);
+        w.into_bytes()
+    }
+
+    /// WP7: the tick the entity's newest recorded change happened at (None when untracked or never
+    /// recorded).
+    pub fn last_change(&self, id: NetId) -> Option<u64> {
+        self.entities
+            .get(&id)?
+            .fields
+            .iter()
+            .filter(|f| f.version != 0)
+            .map(|f| f.last_change)
+            .max()
+    }
+
     /// Decodes a full state ([`Replication::encode_full`]) with this side's table of `scene`.
     pub fn decode_state(&self, scene: u64, bytes: &[u8]) -> Option<Vec<(u16, u16, Value)>> {
         if bytes.is_empty() {

@@ -71,6 +71,15 @@ impl NetArg {
         NetArg(Rid::new(NO_ARG).to_variant())
     }
 
+    /// The value given, or nil for a left-out slot.
+    pub fn or_nil(self) -> Variant {
+        if self.is_absent() {
+            Variant::nil()
+        } else {
+            self.0
+        }
+    }
+
     fn is_absent(&self) -> bool {
         self.0.try_to::<Rid>().is_ok_and(|r| r == Rid::new(NO_ARG))
     }

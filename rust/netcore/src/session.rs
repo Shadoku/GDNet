@@ -18,6 +18,7 @@
 //!
 //! `now` is microseconds since any epoch, supplied by the caller.
 
+use crate::authority::{self, AuthorityStats, Decision, StateMsg, Transfer, WriteReject};
 use crate::call::{
     CallIn, CallMsg, CallPlan, CallResult, CallReturn, CallStats, OutCall, Verb,
     DEFAULT_CALL_TIMEOUT_US,
@@ -30,6 +31,7 @@ use crate::entity::{
 };
 use crate::input::{self, AdaptiveDelay, InputBuffer, InputFrame, OwnerInputs, TakenFrame};
 use crate::interp::Interp;
+use crate::keyed::{KeyEvent, KeyMsg, KeyedState, Who};
 use crate::peers::{PeerId, PeerTable, Stage, SERVER};
 use crate::predict::{self, Policy, PredictStats, Prediction, Rollback};
 use crate::props::{PropDesc, ScenePropsTable, Value};
@@ -79,7 +81,7 @@ pub enum Event {
 }
 
 /// What remote entity actions did to this peer's table, in order, for gdnet to apply to nodes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EntityEvent {
     /// Instantiate `scene_path` under `create.parent`. On the server, `proposal` marks a client's create
     /// (spawn policy `owner_allowed`) that gdnet must accept (`accept_create`) or refuse
@@ -106,6 +108,43 @@ pub enum EntityEvent {
     },
     /// WP6: a call to run (or, on the server, to check and route), in order with the entity events.
     Call(CallIn),
+    /// WP7: this peer owns (or, on the server, holds for the server) a `request` entity that
+    /// `requester` asks for; gdnet answers with [`Session::answer_owner_query`].
+    OwnerQuery {
+        id: NetId,
+        manager: u64,
+        requester: PeerId,
+    },
+    /// WP7: the outcome of this peer's ownership request.
+    OwnerReply {
+        id: NetId,
+        manager: u64,
+        granted: bool,
+    },
+    /// WP7: a rejected write. On the server: `peer` wrote fields it may not write. On the writer
+    /// (`peer` = itself): restore `restore` (the server's last values).
+    WriteRejected {
+        id: NetId,
+        manager: u64,
+        peer: PeerId,
+        restore: Vec<(u16, u16, Value)>,
+    },
+}
+
+impl EntityEvent {
+    /// The manager key the event belongs to.
+    pub fn manager(&self) -> u64 {
+        match self {
+            EntityEvent::Create { create, .. } => create.parent.manager,
+            EntityEvent::Destroy { record, .. } => record.parent.manager,
+            EntityEvent::Reparent { from_manager, .. } => *from_manager,
+            EntityEvent::SetOwner { manager, .. }
+            | EntityEvent::OwnerQuery { manager, .. }
+            | EntityEvent::OwnerReply { manager, .. }
+            | EntityEvent::WriteRejected { manager, .. } => *manager,
+            EntityEvent::Call(c) => c.manager,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -211,7 +250,42 @@ pub struct Session {
     interp: Interp,
     /// WP6: requests, inbound calls awaiting gdnet's verdict, method tables, counters.
     calls: CallState,
+    /// WP7: ownership requests, owner state, rejected writes.
+    auth: AuthState,
+    /// WP7: the keyed state map.
+    keyed: KeyedState,
 }
+
+/// WP7: the session's authority state (authority.rs).
+#[derive(Default)]
+struct AuthState {
+    stats: AuthorityStats,
+    /// Server: ownership queries waiting for an answer, (entity, requester) -> the tick asked.
+    queries: BTreeMap<(NetId, PeerId), u64>,
+    /// Server: the newest owner-state tick applied per `client_owned` entity.
+    owner_tick: BTreeMap<NetId, u64>,
+    /// Server: the tick of the last reject of an owner state, per (peer, entity).
+    reject_tick: BTreeMap<(PeerId, NetId), u64>,
+    /// Client: the last value the server sent for each field (what a rejected write restores).
+    received: BTreeMap<(NetId, u16, u16), Value>,
+    /// Client: fields written and sent, waiting for the reject (or a newer value from the server).
+    pending_writes: BTreeSet<(NetId, u16, u16)>,
+    /// Client: write entries to send at the next post-tick.
+    write_queue: Vec<(NetId, Vec<u8>)>,
+    /// Client: rejects in a row per field without a new value from the server; at
+    /// [`MAX_REJECTS_IN_A_ROW`] the field is no longer checked (the restore does not stick: code keeps
+    /// writing it, or its value does not survive a write and read back).
+    rejects: BTreeMap<(NetId, u16, u16), u32>,
+    /// Client: the tick each owned entity's state was last sent.
+    last_sent: BTreeMap<NetId, u64>,
+}
+
+/// An ownership query waiting this long (seconds) is refused.
+pub const OWNER_QUERY_TIMEOUT_S: u64 = 5;
+
+/// A field rejected this many times in a row is no longer checked for writes (until the server sends a
+/// new value for it).
+pub const MAX_REJECTS_IN_A_ROW: u32 = 3;
 
 /// WP6: the session's call state.
 #[derive(Default)]
@@ -320,6 +394,8 @@ impl Session {
                 timeout_us: DEFAULT_CALL_TIMEOUT_US,
                 ..CallState::default()
             },
+            auth: AuthState::default(),
+            keyed: KeyedState::default(),
         }
     }
 
@@ -476,7 +552,33 @@ impl Session {
     }
 
     /// The transport lost `peer`.
-    pub fn peer_disconnected(&mut self, peer: PeerId, _now_us: u64) {
+    pub fn peer_disconnected(&mut self, peer: PeerId, now_us: u64) {
+        if self.role == Role::Server && self.peers.is_joined(peer) {
+            // WP7: a departed client's entities stay, owned by the server again.
+            let owned: Vec<NetId> = self
+                .entities
+                .iter()
+                .filter(|r| r.owner == peer)
+                .map(|r| r.id)
+                .collect();
+            for id in owned {
+                self.set_owner(id, SERVER, now_us);
+            }
+            let stale: Vec<(NetId, PeerId)> = self
+                .auth
+                .queries
+                .keys()
+                .filter(|(id, r)| {
+                    *r == peer || self.entities.get(*id).is_some_and(|e| e.owner == peer)
+                })
+                .copied()
+                .collect();
+            for (id, r) in stale {
+                self.finish_query(id, r, false, now_us);
+            }
+            self.keyed.forget_peer(peer);
+            self.auth.reject_tick.retain(|(p, _), _| *p != peer);
+        }
         self.scenes_sent.remove(&peer);
         self.repl.remove_peer(peer);
         self.remote_props.retain(|(p, _), _| *p != peer);
@@ -575,6 +677,20 @@ impl Session {
                 self.repl.on_ack(peer, a, tick);
             }
             Message::Call(c) => self.on_call(peer, c, now_us),
+            Message::OwnerState(m) if self.role == Role::Server && self.peers.is_joined(peer) => {
+                self.on_state(peer, m, false, now_us);
+            }
+            Message::Write(m) if self.role == Role::Server && self.peers.is_joined(peer) => {
+                self.on_state(peer, m, true, now_us);
+            }
+            Message::WriteReject(r) if self.role == Role::Client && peer == SERVER => {
+                self.on_write_reject(r);
+            }
+            Message::Keyed(m) => {
+                self.keyed.stats.messages_received += 1;
+                self.keyed.stats.bytes_received += bytes.len() as u64;
+                self.on_keyed(peer, m, now_us);
+            }
             Message::CallReturn(r) if self.role == Role::Client && peer == SERVER => {
                 self.on_call_return(r);
             }
@@ -643,6 +759,12 @@ impl Session {
             self.send_entity(peer, EntityAction::Create(c), now_us);
             self.repl.mark_synced(peer, id);
         }
+        // WP7: the keyed state it can see (viewed paths follow once gdnet decides) and the rules.
+        let full = KeyMsg::Full {
+            entries: self.keyed.entries_for(peer),
+            rules: self.keyed.rules().to_vec(),
+        };
+        self.send_keyed(peer, full, now_us);
         self.events.push_back(Event::PeerJoined(peer));
     }
 
@@ -734,6 +856,7 @@ impl Session {
             });
         }
         self.input_tick(tick);
+        self.expire_queries(tick, now_us);
         self.expire_calls(now_us);
         self.flush_emulated(now_us);
     }
@@ -769,6 +892,12 @@ pub struct Spawn {
     /// WP3: every part's property values (in table order). When given and the scene has a property
     /// table, netcore records them and encodes `initial_state` itself.
     pub values: Option<Vec<Vec<Value>>>,
+    /// WP7: the transfer rule and whether the owner's state is accepted (a client's own spawn is
+    /// always `client_owned`).
+    pub transfer: Transfer,
+    pub client_owned: bool,
+    /// WP7: take the parent entity's owner instead of `owner` (nested entities, 2.6).
+    pub inherit_owner: bool,
 }
 
 impl Spawn {
@@ -786,7 +915,23 @@ impl Spawn {
             parts,
             initial_state,
             values: None,
+            transfer: Transfer::Fixed,
+            client_owned: false,
+            inherit_owner: false,
         }
+    }
+
+    /// WP7: the entity's transfer rule and `client_owned` flag.
+    pub fn with_authority(mut self, transfer: Transfer, client_owned: bool) -> Self {
+        self.transfer = transfer;
+        self.client_owned = client_owned;
+        self
+    }
+
+    /// WP7: the entity takes its parent entity's owner (when it has a parent entity).
+    pub fn inheriting_owner(mut self) -> Self {
+        self.inherit_owner = true;
+        self
     }
 
     /// WP3: the entity's property values per part (they become the `Create`'s initial state).
@@ -817,6 +962,13 @@ fn held_description(a: &EntityAction, paths: &BTreeMap<u64, String>) -> String {
             std::format!("the reparent of entity {id} under entity {}", parent.entity)
         }
         EntityAction::SetOwner { id, .. } => std::format!("the owner change of entity {id}"),
+        EntityAction::RequestOwner { id } => std::format!("an ownership request for entity {id}"),
+        EntityAction::ReleaseOwner { id } => std::format!("the release of entity {id}"),
+        EntityAction::OwnerQuery { id, .. }
+        | EntityAction::OwnerAnswer { id, .. }
+        | EntityAction::OwnerReply { id, .. } => {
+            std::format!("an ownership decision on entity {id}")
+        }
         EntityAction::Scene { path, .. } => std::format!("the scene {path}"),
         EntityAction::Call(c) => std::format!("a call on entity {}", c.entity),
     }
@@ -950,11 +1102,21 @@ impl Session {
         let Spawn {
             parent,
             name,
-            owner,
+            mut owner,
             parts,
             mut initial_state,
             values,
+            transfer,
+            mut client_owned,
+            inherit_owner,
         } = spec;
+        if self.role == Role::Client {
+            client_owned = true;
+        } else if inherit_owner {
+            if let Some(p) = self.entities.get(parent.entity) {
+                owner = p.owner;
+            }
+        }
         if !self.is_connected() {
             return Err(String::from("the session is not connected"));
         }
@@ -985,6 +1147,8 @@ impl Session {
             owner,
             parts,
             initial_state,
+            transfer,
+            client_owned,
         };
         self.entities.insert(&create);
         self.share(EntityAction::Create(create), None, now_us);
@@ -1025,12 +1189,38 @@ impl Session {
 
     /// Server only: changes an entity's owner and announces it.
     pub fn set_owner(&mut self, id: NetId, owner: PeerId, now_us: u64) -> bool {
-        if self.role != Role::Server || !self.entities.set_owner(id, owner) {
+        if self.role != Role::Server {
             return false;
         }
-        // A new owner starts a new input stream.
+        let Some((old, manager)) = self.entities.get(id).map(|r| (r.owner, r.parent.manager))
+        else {
+            return false;
+        };
+        if old == owner {
+            return true;
+        }
+        self.entities.set_owner(id, owner);
+        // A new owner starts a new input stream and a new owner-state stream.
         self.input_buffers.remove(&id);
         self.server_inputs.remove(&id);
+        self.auth.owner_tick.remove(&id);
+        self.auth.stats.owner_changes += 1;
+        let stale: Vec<(NetId, PeerId)> = self
+            .auth
+            .queries
+            .keys()
+            .filter(|(q, _)| *q == id)
+            .copied()
+            .collect();
+        for (q, r) in stale {
+            self.auth.queries.remove(&(q, r));
+            if r != owner {
+                self.reply_owner(q, r, false, now_us);
+            }
+        }
+        // WP7: the server's gdnet hears of every change too (owner_changed fires on every peer).
+        self.entity_events
+            .push_back(EntityEvent::SetOwner { id, manager, owner });
         self.share(EntityAction::SetOwner { id, owner }, None, now_us);
         true
     }
@@ -1060,7 +1250,14 @@ impl Session {
             self.drain_held(now_us);
             return false;
         }
+        // WP7: the creator's initial state is the server's record of it (relayed, and in bursts).
+        self.record_encoded(id, create.scene_hash, &create.initial_state);
         self.share(EntityAction::Create(create), Some(from), now_us);
+        if self.repl.entity(id).is_some() {
+            for peer in self.peers.joined() {
+                self.repl.mark_synced(peer, id);
+            }
+        }
         self.drain_held(now_us);
         true
     }
@@ -1162,7 +1359,14 @@ impl Session {
                         IdAllocator::in_range(range, *id)
                             && self.entities.get(*id).is_none_or(|r| r.owner == peer)
                     }
-                    EntityAction::SetOwner { .. } | EntityAction::Scene { .. } => false,
+                    EntityAction::SetOwner { .. }
+                    | EntityAction::Scene { .. }
+                    | EntityAction::OwnerQuery { .. }
+                    | EntityAction::OwnerReply { .. } => false,
+                    // WP7: checked when applied (the entity and its owner may change meanwhile).
+                    EntityAction::RequestOwner { .. }
+                    | EntityAction::ReleaseOwner { .. }
+                    | EntityAction::OwnerAnswer { .. } => true,
                     // WP6: admitted by `on_call` (sender set from the transport).
                     EntityAction::Call(_) => true,
                 }
@@ -1253,9 +1457,58 @@ impl Session {
                 let manager = self.entities.get(id).map(|r| r.parent.manager);
                 if let Some(manager) = manager {
                     if self.entities.set_owner(id, owner) {
+                        self.auth.stats.owner_changes += 1;
+                        self.auth.last_sent.remove(&id);
+                        self.auth.pending_writes.retain(|k| k.0 != id);
                         self.entity_events
                             .push_back(EntityEvent::SetOwner { id, manager, owner });
                     }
+                }
+            }
+            EntityAction::RequestOwner { id } => {
+                if self.role == Role::Server {
+                    self.handle_request(id, from, now_us);
+                }
+            }
+            EntityAction::ReleaseOwner { id } => {
+                if self.role == Role::Server
+                    && self.entities.get(id).is_some_and(|r| r.owner == from)
+                {
+                    self.set_owner(id, SERVER, now_us);
+                }
+            }
+            EntityAction::OwnerAnswer {
+                id,
+                requester,
+                grant,
+            } => {
+                let asked = self.auth.queries.contains_key(&(id, requester))
+                    && self.entities.get(id).is_some_and(|r| r.owner == from);
+                if self.role == Role::Server && asked {
+                    self.finish_query(id, requester, grant, now_us);
+                }
+            }
+            EntityAction::OwnerQuery { id, requester } => {
+                if let Some(manager) = self.entities.get(id).map(|r| r.parent.manager) {
+                    self.entity_events.push_back(EntityEvent::OwnerQuery {
+                        id,
+                        manager,
+                        requester,
+                    });
+                }
+            }
+            EntityAction::OwnerReply { id, granted } => {
+                if granted {
+                    self.auth.stats.requests_granted += 1;
+                } else {
+                    self.auth.stats.requests_refused += 1;
+                }
+                if let Some(manager) = self.entities.get(id).map(|r| r.parent.manager) {
+                    self.entity_events.push_back(EntityEvent::OwnerReply {
+                        id,
+                        manager,
+                        granted,
+                    });
                 }
             }
         }
@@ -1741,21 +1994,21 @@ impl Session {
                     self.input_stats.messages_sent += 1;
                     self.send(SERVER, &Message::Input(input::encode_msg(&msg)), now_us);
                 }
+                self.send_owner_states(now_us);
             }
             Role::Server => {
                 let tick = self.clock.tick();
                 let rate = self.tick_rate();
                 let budget = self.budget_bytes_per_s;
                 for peer in self.peers.joined() {
-                    let range = self.peers.get(peer).map(|p| p.id_range).unwrap_or_default();
                     let entities = &self.entities;
                     let owner_of = |id: NetId| entities.get(id).map(|r| r.owner);
-                    // An entity the peer created itself (spawn policy owner_allowed) is its own; WP7
-                    // decides who is authoritative for it.
+                    // WP7: a `client_owned` entity's state comes from its owner, who never gets it
+                    // back (a client's own spawn is one).
                     let skip = |id: NetId| {
                         entities
                             .get(id)
-                            .is_none_or(|r| r.owner == peer && IdAllocator::in_range(range, id))
+                            .is_none_or(|r| r.client_owned && r.owner == peer)
                     };
                     let out = self
                         .repl
@@ -1784,6 +2037,16 @@ impl Session {
 impl Session {
     fn route_updates(&mut self) {
         while let Some(u) = self.repl.poll_update() {
+            if self.role == Role::Client {
+                // WP7: the owner's own state never comes back (a late snapshot after a transfer).
+                if self.owns_state(u.id) {
+                    continue;
+                }
+                let key = (u.id, u.part, u.field);
+                self.auth.pending_writes.remove(&key);
+                self.auth.rejects.remove(&key);
+                self.auth.received.insert(key, u.value.clone());
+            }
             if self.prediction.diverts(u.id, u.part, u.field) {
                 self.prediction
                     .confirm(u.id, u.part, u.field, u.value, u.tick);
@@ -1801,7 +2064,7 @@ impl Session {
     /// WP5: the descriptor of a field this client interpolates: an `interpolate` field of an entity it
     /// does not predict.
     fn interpolated_desc(&self, id: NetId, part: u16, field: u16) -> Option<PropDesc> {
-        if self.role != Role::Client || self.prediction.is_tracked(id) {
+        if self.role != Role::Client || self.prediction.is_tracked(id) || self.owns_state(id) {
             return None;
         }
         let scene = self.entities.get(id)?.scene;
@@ -1810,6 +2073,11 @@ impl Session {
     }
 
     fn forget_input(&mut self, id: NetId) {
+        self.auth.received.retain(|k, _| k.0 != id);
+        self.auth.pending_writes.retain(|k| k.0 != id);
+        self.auth.rejects.retain(|k, _| k.0 != id);
+        self.auth.owner_tick.remove(&id);
+        self.auth.last_sent.remove(&id);
         self.interp.reset(id);
         self.prediction.untrack(id);
         self.owner_inputs.forget(id);
@@ -2008,6 +2276,670 @@ impl Session {
 
     pub fn input_stats(&self) -> InputStats {
         self.input_stats
+    }
+}
+
+/// Authority (WP7, docs/PLAN_NETCODE.md 2.6; see [`crate::authority`]): ownership requests and
+/// releases, `client_owned` state from owners, rejected writes.
+impl Session {
+    pub fn authority_stats(&self) -> AuthorityStats {
+        self.auth.stats
+    }
+
+    /// True when this side owns `id` and its state is this side's to send (a `client_owned` entity it
+    /// owns, on a client).
+    pub fn owns_state(&self, id: NetId) -> bool {
+        self.role == Role::Client
+            && self
+                .entities
+                .get(id)
+                .is_some_and(|r| r.client_owned && r.owner == self.local_id)
+    }
+
+    /// Asks for ownership of `id`. A client sends `RequestOwner` (the outcome arrives as
+    /// `EntityEvent::OwnerReply`); on the server the request is decided at once for the server itself
+    /// (a `request` entity owned by a client asks that client first).
+    pub fn request_owner(&mut self, id: NetId, now_us: u64) -> Result<(), String> {
+        if !self.is_connected() {
+            return Err(String::from("the session is not connected"));
+        }
+        if !self.entities.contains(id) {
+            return Err(std::format!("entity {id} is not spawned on this peer"));
+        }
+        match self.role {
+            Role::Server => self.handle_request(id, SERVER, now_us),
+            Role::Client => self.send(
+                SERVER,
+                &Message::Entity(EntityAction::RequestOwner { id }),
+                now_us,
+            ),
+        }
+        Ok(())
+    }
+
+    /// Gives `id` back to the server. A client must own it; on the server it is `set_owner(id, 1)`.
+    pub fn release_owner(&mut self, id: NetId, now_us: u64) -> bool {
+        match self.role {
+            Role::Server => self.set_owner(id, SERVER, now_us),
+            Role::Client => {
+                if !self.is_connected()
+                    || self
+                        .entities
+                        .get(id)
+                        .is_none_or(|r| r.owner != self.local_id)
+                {
+                    return false;
+                }
+                self.send(
+                    SERVER,
+                    &Message::Entity(EntityAction::ReleaseOwner { id }),
+                    now_us,
+                );
+                true
+            }
+        }
+    }
+
+    /// gdnet's answer to an `EntityEvent::OwnerQuery` (may `requester` have `id`?).
+    pub fn answer_owner_query(&mut self, id: NetId, requester: PeerId, grant: bool, now_us: u64) {
+        match self.role {
+            Role::Server => {
+                let asked = self.auth.queries.contains_key(&(id, requester))
+                    && self.entities.get(id).is_some_and(|r| r.owner == SERVER);
+                if asked {
+                    self.finish_query(id, requester, grant, now_us);
+                }
+            }
+            Role::Client => self.send(
+                SERVER,
+                &Message::Entity(EntityAction::OwnerAnswer {
+                    id,
+                    requester,
+                    grant,
+                }),
+                now_us,
+            ),
+        }
+    }
+
+    /// Server: a request by `requester` (a client, or the server itself) for `id`.
+    fn handle_request(&mut self, id: NetId, requester: PeerId, now_us: u64) {
+        let Some((owner, transfer, manager)) = self
+            .entities
+            .get(id)
+            .map(|r| (r.owner, r.transfer, r.parent.manager))
+        else {
+            self.reply_owner(id, requester, false, now_us);
+            return;
+        };
+        match authority::decide(transfer, owner, requester) {
+            Decision::Grant => {
+                self.set_owner(id, requester, now_us);
+                self.reply_owner(id, requester, true, now_us);
+            }
+            Decision::Refuse => self.reply_owner(id, requester, false, now_us),
+            Decision::Ask(asked) => {
+                if self.auth.queries.contains_key(&(id, requester)) {
+                    return;
+                }
+                let tick = self.clock.tick();
+                if asked == SERVER {
+                    self.auth.queries.insert((id, requester), tick);
+                    self.entity_events.push_back(EntityEvent::OwnerQuery {
+                        id,
+                        manager,
+                        requester,
+                    });
+                } else if self.peers.is_joined(asked) {
+                    self.auth.queries.insert((id, requester), tick);
+                    self.send(
+                        asked,
+                        &Message::Entity(EntityAction::OwnerQuery { id, requester }),
+                        now_us,
+                    );
+                } else {
+                    self.reply_owner(id, requester, false, now_us);
+                }
+            }
+        }
+    }
+
+    /// Server: the owner decided a query.
+    fn finish_query(&mut self, id: NetId, requester: PeerId, grant: bool, now_us: u64) {
+        if self.auth.queries.remove(&(id, requester)).is_none() {
+            return;
+        }
+        let ok = grant && self.entities.contains(id);
+        if ok {
+            self.set_owner(id, requester, now_us);
+        }
+        self.reply_owner(id, requester, ok, now_us);
+    }
+
+    /// Server: tells `requester` the outcome (the server's own request: a local event).
+    fn reply_owner(&mut self, id: NetId, requester: PeerId, granted: bool, now_us: u64) {
+        if granted {
+            self.auth.stats.requests_granted += 1;
+        } else {
+            self.auth.stats.requests_refused += 1;
+        }
+        if requester == SERVER {
+            if let Some(manager) = self.entities.get(id).map(|r| r.parent.manager) {
+                self.entity_events.push_back(EntityEvent::OwnerReply {
+                    id,
+                    manager,
+                    granted,
+                });
+            }
+        } else if self.peers.is_joined(requester) {
+            self.send(
+                requester,
+                &Message::Entity(EntityAction::OwnerReply { id, granted }),
+                now_us,
+            );
+        }
+    }
+
+    fn expire_queries(&mut self, tick: u64, now_us: u64) {
+        if self.auth.queries.is_empty() {
+            return;
+        }
+        let limit = OWNER_QUERY_TIMEOUT_S * u64::from(self.tick_rate());
+        let expired: Vec<(NetId, PeerId)> = self
+            .auth
+            .queries
+            .iter()
+            .filter(|(_, asked)| tick.saturating_sub(**asked) >= limit)
+            .map(|(k, _)| *k)
+            .collect();
+        for (id, r) in expired {
+            self.finish_query(id, r, false, now_us);
+        }
+    }
+
+    /// Records an encoded full state (a `Create`'s) as this side's values of `id`.
+    fn record_encoded(&mut self, id: NetId, scene: u64, bytes: &[u8]) -> Vec<(u16, u16, Value)> {
+        let Some(values) = self.repl.decode_state(scene, bytes) else {
+            return Vec::new();
+        };
+        let tick = self.clock.tick();
+        let mut by_part: BTreeMap<u16, Vec<(u16, Value)>> = BTreeMap::new();
+        for (p, f, v) in &values {
+            by_part.entry(*p).or_default().push((*f, v.clone()));
+        }
+        for (p, vals) in by_part {
+            self.repl.record_part(id, scene, p, &vals, tick);
+        }
+        values
+    }
+
+    /// Server: an owner state (unreliable) or a write (reliable) from `peer`.
+    fn on_state(&mut self, peer: PeerId, m: StateMsg, reliable: bool, now_us: u64) {
+        let tick = self.clock.tick();
+        for (id, bytes) in m.entities {
+            let Some((owner, client_owned, scene, manager)) = self
+                .entities
+                .get(id)
+                .map(|r| (r.owner, r.client_owned, r.scene, r.parent.manager))
+            else {
+                continue;
+            };
+            if client_owned && owner == peer {
+                if !reliable && self.auth.owner_tick.get(&id).is_some_and(|t| *t >= m.tick) {
+                    continue;
+                }
+                if !reliable {
+                    self.auth.owner_tick.insert(id, m.tick);
+                }
+                self.auth.stats.owner_states_received += 1;
+                for (part, field, value) in self.record_encoded(id, scene, &bytes) {
+                    self.pass_updates.push_back(StateUpdate {
+                        id,
+                        part,
+                        field,
+                        value,
+                        tick,
+                    });
+                }
+                continue;
+            }
+            // A rejected write: the writer restores the server's values.
+            let throttled = !reliable
+                && self
+                    .auth
+                    .reject_tick
+                    .get(&(peer, id))
+                    .is_some_and(|t| tick.saturating_sub(*t) < u64::from(self.tick_rate() / 2));
+            if throttled {
+                continue;
+            }
+            self.auth.reject_tick.insert((peer, id), tick);
+            let fields: Vec<(u16, u16)> = self
+                .repl
+                .decode_state(scene, &bytes)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(p, f, _)| (p, f))
+                .collect();
+            self.auth.stats.writes_rejected += 1;
+            self.entity_events.push_back(EntityEvent::WriteRejected {
+                id,
+                manager,
+                peer,
+                restore: Vec::new(),
+            });
+            self.send(
+                peer,
+                &Message::WriteReject(WriteReject { id, fields }),
+                now_us,
+            );
+        }
+    }
+
+    /// Client: the server refused this side's write.
+    fn on_write_reject(&mut self, r: WriteReject) {
+        let Some(manager) = self.entities.get(r.id).map(|e| e.parent.manager) else {
+            return;
+        };
+        self.auth.stats.writes_rejected += 1;
+        let mut restore = Vec::new();
+        for (p, f) in r.fields {
+            self.auth.pending_writes.remove(&(r.id, p, f));
+            *self.auth.rejects.entry((r.id, p, f)).or_default() += 1;
+            if let Some(v) = self.auth.received.get(&(r.id, p, f)) {
+                restore.push((p, f, v.clone()));
+            }
+        }
+        self.entity_events.push_back(EntityEvent::WriteRejected {
+            id: r.id,
+            manager,
+            peer: self.local_id,
+            restore,
+        });
+    }
+
+    /// Client: the values the server sent for `id` outside snapshots (a `Create`'s initial state), the
+    /// baseline of write detection.
+    pub fn remember_received(&mut self, id: NetId, values: &[(u16, u16, Value)]) {
+        if self.role != Role::Client {
+            return;
+        }
+        for (p, f, v) in values {
+            self.auth.received.insert((id, *p, *f), v.clone());
+        }
+    }
+
+    /// Client: compares the polled values of one part of `id`, an entity this side does not own, with
+    /// the last values the server sent; each [`authority::write_checked`] field that differs (and is
+    /// not already waiting for its answer) is a write, queued for the server, which rejects it.
+    /// Returns the number of fields written.
+    pub fn check_writes(&mut self, id: NetId, part: u16, values: &[(u16, Value)]) -> usize {
+        if self.role != Role::Client || !self.is_connected() {
+            return 0;
+        }
+        let Some((owner, scene)) = self.entities.get(id).map(|r| (r.owner, r.scene)) else {
+            return 0;
+        };
+        if owner == self.local_id {
+            return 0;
+        }
+        let Some(table) = self.repl.table(scene) else {
+            return 0;
+        };
+        let mut written = Vec::new();
+        for (f, v) in values {
+            let Some(d) = table.get(part, *f) else {
+                continue;
+            };
+            if !authority::write_checked(d) {
+                continue;
+            }
+            let key = (id, part, *f);
+            if self.auth.pending_writes.contains(&key)
+                || self
+                    .auth
+                    .rejects
+                    .get(&key)
+                    .is_some_and(|n| *n >= MAX_REJECTS_IN_A_ROW)
+            {
+                continue;
+            }
+            let Some(had) = self.auth.received.get(&key) else {
+                continue;
+            };
+            if predict::canonical(d.ty, d.quant, had) != predict::canonical(d.ty, d.quant, v) {
+                written.push((part, *f, v.clone()));
+            }
+        }
+        if written.is_empty() {
+            return 0;
+        }
+        for (p, f, _) in &written {
+            self.auth.pending_writes.insert((id, *p, *f));
+        }
+        let bytes = self.repl.encode_values(id, scene, &written);
+        self.auth.write_queue.push((id, bytes));
+        self.auth.stats.writes_sent += written.len() as u64;
+        written.len()
+    }
+
+    /// Client post-tick: the state of every `client_owned` entity this side owns that changed in the
+    /// last few ticks (or is due for its keyframe), packed into unreliable owner-state messages; then
+    /// the queued writes, reliably.
+    fn send_owner_states(&mut self, now_us: u64) {
+        let tick = self.clock.tick();
+        let rate = u64::from(self.tick_rate());
+        let local = self.local_id;
+        let owned: Vec<NetId> = self
+            .entities
+            .iter()
+            .filter(|r| r.client_owned && r.owner == local)
+            .map(|r| r.id)
+            .collect();
+        let mut msg = StateMsg {
+            tick,
+            entities: Vec::new(),
+        };
+        let mut size = 0usize;
+        for id in owned {
+            let Some(changed) = self.repl.last_change(id) else {
+                continue;
+            };
+            let last = self.auth.last_sent.get(&id).copied();
+            let recent = changed + authority::OWNER_STATE_REDUNDANCY >= tick;
+            let keyframe = last.is_none_or(|l| tick.saturating_sub(l) >= rate);
+            if !recent && !keyframe {
+                continue;
+            }
+            let bytes = self.repl.encode_full(id);
+            if bytes.is_empty() {
+                continue;
+            }
+            if size + bytes.len() > authority::OWNER_STATE_MAX_BYTES && !msg.entities.is_empty() {
+                let full = core::mem::replace(
+                    &mut msg,
+                    StateMsg {
+                        tick,
+                        entities: Vec::new(),
+                    },
+                );
+                self.auth.stats.owner_states_sent += 1;
+                self.send(SERVER, &Message::OwnerState(full), now_us);
+                size = 0;
+            }
+            size += bytes.len() + 8;
+            msg.entities.push((id, bytes));
+            self.auth.last_sent.insert(id, tick);
+        }
+        if !msg.entities.is_empty() {
+            self.auth.stats.owner_states_sent += 1;
+            self.send(SERVER, &Message::OwnerState(msg), now_us);
+        }
+        if !self.auth.write_queue.is_empty() {
+            let entities = core::mem::take(&mut self.auth.write_queue);
+            self.send(SERVER, &Message::Write(StateMsg { tick, entities }), now_us);
+        }
+    }
+}
+
+/// Keyed state (WP7, docs/PLAN_NETCODE.md 2.4; see [`crate::keyed`]).
+impl Session {
+    pub fn keyed(&self) -> &KeyedState {
+        &self.keyed
+    }
+
+    /// The next change of the keyed map (remote or local) for gdnet's signals.
+    pub fn poll_key_event(&mut self) -> Option<KeyEvent> {
+        self.keyed.poll_event()
+    }
+
+    fn send_keyed(&mut self, peer: PeerId, msg: KeyMsg, now_us: u64) {
+        let m = Message::Keyed(msg);
+        self.keyed.stats.messages_sent += 1;
+        self.keyed.stats.bytes_sent += wire::encode(&m).len() as u64;
+        self.send(peer, &m, now_us);
+    }
+
+    /// Server: sends a set or erase of `path` to every joined peer that sees it (but `except`).
+    fn share_key(&mut self, path: &str, except: Option<PeerId>, now_us: u64) {
+        let value = self.keyed.get(path).cloned();
+        let peers: Vec<PeerId> = self
+            .peers
+            .joined()
+            .into_iter()
+            .filter(|p| Some(*p) != except && self.keyed.visible(*p, path))
+            .collect();
+        for peer in peers {
+            let msg = match &value {
+                Some(v) => KeyMsg::Set {
+                    path: String::from(path),
+                    value: v.clone(),
+                },
+                None => KeyMsg::Erase {
+                    path: String::from(path),
+                },
+            };
+            self.send_keyed(peer, msg, now_us);
+        }
+    }
+
+    fn refuse_key_locally(&self, path: &str) -> Result<(), String> {
+        if self.role == Role::Client && !self.keyed.may_write(self.local_id, path) {
+            return Err(std::format!(
+                "this peer may not write the keyed state path {path:?}: only the server writes it (the server opens paths with Net.state.allow(prefix, who))"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sets `path` to `value` (encoded bytes). The server applies and shares it; a client allowed to
+    /// write the path applies it at once and sends it to the server (which may still refuse it); a
+    /// client without the permission gets an error and nothing is sent.
+    pub fn keyed_set(&mut self, path: &str, value: Vec<u8>, now_us: u64) -> Result<(), String> {
+        self.refuse_key_locally(path)?;
+        match self.role {
+            Role::Server => {
+                if self.keyed.apply_set(path, value) {
+                    self.share_key(path, None, now_us);
+                }
+            }
+            Role::Client => {
+                if !self.is_connected() {
+                    return Err(String::from("the session is not connected"));
+                }
+                self.keyed.apply_set(path, value.clone());
+                let msg = KeyMsg::Set {
+                    path: String::from(path),
+                    value,
+                };
+                self.send_keyed(SERVER, msg, now_us);
+            }
+        }
+        Ok(())
+    }
+
+    /// Erases `path` (the same rules as [`Session::keyed_set`]).
+    pub fn keyed_erase(&mut self, path: &str, now_us: u64) -> Result<(), String> {
+        self.refuse_key_locally(path)?;
+        match self.role {
+            Role::Server => {
+                if self.keyed.get(path).is_some() {
+                    let visible: Vec<PeerId> = self
+                        .peers
+                        .joined()
+                        .into_iter()
+                        .filter(|p| self.keyed.visible(*p, path))
+                        .collect();
+                    self.keyed.apply_erase(path);
+                    for peer in visible {
+                        let msg = KeyMsg::Erase {
+                            path: String::from(path),
+                        };
+                        self.send_keyed(peer, msg, now_us);
+                    }
+                }
+            }
+            Role::Client => {
+                if !self.is_connected() {
+                    return Err(String::from("the session is not connected"));
+                }
+                self.keyed.apply_erase(path);
+                let msg = KeyMsg::Erase {
+                    path: String::from(path),
+                };
+                self.send_keyed(SERVER, msg, now_us);
+            }
+        }
+        Ok(())
+    }
+
+    /// Server: lets `who` write the paths under `prefix`; the rules go to every client.
+    pub fn keyed_allow(&mut self, prefix: &str, who: Who, now_us: u64) {
+        if self.role != Role::Server {
+            return;
+        }
+        self.keyed.allow(prefix, who);
+        let rules = self.keyed.rules().to_vec();
+        for peer in self.peers.joined() {
+            let msg = KeyMsg::Rules {
+                rules: rules.clone(),
+            };
+            self.send_keyed(peer, msg, now_us);
+        }
+    }
+
+    /// Server: a view over `prefix`, with the decisions gdnet's filter made for the joined peers.
+    /// Peers that saw paths under it and may not any more get erases; peers that may get the paths.
+    pub fn keyed_view(&mut self, prefix: &str, decisions: &[(PeerId, bool)], now_us: u64) {
+        if self.role != Role::Server {
+            return;
+        }
+        let entries = self.keyed.entries_under(prefix);
+        let peers = self.peers.joined();
+        let before: Vec<Vec<bool>> = peers
+            .iter()
+            .map(|p| {
+                entries
+                    .iter()
+                    .map(|(k, _)| self.keyed.visible(*p, k))
+                    .collect()
+            })
+            .collect();
+        self.keyed.add_view(prefix);
+        for (peer, vis) in decisions {
+            self.keyed.set_visible(prefix, *peer, *vis);
+        }
+        for (i, peer) in peers.iter().enumerate() {
+            self.send_visibility_diff(*peer, &entries, &before[i], now_us);
+        }
+    }
+
+    /// Server: `peer`'s decision for the view `prefix` (gdnet re-evaluates the filter every tick).
+    pub fn keyed_set_visible(&mut self, prefix: &str, peer: PeerId, visible: bool, now_us: u64) {
+        if self.role != Role::Server || !self.keyed.has_view(prefix) {
+            return;
+        }
+        let entries = self.keyed.entries_under(prefix);
+        let before: Vec<bool> = entries
+            .iter()
+            .map(|(k, _)| self.keyed.visible(peer, k))
+            .collect();
+        if self.keyed.set_visible(prefix, peer, visible) && self.peers.is_joined(peer) {
+            self.send_visibility_diff(peer, &entries, &before, now_us);
+        }
+    }
+
+    fn send_visibility_diff(
+        &mut self,
+        peer: PeerId,
+        entries: &[(String, Vec<u8>)],
+        before: &[bool],
+        now_us: u64,
+    ) {
+        for ((k, v), was) in entries.iter().zip(before) {
+            let now = self.keyed.visible(peer, k);
+            if now == *was {
+                continue;
+            }
+            let msg = if now {
+                KeyMsg::Set {
+                    path: k.clone(),
+                    value: v.clone(),
+                }
+            } else {
+                KeyMsg::Erase { path: k.clone() }
+            };
+            self.send_keyed(peer, msg, now_us);
+        }
+    }
+
+    fn on_keyed(&mut self, peer: PeerId, m: KeyMsg, now_us: u64) {
+        match self.role {
+            Role::Server => {
+                if !self.peers.is_joined(peer) {
+                    return;
+                }
+                let path = match &m {
+                    KeyMsg::Set { path, .. } | KeyMsg::Erase { path } => path.clone(),
+                    _ => return,
+                };
+                if !self.keyed.may_write(peer, &path) {
+                    self.keyed.stats.rejected += 1;
+                    let value = self.keyed.get(&path).cloned();
+                    self.send_keyed(peer, KeyMsg::Rejected { path, value }, now_us);
+                    return;
+                }
+                let changed = match m {
+                    KeyMsg::Set { path, value } => self.keyed.apply_set(&path, value),
+                    KeyMsg::Erase { path } => {
+                        let visible: Vec<PeerId> = self
+                            .peers
+                            .joined()
+                            .into_iter()
+                            .filter(|p| *p != peer && self.keyed.visible(*p, &path))
+                            .collect();
+                        if self.keyed.apply_erase(&path) {
+                            for p in visible {
+                                let msg = KeyMsg::Erase { path: path.clone() };
+                                self.send_keyed(p, msg, now_us);
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
+                };
+                if changed {
+                    // The writer applied it already; everyone else who sees it gets it.
+                    self.share_key(&path, Some(peer), now_us);
+                }
+            }
+            Role::Client => {
+                if peer != SERVER {
+                    return;
+                }
+                match m {
+                    KeyMsg::Set { path, value } => {
+                        self.keyed.apply_set(&path, value);
+                    }
+                    KeyMsg::Erase { path } => {
+                        self.keyed.apply_erase(&path);
+                    }
+                    KeyMsg::Full { entries, rules } => {
+                        self.keyed.set_rules(rules);
+                        self.keyed.apply_full(entries);
+                    }
+                    KeyMsg::Rules { rules } => self.keyed.set_rules(rules),
+                    KeyMsg::Rejected { path, value } => {
+                        match value {
+                            Some(v) => self.keyed.apply_set(&path, v),
+                            None => self.keyed.apply_erase(&path),
+                        };
+                        self.keyed.stats.rejected += 1;
+                        self.keyed.push_event(KeyEvent::Rejected(path));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2526,6 +3458,7 @@ mod tests {
             owner: 1,
             parts: 2,
             initial_state: std::vec![],
+            ..CreateAction::default()
         }
     }
 
@@ -3312,5 +4245,502 @@ mod tests {
         c.set_interaction(true);
         c.set_adaptive_delay(false);
         assert!(c.adaptive_delay().is_none());
+    }
+
+    // ---- WP7: authority and keyed state --------------------------------------------------------
+
+    use crate::authority::Transfer;
+    use crate::keyed::{KeyEvent, KeyMsg, Who};
+
+    /// A server and two clients (transport ids 2 and 3) with an instant transport; every step runs the
+    /// tick and the post-tick send on all three.
+    struct Trio {
+        server: Session,
+        a: Session,
+        b: Session,
+        now: u64,
+    }
+
+    impl Trio {
+        fn new() -> Self {
+            let mut t = Self {
+                server: Session::server(SessionConfig::new(60)),
+                a: Session::client(SessionConfig::new(60)),
+                b: Session::client(SessionConfig::new(60)),
+                now: 1_000_000,
+            };
+            t.server.peer_connected(2, t.now);
+            t.server.peer_connected(3, t.now);
+            t.a.peer_connected(SERVER, t.now);
+            t.b.peer_connected(SERVER, t.now);
+            for _ in 0..3 {
+                t.step();
+            }
+            assert!(t.a.is_connected() && t.b.is_connected());
+            for s in [&mut t.server, &mut t.a, &mut t.b] {
+                s.register_scene(SCENE, 42);
+                s.register_props(SCENE, props(), names());
+            }
+            t
+        }
+
+        fn step(&mut self) {
+            self.now += TICK_US;
+            for s in [&mut self.server, &mut self.a, &mut self.b] {
+                s.tick(self.now);
+                s.send_snapshots(self.now);
+            }
+            self.pump();
+        }
+
+        fn pump(&mut self) {
+            let now = self.now;
+            for o in self.a.outgoing() {
+                self.server.receive(2, &o.bytes, now);
+            }
+            for o in self.b.outgoing() {
+                self.server.receive(3, &o.bytes, now);
+            }
+            for o in self.server.outgoing() {
+                match o.peer {
+                    2 => self.a.receive(SERVER, &o.bytes, now),
+                    3 => self.b.receive(SERVER, &o.bytes, now),
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        fn steps(&mut self, n: usize) {
+            for _ in 0..n {
+                self.step();
+            }
+        }
+
+        fn spawn(&mut self, owner: PeerId, transfer: Transfer, client_owned: bool) -> NetId {
+            let id = self
+                .server
+                .spawn(
+                    SCENE,
+                    Spawn::new(root(1), "E", owner, 3, std::vec![])
+                        .with_values(state(1.0))
+                        .with_authority(transfer, client_owned),
+                    self.now,
+                )
+                .unwrap();
+            self.steps(2);
+            for s in [&mut self.server, &mut self.a, &mut self.b] {
+                entity_events(s);
+            }
+            id
+        }
+
+        fn owner(&self, id: NetId) -> [PeerId; 3] {
+            [&self.server, &self.a, &self.b].map(|s| s.entities().get(id).map_or(0, |r| r.owner))
+        }
+    }
+
+    fn replies(events: &[EntityEvent]) -> Vec<(NetId, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EntityEvent::OwnerReply { id, granted, .. } => Some((*id, *granted)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn owner_sets(events: &[EntityEvent]) -> Vec<(NetId, PeerId)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EntityEvent::SetOwner { id, owner, .. } => Some((*id, *owner)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn queries(events: &[EntityEvent]) -> Vec<(NetId, PeerId)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EntityEvent::OwnerQuery { id, requester, .. } => Some((*id, *requester)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn take_request_fixed_and_release() {
+        let mut t = Trio::new();
+        let fixed = t.spawn(SERVER, Transfer::Fixed, false);
+        let take = t.spawn(SERVER, Transfer::Take, false);
+        let req = t.spawn(SERVER, Transfer::Request, false);
+        assert_eq!(
+            t.a.entities().get(take).map(|r| r.transfer),
+            Some(Transfer::Take),
+            "the rule travels in the create"
+        );
+        // take: always granted, one SetOwner on every peer, then the reply to the requester.
+        t.a.request_owner(take, t.now).unwrap();
+        t.steps(2);
+        assert_eq!(t.owner(take), [2, 2, 2]);
+        assert_eq!(owner_sets(&entity_events(&mut t.server)), [(take, 2)]);
+        let ev = entity_events(&mut t.a);
+        assert_eq!(owner_sets(&ev), [(take, 2)]);
+        assert_eq!(replies(&ev), [(take, true)]);
+        assert_eq!(owner_sets(&entity_events(&mut t.b)), [(take, 2)]);
+        // fixed: refused.
+        t.a.request_owner(fixed, t.now).unwrap();
+        t.steps(2);
+        assert_eq!(t.owner(fixed), [1, 1, 1]);
+        assert_eq!(replies(&entity_events(&mut t.a)), [(fixed, false)]);
+        assert!(owner_sets(&entity_events(&mut t.b)).is_empty());
+        // request of a server-owned entity: the server's gdnet decides.
+        t.a.request_owner(req, t.now).unwrap();
+        t.steps(2);
+        assert_eq!(queries(&entity_events(&mut t.server)), [(req, 2)]);
+        t.server.answer_owner_query(req, 2, true, t.now);
+        t.steps(2);
+        assert_eq!(t.owner(req), [2, 2, 2]);
+        assert_eq!(replies(&entity_events(&mut t.a)), [(req, true)]);
+        // request of a client-owned entity: the owner is asked; a refusal keeps it.
+        t.b.request_owner(req, t.now).unwrap();
+        t.steps(2);
+        assert_eq!(queries(&entity_events(&mut t.a)), [(req, 3)]);
+        t.a.answer_owner_query(req, 3, false, t.now);
+        t.steps(2);
+        assert_eq!(t.owner(req), [2, 2, 2]);
+        assert_eq!(replies(&entity_events(&mut t.b)), [(req, false)]);
+        t.b.request_owner(req, t.now).unwrap();
+        t.steps(2);
+        entity_events(&mut t.a);
+        t.a.answer_owner_query(req, 3, true, t.now);
+        t.steps(2);
+        assert_eq!(t.owner(req), [3, 3, 3]);
+        assert_eq!(replies(&entity_events(&mut t.b)), [(req, true)]);
+        // release: back to the server; only the owner may release.
+        assert!(!t.a.release_owner(req, t.now), "a does not own it any more");
+        assert!(t.a.release_owner(take, t.now));
+        t.steps(2);
+        assert_eq!(t.owner(take), [1, 1, 1]);
+        // A forged release of someone else's entity changes nothing.
+        let bytes = wire::encode(&Message::Entity(EntityAction::ReleaseOwner { id: req }));
+        t.server.receive(2, &bytes, t.now);
+        t.steps(1);
+        assert_eq!(t.owner(req), [3, 3, 3]);
+        assert!(t.server.authority_stats().owner_changes >= 4);
+        assert_eq!(t.server.authority_stats().requests_refused, 2);
+    }
+
+    #[test]
+    fn an_unanswered_query_is_refused_after_five_seconds() {
+        let mut t = Trio::new();
+        let req = t.spawn(2, Transfer::Request, false);
+        t.b.request_owner(req, t.now).unwrap();
+        t.steps(2);
+        assert_eq!(queries(&entity_events(&mut t.a)), [(req, 3)]);
+        t.steps(5 * 60);
+        assert_eq!(replies(&entity_events(&mut t.b)), [(req, false)]);
+        assert_eq!(t.owner(req), [2, 2, 2]);
+    }
+
+    #[test]
+    fn a_new_owner_starts_a_new_input_stream_and_the_old_ones_input_is_dropped() {
+        let mut t = Trio::new();
+        let id = t.spawn(2, Transfer::Take, false);
+        t.b.request_owner(id, t.now).unwrap();
+        t.steps(2);
+        assert_eq!(t.owner(id), [3, 3, 3]);
+        let before = t.server.input_stats().refused;
+        t.a.local_input(id, InputFrame::default());
+        t.steps(1);
+        assert!(
+            t.server.input_stats().refused > before,
+            "a's frames are refused now"
+        );
+    }
+
+    #[test]
+    fn nested_entities_inherit_their_parents_owner_unless_they_set_their_own() {
+        let mut t = Trio::new();
+        let parent = t.spawn(2, Transfer::Fixed, false);
+        let inherit = t
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(under(parent, 2), "In", SERVER, 3, std::vec![]).inheriting_owner(),
+                t.now,
+            )
+            .unwrap();
+        let own = t
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(under(parent, 2), "Own", SERVER, 3, std::vec![]),
+                t.now,
+            )
+            .unwrap();
+        t.steps(2);
+        assert_eq!(t.owner(inherit), [2, 2, 2]);
+        assert_eq!(t.owner(own), [1, 1, 1]);
+    }
+
+    #[test]
+    fn a_client_owned_entitys_state_is_accepted_relayed_and_not_echoed() {
+        let mut t = Trio::new();
+        let id = t.spawn(2, Transfer::Fixed, true);
+        t.server.drain_state_updates();
+        t.b.drain_state_updates();
+        for k in 0..10 {
+            t.a.record_part(id, 0, &[(0, Value::Vector2([2.0 + k as f32, 1.0]))]);
+            t.step();
+        }
+        t.steps(2);
+        let on_server = t.server.drain_state_updates();
+        assert!(
+            on_server
+                .iter()
+                .any(|u| u.id == id && u.value == Value::Vector2([11.0, 1.0])),
+            "the server applies the owner's state: {on_server:?}"
+        );
+        let on_b = t.b.drain_state_updates();
+        assert_eq!(
+            on_b.last().map(|u| u.value.clone()),
+            Some(Value::Vector2([11.0, 1.0])),
+            "relayed to the other client"
+        );
+        assert!(
+            t.a.drain_state_updates().iter().all(|u| u.id != id),
+            "never echoed to its owner"
+        );
+        assert!(t.server.authority_stats().owner_states_received > 0);
+        // A late joiner's burst carries the owner's latest state.
+        let mut c = Session::client(SessionConfig::new(60));
+        t.server.peer_connected(4, t.now);
+        c.peer_connected(SERVER, t.now);
+        c.register_scene(SCENE, 42);
+        c.register_props(SCENE, props(), names());
+        for o in c.outgoing() {
+            t.server.receive(4, &o.bytes, t.now);
+        }
+        for o in t.server.outgoing() {
+            match o.peer {
+                4 => c.receive(SERVER, &o.bytes, t.now),
+                2 => t.a.receive(SERVER, &o.bytes, t.now),
+                _ => t.b.receive(SERVER, &o.bytes, t.now),
+            }
+        }
+        let ev = entity_events(&mut c);
+        let init = ev
+            .iter()
+            .find_map(|e| match e {
+                EntityEvent::Create { create, .. } if create.id == id => {
+                    c.decode_state(create.scene_hash, &create.initial_state)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(init.contains(&(0, 0, Value::Vector2([11.0, 1.0]))));
+        t.server.peer_disconnected(4, t.now);
+        // Once the server owns it again, its own records go to the old owner.
+        t.server.set_owner(id, SERVER, t.now);
+        t.steps(2);
+        t.server
+            .record_part(id, 0, &[(0, Value::Vector2([50.0, 1.0]))]);
+        t.steps(3);
+        assert!(t
+            .a
+            .drain_state_updates()
+            .iter()
+            .any(|u| u.id == id && u.value == Value::Vector2([50.0, 1.0])));
+    }
+
+    #[test]
+    fn the_owner_never_interpolates_its_client_owned_entity() {
+        let mut t = Trio::new();
+        let mut table = props();
+        table.parts[0][0].interpolate = true;
+        for s in [&mut t.server, &mut t.a, &mut t.b] {
+            s.register_props(SCENE, table.clone(), names());
+        }
+        let id = t.spawn(2, Transfer::Fixed, true);
+        assert!(!t.a.is_interpolated(id, 0, 0), "the owner simulates it");
+        assert!(
+            t.b.is_interpolated(id, 0, 0),
+            "another client interpolates it"
+        );
+    }
+
+    #[test]
+    fn a_write_to_an_entity_the_client_does_not_own_is_rejected() {
+        let mut t = Trio::new();
+        let id = t.spawn(SERVER, Transfer::Fixed, false);
+        t.a.remember_received(
+            id,
+            &[
+                (0, 0, Value::Vector2([1.0, 1.0])),
+                (0, 1, Value::Bool(true)),
+            ],
+        );
+        // No change, no write; an interpolated or engine-driven field never counts.
+        assert_eq!(t.a.check_writes(id, 0, &[(1, Value::Bool(true))]), 0);
+        assert_eq!(t.a.check_writes(id, 2, &[(0, Value::Int(9))]), 0, "frame");
+        assert_eq!(t.a.check_writes(id, 0, &[(1, Value::Bool(false))]), 1);
+        assert_eq!(
+            t.a.check_writes(id, 0, &[(1, Value::Bool(false))]),
+            0,
+            "sent once until answered"
+        );
+        t.steps(2);
+        let ev = entity_events(&mut t.server);
+        assert!(
+            matches!(&ev[..], [EntityEvent::WriteRejected { id: i, peer: 2, .. }] if *i == id),
+            "{ev:?}"
+        );
+        let ev = entity_events(&mut t.a);
+        let restore = ev
+            .iter()
+            .find_map(|e| match e {
+                EntityEvent::WriteRejected {
+                    restore, peer: 2, ..
+                } => Some(restore.clone()),
+                _ => None,
+            })
+            .expect("the writer is told");
+        assert_eq!(restore, std::vec![(0, 1, Value::Bool(true))]);
+        assert_eq!(t.server.authority_stats().writes_rejected, 1);
+        assert_eq!(t.a.authority_stats().writes_rejected, 1);
+        // A write that keeps coming back (code rewriting it every poll) stops being checked after
+        // three rejects in a row.
+        for _ in 0..5 {
+            t.a.check_writes(id, 0, &[(1, Value::Bool(false))]);
+            t.steps(2);
+        }
+        assert_eq!(
+            t.a.authority_stats().writes_rejected,
+            MAX_REJECTS_IN_A_ROW as u64
+        );
+        entity_events(&mut t.server);
+        entity_events(&mut t.a);
+        // The server's value never changed and nothing reached b.
+        assert!(t.b.drain_state_updates().iter().all(|u| u.id != id));
+        // An owner state for an entity that is not client_owned is a rejected write too.
+        let own = t.spawn(2, Transfer::Fixed, false);
+        t.a.record_part(own, 0, &[(1, Value::Bool(false))]);
+        let bytes = wire::encode(&Message::OwnerState(crate::authority::StateMsg {
+            tick: 1,
+            entities: std::vec![(own, t.a.replication().encode_full(own))],
+        }));
+        t.server.receive(2, &bytes, t.now);
+        t.steps(1);
+        assert!(entity_events(&mut t.server)
+            .iter()
+            .any(|e| matches!(e, EntityEvent::WriteRejected { id: i, .. } if *i == own)));
+        assert!(t.server.drain_state_updates().is_empty(), "not applied");
+    }
+
+    fn key_events(s: &mut Session) -> Vec<KeyEvent> {
+        core::iter::from_fn(|| s.poll_key_event()).collect()
+    }
+
+    #[test]
+    fn keyed_state_deltas_erase_and_the_full_map_on_join() {
+        let mut p = Pair::new(SessionConfig::new(60), SessionConfig::new(60), 2);
+        p.server.keyed_set("score/1", std::vec![10], p.now).unwrap();
+        p.server.keyed_set("title", std::vec![1, 2], p.now).unwrap();
+        for _ in 0..3 {
+            p.step();
+        }
+        assert_eq!(p.client.keyed().get("score/1"), Some(&std::vec![10]));
+        assert_eq!(p.client.keyed().keys(""), std::vec!["score/1", "title"]);
+        assert_eq!(
+            key_events(&mut p.client).len(),
+            2,
+            "the late joiner's full map"
+        );
+        p.server.keyed_set("score/1", std::vec![11], p.now).unwrap();
+        p.server.keyed_set("score/1", std::vec![11], p.now).unwrap();
+        p.server.keyed_erase("title", p.now).unwrap();
+        p.step();
+        assert_eq!(
+            key_events(&mut p.client),
+            std::vec![
+                KeyEvent::Changed("score/1".into(), std::vec![11]),
+                KeyEvent::Erased("title".into()),
+            ],
+            "deltas only on change"
+        );
+        assert!(p.server.keyed().stats.bytes_sent > 0);
+        assert!(p.client.keyed().stats.bytes_received > 0);
+    }
+
+    #[test]
+    fn keyed_writes_need_a_permission() {
+        let mut t = Trio::new();
+        let err = t.a.keyed_set("chat/1", std::vec![1], t.now).unwrap_err();
+        assert!(err.contains("chat/1"), "{err}");
+        t.server.keyed_allow("chat/", Who::All, t.now);
+        t.server.keyed_allow("score/", Who::Owner, t.now);
+        t.steps(1);
+        t.a.keyed_set("chat/1", std::vec![7], t.now).unwrap();
+        assert_eq!(
+            t.a.keyed().get("chat/1"),
+            Some(&std::vec![7]),
+            "applied at once"
+        );
+        t.a.keyed_set("score/2", std::vec![3], t.now).unwrap();
+        assert!(t.a.keyed_set("score/3", std::vec![3], t.now).is_err());
+        t.steps(2);
+        for s in [&t.server, &t.b] {
+            assert_eq!(s.keyed().get("chat/1"), Some(&std::vec![7]));
+            assert_eq!(s.keyed().get("score/2"), Some(&std::vec![3]));
+        }
+        // A write the server refuses (sent past the local check) is rolled back on the writer.
+        key_events(&mut t.a);
+        t.server.keyed_set("admin", std::vec![1], t.now).unwrap();
+        t.steps(1);
+        let forged = wire::encode(&Message::Keyed(KeyMsg::Set {
+            path: "admin".into(),
+            value: std::vec![9],
+        }));
+        t.server.receive(2, &forged, t.now);
+        t.steps(2);
+        assert_eq!(t.server.keyed().get("admin"), Some(&std::vec![1]));
+        assert_eq!(t.b.keyed().get("admin"), Some(&std::vec![1]));
+        assert!(key_events(&mut t.a).contains(&KeyEvent::Rejected("admin".into())));
+        assert_eq!(t.server.keyed().stats.rejected, 1);
+    }
+
+    #[test]
+    fn a_view_hides_a_path_from_the_filtered_peer() {
+        let mut t = Trio::new();
+        t.server
+            .keyed_set("team/red/plan", std::vec![1], t.now)
+            .unwrap();
+        t.server.keyed_set("open", std::vec![2], t.now).unwrap();
+        t.steps(1);
+        assert!(t.b.keyed().get("team/red/plan").is_some());
+        key_events(&mut t.b);
+        t.server
+            .keyed_view("team/red/", &[(2, true), (3, false)], t.now);
+        t.steps(1);
+        assert_eq!(
+            key_events(&mut t.b),
+            std::vec![KeyEvent::Erased("team/red/plan".into())]
+        );
+        assert!(
+            t.a.keyed().get("team/red/plan").is_some(),
+            "a still sees it"
+        );
+        t.server
+            .keyed_set("team/red/plan", std::vec![5], t.now)
+            .unwrap();
+        t.steps(1);
+        assert_eq!(t.a.keyed().get("team/red/plan"), Some(&std::vec![5]));
+        assert!(t.b.keyed().get("team/red/plan").is_none());
+        assert!(t.b.keyed().get("open").is_some());
+        t.server.keyed_set_visible("team/red/", 3, true, t.now);
+        t.steps(1);
+        assert_eq!(t.b.keyed().get("team/red/plan"), Some(&std::vec![5]));
     }
 }
