@@ -41,6 +41,8 @@ pub struct StateUpdate {
     pub part: u16,
     pub field: u16,
     pub value: Value,
+    /// WP4: the server tick of the snapshot (or reliable field) that carried the value.
+    pub tick: u64,
 }
 
 /// A field sent reliably (2.4: `reliable` properties and values too large for a snapshot).
@@ -621,17 +623,22 @@ impl Replication {
     }
 
     /// A snapshot body from the authority. `scene_of(id)` gives a known entity's scene; entities this
-    /// side cannot decode yet are skipped and the snapshot is then not acknowledged.
-    pub fn on_snapshot(&mut self, body: &[u8], scene_of: &dyn Fn(NetId) -> Option<u64>) {
+    /// side cannot decode yet are skipped and the snapshot is then not acknowledged. Returns the
+    /// snapshot's server tick when it was applied (WP4: the tick prediction compares against).
+    pub fn on_snapshot(
+        &mut self,
+        body: &[u8],
+        scene_of: &dyn Fn(NetId) -> Option<u64>,
+    ) -> Option<u64> {
         let tables = &self.tables;
         let Some(d) = snapshot::decode(body, |id| scene_of(id).and_then(|s| tables.get(&s))) else {
             self.stats.decode_errors += 1;
-            return;
+            return None;
         };
         let t = d.header.tick;
         if self.rx.last_applied.is_some_and(|last| t <= last) {
             self.stats.snapshots_stale += 1;
-            return;
+            return None;
         }
         self.rx.last_applied = Some(t);
         self.stats.snapshots_received += 1;
@@ -651,6 +658,7 @@ impl Replication {
                     part,
                     field,
                     value,
+                    tick: t,
                 });
             }
         }
@@ -659,6 +667,7 @@ impl Replication {
         } else {
             self.stats.snapshots_unacked += 1;
         }
+        Some(t)
     }
 
     /// A reliable field from the authority.
@@ -694,6 +703,7 @@ impl Replication {
             part: msg.part,
             field: msg.field,
             value,
+            tick: msg.tick,
         });
     }
 

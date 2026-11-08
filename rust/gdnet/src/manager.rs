@@ -32,15 +32,18 @@
 //! are frozen once.
 
 use crate::apply;
-use crate::entity_node::NetEntity;
+use crate::entity_node::{NetEntity, Simulate};
 use crate::infer::{self, RuntimeProps};
+use crate::input::{self as net_input, ActionTable, NetInput};
 use crate::parts::{self, SceneInfo};
 use crate::profiles::{self, NetProfiles, Profiles};
 use crate::session::NetSession;
+use crate::tick::{self, Gate};
 use godot::classes::{Engine, INode, Node, SceneTree};
 use godot::prelude::*;
+use netcore::input::{name_hash, InputFrame};
 use netcore::session::EntityEvent;
-use netcore::{NetId, ParentRef, Spawn, StateUpdate, Value, MANAGER_ROOT};
+use netcore::{NetId, ParentRef, Policy, Spawn, StateUpdate, Value, MANAGER_ROOT};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -101,6 +104,19 @@ struct Entry {
     nodes: PartNodes,
     /// Poll the cold properties at the next record (`mark_cold_dirty`).
     cold_force: bool,
+    /// WP4: the entity's input actions, its `NetInput`, who simulates, prediction.
+    actions: Rc<ActionTable>,
+    input: Option<Gd<NetInput>>,
+    gate: Option<Gate>,
+    /// Read from the `NetEntity` when the gate is created.
+    everywhere: bool,
+    policy: Policy,
+    /// `NetEntity.input_properties`: (part node, property, wire name hash).
+    input_props: Vec<(Gd<Node>, StringName, u32)>,
+    /// Tracked by netcore's prediction (this peer owns it as a client and predicts it).
+    predicted: Option<Policy>,
+    /// The scripts were checked for global `Input` use (once, when a client owns it).
+    input_checked: bool,
 }
 
 impl Entry {
@@ -117,8 +133,28 @@ impl Entry {
             props: None,
             nodes: Rc::new(Vec::new()),
             cold_force: false,
+            actions: Rc::new(ActionTable::default()),
+            input: None,
+            gate: None,
+            everywhere: false,
+            policy: Policy::Check,
+            input_props: Vec::new(),
+            predicted: None,
+            input_checked: false,
         }
     }
+}
+
+/// What the session tells its managers each tick (WP4).
+#[derive(Clone, Copy, Debug)]
+pub struct TickCtx {
+    pub is_server: bool,
+    pub local_id: u32,
+    /// The server tick (server) or the predicted tick (client).
+    pub tick: u64,
+    /// No input delay: the frame read this tick is the one sampled now.
+    pub delay0: bool,
+    pub delta: f64,
 }
 
 #[derive(GodotClass)]
@@ -136,6 +172,12 @@ pub struct NetManager {
     #[export]
     #[var(get = get_profiles, set = set_profiles)]
     profiles: Option<Gd<NetProfiles>>,
+    /// The input actions owned entities sample and send (WP4, D15). Empty: the project setting
+    /// `gdnet/input/actions`, else every InputMap action except `ui_*`. A `NetEntity`'s
+    /// `input_actions` narrows it per entity.
+    #[export]
+    input_actions: PackedStringArray,
+    actions_cache: HashMap<String, Rc<ActionTable>>,
     profiles_cache: Option<(usize, Rc<Profiles>)>,
     runtime: HashMap<usize, Rc<RuntimeProps>>,
     /// Spawned entities under this manager (read only).
@@ -1002,17 +1044,46 @@ impl NetManager {
             .entry(key)
             .or_insert_with(|| Rc::new(RuntimeProps::new(inferred.clone())))
             .clone();
+        // WP4: the input actions are part of the table, so both peers agree on their indices.
+        let actions = self.actions_for(node, &scene.path);
+        let mut table = inferred.table.clone();
+        table.inputs = actions.strings.clone();
         let mut s = session.clone();
         s.bind_mut().with_core(|c, _| {
-            if c.props(netcore::entity::scene_hash(&scene.path)) != Some(&inferred.table) {
-                c.register_props(
-                    &scene.path,
-                    inferred.table.clone(),
-                    inferred.part_names.clone(),
-                );
+            if c.props(netcore::entity::scene_hash(&scene.path)) != Some(&table) {
+                c.register_props(&scene.path, table, inferred.part_names.clone());
             }
         });
+        if let Some(e) = self.entries.get_mut(&node.instance_id()) {
+            e.actions = actions;
+        }
         Some(rt)
+    }
+
+    /// The input actions of an entity of `scene` (cached per scene).
+    fn actions_for(&mut self, node: &Gd<Node>, scene: &str) -> Rc<ActionTable> {
+        if let Some(a) = self.actions_cache.get(scene) {
+            return a.clone();
+        }
+        let manager: Vec<String> = self
+            .input_actions
+            .as_slice()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let entity: Vec<String> = net_entity_of(node)
+            .map(|ne| {
+                ne.bind()
+                    .get_input_actions()
+                    .as_slice()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let a = Rc::new(ActionTable::new(net_input::action_list(&manager, &entity)));
+        self.actions_cache.insert(scene.to_string(), a.clone());
+        a
     }
 
     /// 2.2 step 5 on the server: reads the hot properties of every spawned entity, and the cold ones
@@ -1127,6 +1198,489 @@ impl NetManager {
                 p.remove_child(&n);
             }
             n.queue_free();
+        }
+    }
+}
+
+/// WP4: who simulates, input, prediction and replay (docs/PLAN_NETCODE.md 2.1, 2.2 steps 2-4, 2.5).
+/// The session calls these once per tick in its step (priority -1000), after the entity actions and
+/// received state were applied, in this order: `gate_and_track`, (a rollback: `restore` then
+/// `replay_tick` per replayed tick), `prepare_inputs`, `net_ticks`; and `record_owned` from its
+/// post-tick hook. Calls out to the engine hold the base guard; core access goes through short
+/// `with_core` borrows.
+impl NetManager {
+    /// Applies the who-simulates rule (D13) to every spawned entity, starts or stops netcore's
+    /// prediction for entities this client owns, creates their `NetInput`s and runs the global-`Input`
+    /// check once per client-owned entity.
+    pub fn gate_and_track(&mut self, session: &Gd<NetSession>) {
+        if !self.online {
+            return;
+        }
+        let (is_server, local) = (self.is_server, self.local_id);
+        let order = self.order.clone();
+        for iid in order {
+            let Some(e) = self.entries.get_mut(&iid) else {
+                continue;
+            };
+            let (Some(id), Some(_)) = (e.id, e.props.as_ref()) else {
+                continue;
+            };
+            let nodes = e.nodes.clone();
+            if e.gate.is_none() {
+                let root = Gd::<Node>::try_from_instance_id(iid).ok();
+                let ne = root.as_ref().and_then(net_entity_of);
+                e.everywhere = ne
+                    .as_ref()
+                    .is_some_and(|n| n.bind().get_simulate() == Simulate::Everywhere);
+                e.policy = ne
+                    .as_ref()
+                    .map_or(Policy::Check, |n| n.bind().get_predict().policy());
+                e.input_props = match (&root, &ne) {
+                    (Some(r), Some(n)) => input_props_of(r, &n.bind().get_input_properties()),
+                    _ => Vec::new(),
+                };
+                e.gate = Some(Gate::new(&nodes));
+            }
+            let owned = e.owner == local;
+            let simulate = if is_server || e.origin == Origin::Local {
+                true
+            } else if owned {
+                e.policy != Policy::Disabled
+            } else {
+                e.everywhere
+            };
+            let want =
+                (!is_server && owned && e.origin != Origin::Local && e.policy != Policy::Disabled)
+                    .then_some(e.policy);
+            let track = (want != e.predicted).then_some(want);
+            e.predicted = want;
+            let check = !e.input_checked && e.owner != netcore::SERVER && (is_server || owned);
+            if check {
+                e.input_checked = true;
+            }
+            if e.input.is_none() {
+                let mut inp = NetInput::new_live();
+                inp.bind_mut().set_actions(e.actions.clone());
+                e.input = Some(inp);
+            }
+            let rt = e.props.clone();
+            let gate = e.gate.as_mut().map(|g| (g.simulating != Some(simulate), g));
+            if let Some((true, g)) = gate {
+                let mut g2 = std::mem::take(g);
+                {
+                    let _guard = self.base_mut();
+                    g2.apply(&nodes, simulate);
+                }
+                if let Some(e) = self.entries.get_mut(&iid) {
+                    e.gate = Some(g2);
+                }
+            }
+            if let Some(want) = track {
+                let mut s = session.clone();
+                match want {
+                    Some(policy) => {
+                        let initial = {
+                            let _guard = self.base_mut();
+                            rt.as_ref()
+                                .map(|rt| read_hot_indexed(rt, &nodes))
+                                .unwrap_or_default()
+                        };
+                        s.bind_mut()
+                            .with_core(|c, _| c.track_prediction(id, policy, &initial));
+                    }
+                    None => {
+                        s.bind_mut().with_core(|c, _| c.untrack_prediction(id));
+                    }
+                }
+            }
+            if check {
+                let _guard = self.base_mut();
+                tick::check_global_input(&nodes);
+            }
+        }
+    }
+
+    /// 2.2 step 2: sets each entity's `NetInput` for this tick. The server uses the received frame of a
+    /// client-owned entity (and writes its `input_properties`); a client samples the real `Input` for
+    /// the entities it owns and runs `_net_input()`; entities the server owns read the real `Input`.
+    pub fn prepare_inputs(&mut self, session: &Gd<NetSession>, ctx: &TickCtx) {
+        if !self.online {
+            return;
+        }
+        let order = self.order.clone();
+        for iid in order {
+            let Some(e) = self.entries.get(&iid) else {
+                continue;
+            };
+            let (Some(id), Some(mut inp)) = (e.id, e.input.clone()) else {
+                continue;
+            };
+            let owned = e.owner == ctx.local_id;
+            let tick = ctx.tick as i64;
+            let nodes = e.nodes.clone();
+            let props = e.input_props.clone();
+            if e.owner == netcore::SERVER || (owned && e.origin == Origin::Local) {
+                inp.bind_mut().set_live(tick);
+                if owned {
+                    self.call_net_input(&nodes);
+                }
+            } else if ctx.is_server {
+                let mut s = session.clone();
+                let taken = s
+                    .bind_mut()
+                    .with_core(|c, _| c.server_input(id).cloned())
+                    .flatten()
+                    .unwrap_or_default();
+                {
+                    let _guard = self.base_mut();
+                    write_input_props(&props, &taken.frame);
+                }
+                inp.bind_mut()
+                    .set_frames(tick, taken.frame, taken.prev, None, false);
+            } else if owned {
+                let actions = e.actions.clone();
+                let sampled = net_input::sample(&actions);
+                let mut s = session.clone();
+                let (stored, prev) = s
+                    .bind_mut()
+                    .with_core(|c, _| {
+                        (
+                            c.owner_frame(id, ctx.tick).cloned(),
+                            ctx.tick
+                                .checked_sub(1)
+                                .and_then(|t| c.owner_frame(id, t).cloned()),
+                        )
+                    })
+                    .unwrap_or_default();
+                let current = if ctx.delay0 {
+                    sampled.clone()
+                } else {
+                    stored.unwrap_or_default()
+                };
+                inp.bind_mut().set_frames(
+                    tick,
+                    current,
+                    prev.unwrap_or_default(),
+                    Some(sampled),
+                    ctx.delay0,
+                );
+                self.call_net_input(&nodes);
+                if !props.is_empty() {
+                    let values: Vec<(u32, Value)> = {
+                        let _guard = self.base_mut();
+                        props
+                            .iter()
+                            .filter(|(n, _, _)| n.is_instance_valid())
+                            .filter_map(|(n, p, h)| {
+                                net_input::to_input_value(&n.get(p)).map(|v| (*h, v))
+                            })
+                            .collect()
+                    };
+                    let mut b = inp.bind_mut();
+                    for (h, v) in values {
+                        b.write_custom(h, v);
+                    }
+                }
+                if !ctx.delay0 {
+                    // input_properties of the applied frame (sampled `input_delay` ticks ago).
+                    let current = inp.bind().current().clone();
+                    let _guard = self.base_mut();
+                    write_input_props(&props, &current);
+                }
+            } else {
+                inp.bind_mut().set_frames(
+                    tick,
+                    InputFrame::default(),
+                    InputFrame::default(),
+                    None,
+                    false,
+                );
+            }
+        }
+    }
+
+    fn call_net_input(&mut self, nodes: &PartNodes) {
+        let _guard = self.base_mut();
+        for n in nodes.iter().flatten() {
+            if n.is_instance_valid() && n.has_method("_net_input") {
+                let mut n = n.clone();
+                n.call("_net_input", &[]);
+            }
+        }
+    }
+
+    /// 2.2 step 4 for parts with `_net_tick`: called instead of their `_physics_process` on the peers
+    /// that simulate the entity, in tree order.
+    pub fn net_ticks(&mut self, ctx: &TickCtx) {
+        if !self.online {
+            return;
+        }
+        let mut work: Vec<Gd<Node>> = Vec::new();
+        for iid in &self.order {
+            let Some(e) = self.entries.get(iid) else {
+                continue;
+            };
+            let Some(g) = e.gate.as_ref() else { continue };
+            if g.simulating != Some(true) {
+                continue;
+            }
+            for (i, n) in e.nodes.iter().enumerate() {
+                if g.net_tick.get(i).copied().unwrap_or(false) {
+                    if let Some(n) = n {
+                        work.push(n.clone());
+                    }
+                }
+            }
+        }
+        if work.is_empty() {
+            return;
+        }
+        let args = [
+            ctx.delta.to_variant(),
+            (ctx.tick as i64).to_variant(),
+            true.to_variant(),
+        ];
+        let _guard = self.base_mut();
+        for mut n in work {
+            if n.is_instance_valid() {
+                n.call("_net_tick", &args);
+            }
+        }
+    }
+
+    /// Restores the hot state of the entities of `states` that this manager holds; returns their ids.
+    pub fn restore(&mut self, states: &[(NetId, netcore::predict::EntityState)]) -> Vec<NetId> {
+        let mut ids = Vec::new();
+        let mut writes = Vec::new();
+        for (id, state) in states {
+            let Some(e) = self.by_id.get(id).and_then(|i| self.entries.get(i)) else {
+                continue;
+            };
+            let Some(rt) = e.props.as_ref() else {
+                continue;
+            };
+            writes.extend(state_writes(rt, &e.nodes, state.clone()));
+            ids.push(*id);
+        }
+        let _guard = self.base_mut();
+        for (n, f, v) in writes {
+            if n.is_instance_valid() {
+                apply::write(&n, &f, &v);
+            }
+        }
+        ids
+    }
+
+    /// One replayed tick for `ids`: sets each entity's input to its frame for `tick`, calls
+    /// `_net_tick(delta, tick, false)` or `_physics_process(delta)` on its simulating parts in tree
+    /// order, and returns the hot state after it (for the history). `Net.is_fresh()` is false around it.
+    pub fn replay_tick(
+        &mut self,
+        session: &Gd<NetSession>,
+        ids: &[NetId],
+        tick: u64,
+        delta: f64,
+    ) -> Vec<(NetId, Vec<Value>)> {
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(e) = self.by_id.get(id).and_then(|i| self.entries.get(i)) else {
+                continue;
+            };
+            let (Some(rt), Some(mut inp), Some(g)) =
+                (e.props.clone(), e.input.clone(), e.gate.clone())
+            else {
+                continue;
+            };
+            let nodes = e.nodes.clone();
+            let props = e.input_props.clone();
+            let mut s = session.clone();
+            let (cur, prev) = s
+                .bind_mut()
+                .with_core(|c, _| {
+                    (
+                        c.owner_frame(*id, tick).cloned(),
+                        tick.checked_sub(1)
+                            .and_then(|t| c.owner_frame(*id, t).cloned()),
+                    )
+                })
+                .unwrap_or_default();
+            let cur = cur.unwrap_or_default();
+            inp.bind_mut().set_frames(
+                tick as i64,
+                cur.clone(),
+                prev.unwrap_or_default(),
+                None,
+                false,
+            );
+            let _guard = self.base_mut();
+            write_input_props(&props, &cur);
+            for (i, n) in nodes.iter().enumerate() {
+                let Some(n) = n else { continue };
+                if !n.is_instance_valid() {
+                    continue;
+                }
+                let mut n = n.clone();
+                if g.net_tick.get(i).copied().unwrap_or(false) {
+                    n.call(
+                        "_net_tick",
+                        &[
+                            delta.to_variant(),
+                            (tick as i64).to_variant(),
+                            false.to_variant(),
+                        ],
+                    );
+                } else if n.is_physics_processing() && n.has_method("_physics_process") {
+                    n.call("_physics_process", &[delta.to_variant()]);
+                }
+            }
+            out.push((*id, read_hot(&rt, &nodes)));
+        }
+        out
+    }
+
+    /// Emits `rolled_back(from_tick, to_tick)` on the entities' `NetEntity` children and the session.
+    pub fn emit_rolled_back(
+        &mut self,
+        session: &Gd<NetSession>,
+        ids: &[NetId],
+        from_tick: u64,
+        to_tick: u64,
+    ) {
+        let nodes: Vec<Gd<Node>> = ids
+            .iter()
+            .filter_map(|id| self.by_id.get(id))
+            .filter_map(|i| Gd::<Node>::try_from_instance_id(*i).ok())
+            .collect();
+        let (from, to) = (
+            (from_tick as i64).to_variant(),
+            (to_tick as i64).to_variant(),
+        );
+        let mut sobj = session.clone().upcast::<Node>();
+        let _guard = self.base_mut();
+        for n in nodes {
+            if let Some(mut ne) = net_entity_of(&n) {
+                ne.emit_signal("rolled_back", &[from.clone(), to.clone()]);
+            }
+            sobj.emit_signal("rolled_back", &[n.to_variant(), from.clone(), to.clone()]);
+        }
+    }
+
+    /// 2.2 step 5 on an owner (a client): the hot state of every entity it predicts, and the frame it
+    /// sampled for every entity it owns (to send).
+    pub fn record_owned(
+        &mut self,
+        hist: &mut Vec<(NetId, Vec<Value>)>,
+        frames: &mut Vec<(NetId, InputFrame)>,
+    ) {
+        if !self.online || self.is_server {
+            return;
+        }
+        let mut work = Vec::new();
+        for iid in &self.order {
+            let Some(e) = self.entries.get(iid) else {
+                continue;
+            };
+            let Some(id) = e.id else { continue };
+            if e.owner != self.local_id || e.origin == Origin::Local {
+                continue;
+            }
+            work.push((
+                id,
+                e.predicted.is_some(),
+                e.props.clone(),
+                e.nodes.clone(),
+                e.input.clone(),
+            ));
+        }
+        let _guard = self.base_mut();
+        for (id, predicted, rt, nodes, inp) in work {
+            if predicted {
+                if let Some(rt) = rt {
+                    hist.push((id, read_hot(&rt, &nodes)));
+                }
+            }
+            if let Some(mut inp) = inp {
+                if let Some(f) = inp.bind_mut().take_sample() {
+                    frames.push((id, f.canonical()));
+                }
+            }
+        }
+    }
+
+    /// The entities this peer predicts (netcore tracks them).
+    pub fn predicted_ids(&self) -> Vec<NetId> {
+        self.order
+            .iter()
+            .filter_map(|i| self.entries.get(i))
+            .filter(|e| e.predicted.is_some())
+            .filter_map(|e| e.id)
+            .collect()
+    }
+
+    /// The `NetInput` of the entity rooted at `root` (None before it is spawned).
+    pub fn input_of(&self, root: &Gd<Node>) -> Option<Gd<NetInput>> {
+        self.entries.get(&root.instance_id())?.input.clone()
+    }
+}
+
+/// Every hot field of every part, in (part, field) order (netcore's `Prediction::hot_fields`).
+fn read_hot(rt: &RuntimeProps, nodes: &[Option<Gd<Node>>]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (p, hot) in rt.hot.iter().enumerate() {
+        for &f in hot {
+            out.push(match nodes.get(p) {
+                Some(Some(n)) if n.is_instance_valid() => {
+                    apply::read(n, &rt.fields[p][usize::from(f)])
+                }
+                _ => Value::Nil,
+            });
+        }
+    }
+    out
+}
+
+fn read_hot_indexed(rt: &RuntimeProps, nodes: &[Option<Gd<Node>>]) -> Vec<(u16, u16, Value)> {
+    let mut out = Vec::new();
+    for (p, hot) in rt.hot.iter().enumerate() {
+        for &f in hot {
+            if let Some(Some(n)) = nodes.get(p) {
+                out.push((p as u16, f, apply::read(n, &rt.fields[p][usize::from(f)])));
+            }
+        }
+    }
+    out
+}
+
+/// `NetEntity.input_properties` resolved against `root`: (node, property, wire hash of the path).
+fn input_props_of(root: &Gd<Node>, paths: &Array<NodePath>) -> Vec<(Gd<Node>, StringName, u32)> {
+    let mut out = Vec::new();
+    for p in paths.iter_shared() {
+        let text = p.to_string();
+        let (node_path, prop) = match text.rsplit_once(':') {
+            Some((n, prop)) => (if n.is_empty() { "." } else { n }, prop),
+            None => (".", text.as_str()),
+        };
+        let Some(node) = root.get_node_or_null(node_path) else {
+            godot_error!(
+                "gdnet: input property {text} of {} names no node",
+                root.get_path()
+            );
+            continue;
+        };
+        out.push((node, StringName::from(prop), name_hash(&text)));
+    }
+    out
+}
+
+/// Writes the frame's values of `input_properties` to their nodes (the server, a replay, a delayed
+/// owner).
+fn write_input_props(props: &[(Gd<Node>, StringName, u32)], frame: &InputFrame) {
+    for (n, p, h) in props {
+        if let Some(v) = frame.get(*h) {
+            if n.is_instance_valid() {
+                let mut n = n.clone();
+                n.set(p, &net_input::from_input_value(v));
+            }
         }
     }
 }

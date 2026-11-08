@@ -231,11 +231,17 @@ impl PropDesc {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenePropsTable {
     pub parts: Vec<Vec<PropDesc>>,
+    /// WP4: the input actions of the scene's entities, in index order (an input frame's pressed bits
+    /// index this list, so both peers must agree on it). Empty when no input is replicated.
+    pub inputs: Vec<String>,
 }
 
 impl ScenePropsTable {
     pub fn new(parts: Vec<Vec<PropDesc>>) -> Self {
-        Self { parts }
+        Self {
+            parts,
+            inputs: Vec::new(),
+        }
     }
 
     /// The flat index of each part's first field, plus the total at the end.
@@ -270,6 +276,14 @@ impl ScenePropsTable {
             }
             bytes.push(0xff);
         }
+        // WP4: tables without input actions hash as before.
+        if !self.inputs.is_empty() {
+            bytes.extend_from_slice(b"inputs");
+            for a in &self.inputs {
+                bytes.extend_from_slice(a.as_bytes());
+                bytes.push(0);
+            }
+        }
         fnv1a64(&bytes)
     }
 
@@ -287,6 +301,13 @@ impl ScenePropsTable {
             return None;
         }
         let head = std::format!("protocol mismatch: the property table of scene {scene} differs");
+        if self.parts == theirs.parts && self.inputs != theirs.inputs {
+            return Some(std::format!(
+                "{head} in its input actions ({local_label} [{}]; {remote_label} [{}]); every peer must have the same InputMap actions and input_actions settings",
+                self.inputs.join(", "),
+                theirs.inputs.join(", ")
+            ));
+        }
         let n = self.parts.len().max(theirs.parts.len());
         for i in 0..n {
             let (a, b) = (self.parts.get(i), theirs.parts.get(i));
@@ -431,6 +452,24 @@ mod tests {
         c.parts[2].clear();
         let r = a.diff(&c, "s", &name, "client", "server").unwrap();
         assert!(r.contains("property text (missing on the server)"), "{r}");
+    }
+
+    #[test]
+    fn input_actions_are_part_of_the_table() {
+        let a = table();
+        let h = a.hash();
+        let mut b = table();
+        b.inputs = std::vec!["left".into(), "right".into()];
+        assert_ne!(b.hash(), h);
+        let name = |_: usize| ".".to_string();
+        let mut c = b.clone();
+        c.inputs.swap(0, 1);
+        let r = b.diff(&c, "s", &name, "client", "server").unwrap();
+        assert!(
+            r.contains("input actions (client [left, right]; server [right, left])"),
+            "{r}"
+        );
+        assert_eq!(b.diff(&b.clone(), "s", &name, "a", "b"), None);
     }
 
     #[test]

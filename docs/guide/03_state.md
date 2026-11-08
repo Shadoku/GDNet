@@ -7,7 +7,7 @@ properties, quantisation, the bandwidth budget, and the two ways to correct the 
 (`Net.configure()` and a `NetEntity` node).
 
 What is not here yet: replicas **snap** to the latest value; smooth interpolation is WP5. Client input and
-prediction (`Net.input(self)`) are WP4. Client-owned state (a client moving its own entity and the server
+prediction (`Net.input(self)`) are in [04_prediction.md](04_prediction.md). Client-owned state (a client moving its own entity and the server
 accepting it) is WP7: for now the server is the only source of state, and a client's own spawn
 (`spawn_policy = owner_allowed`) keeps its local state.
 

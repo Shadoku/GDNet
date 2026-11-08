@@ -10,6 +10,8 @@
 //! `Time` state machine). WP2: [`entity`] (the entity table, id ranges, part tables, `EntityAction`).
 //! WP3: [`props`] (property tables), [`quant`] (bit packing, quantisers), [`snapshot`] (the snapshot
 //! format), [`priority`] (accumulator and budget), [`delta`] (dirty tracking, acked baselines, packing).
+//! WP4: [`input`] (input frames, redundancy, the server's input buffer, adaptive delay), [`predict`]
+//! (prediction histories, mismatch detection, rollback requests, the tick lead).
 
 #![forbid(unsafe_code)]
 
@@ -17,7 +19,9 @@ pub mod clock;
 pub mod delta;
 pub mod emul;
 pub mod entity;
+pub mod input;
 pub mod peers;
+pub mod predict;
 pub mod priority;
 pub mod props;
 pub mod quant;
@@ -31,7 +35,9 @@ pub use entity::{
     CreateAction, EntityAction, EntityRecord, EntityTable, NetId, ParentRef, PartTable,
     MANAGER_ROOT,
 };
+pub use input::{InputFrame, InputMsg, TakenFrame};
 pub use peers::{PeerId, SERVER};
+pub use predict::{Policy, Rollback};
 pub use props::{PropDesc, Quant, ScenePropsTable, Schedule, TypeTag, Value};
 pub use session::{EntityEvent, Event, Outgoing, Role, Session, SessionConfig, Spawn};
 pub use wire::{Channel, Reliability};

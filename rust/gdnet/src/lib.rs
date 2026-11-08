@@ -11,13 +11,16 @@ mod configure;
 mod emulation;
 mod entity_node;
 mod infer;
+mod input;
 mod manager;
 mod net;
 mod parts;
 mod pipe_peer;
 mod poll;
 mod profiles;
+mod replay;
 mod session;
+mod tick;
 mod version;
 
 struct GdNetExtension;

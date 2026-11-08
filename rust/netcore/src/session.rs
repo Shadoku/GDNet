@@ -24,7 +24,9 @@ use crate::emul::{EmulSettings, Emulator};
 use crate::entity::{
     CreateAction, EntityAction, EntityRecord, EntityTable, HeldQueue, IdAllocator, NetId, ParentRef,
 };
+use crate::input::{self, AdaptiveDelay, InputBuffer, InputFrame, OwnerInputs, TakenFrame};
 use crate::peers::{PeerId, PeerTable, Stage, SERVER};
+use crate::predict::{self, Policy, PredictStats, Prediction, Rollback};
 use crate::props::{ScenePropsTable, Value};
 use crate::wire::{
     self, Hello, IdRange, Message, Ping, Pong, Protocol, Reject, Reliability, Welcome,
@@ -114,6 +116,8 @@ pub struct SessionConfig {
     /// An entity action waiting this many ticks for an entity it names is reported as an
     /// `EntityError` (it keeps waiting). 0 = five seconds.
     pub held_timeout_ticks: u32,
+    /// WP4: ticks of prediction history per owned entity (D8: 20).
+    pub max_rollback_ticks: u32,
 }
 
 impl SessionConfig {
@@ -125,6 +129,7 @@ impl SessionConfig {
             protocol_salt: 0,
             ping_interval_ticks: 0,
             held_timeout_ticks: 0,
+            max_rollback_ticks: predict::DEFAULT_MAX_ROLLBACK,
         }
     }
 }
@@ -179,6 +184,34 @@ pub struct Session {
     remote_props: BTreeMap<(PeerId, u64), ScenePropsTable>,
     /// WP3: part names (paths) per scene hash, for mismatch reasons.
     part_names: BTreeMap<u64, Vec<String>>,
+    /// WP4: received state for gdnet (snapshot values minus the hot fields of predicted entities).
+    pass_updates: VecDeque<StateUpdate>,
+    /// WP4 owner side: prediction histories and the confirmed mirror.
+    prediction: Prediction,
+    /// WP4 owner side: the frames this peer sampled, by entity and tick.
+    owner_inputs: OwnerInputs,
+    /// WP4 server side: frames received per client-owned entity.
+    input_buffers: BTreeMap<NetId, InputBuffer>,
+    /// WP4 server side: the frame each client-owned entity uses this tick.
+    server_inputs: BTreeMap<NetId, TakenFrame>,
+    /// WP4: the client's prediction lead in ticks (None until the round trip is known).
+    lead: Option<i64>,
+    input_delay: u32,
+    adaptive: Option<AdaptiveDelay>,
+    interaction: bool,
+    input_stats: InputStats,
+}
+
+/// WP4 input counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InputStats {
+    pub messages_sent: u64,
+    pub messages_received: u64,
+    pub frames_received: u64,
+    /// Ticks the server repeated a client's last frame because the frame for the tick was missing.
+    pub repeated: u64,
+    /// Frames dropped because the sender does not own the entity.
+    pub refused: u64,
 }
 
 /// The default snapshot budget per peer (2.7, D8).
@@ -245,6 +278,16 @@ impl Session {
             },
             remote_props: BTreeMap::new(),
             part_names: BTreeMap::new(),
+            pass_updates: VecDeque::new(),
+            prediction: Prediction::new(cfg.max_rollback_ticks),
+            owner_inputs: OwnerInputs::new(u64::from(cfg.max_rollback_ticks) + 16),
+            input_buffers: BTreeMap::new(),
+            server_inputs: BTreeMap::new(),
+            lead: None,
+            input_delay: 0,
+            adaptive: None,
+            interaction: false,
+            input_stats: InputStats::default(),
         }
     }
 
@@ -474,13 +517,22 @@ impl Session {
             Message::Entity(a) => self.on_entity(peer, a, now_us),
             Message::Snapshot(body) if self.role == Role::Client && peer == SERVER => {
                 let entities = &self.entities;
-                self.repl
+                let applied = self
+                    .repl
                     .on_snapshot(&body, &|id| entities.get(id).map(|r| r.scene));
+                self.route_updates();
+                if let Some(t) = applied {
+                    self.prediction.mark_confirmed(t);
+                }
             }
             Message::Field(f) if self.role == Role::Client && peer == SERVER => {
                 let entities = &self.entities;
                 self.repl
                     .on_field(f, &|id| entities.get(id).map(|r| r.scene));
+                self.route_updates();
+            }
+            Message::Input(body) if self.role == Role::Server && self.peers.is_joined(peer) => {
+                self.on_input(peer, &body, tick);
             }
             Message::Ack(a) if self.role == Role::Server && self.peers.is_joined(peer) => {
                 self.repl.on_ack(peer, a, tick);
@@ -640,6 +692,7 @@ impl Session {
                 reason: String::from("handshake rejected"),
             });
         }
+        self.input_tick(tick);
         self.flush_emulated(now_us);
     }
 
@@ -910,6 +963,7 @@ impl Session {
         for r in &removed {
             self.repl.remove_entity(r.id);
             self.repl.forget_received(r.id);
+            self.forget_input(r.id);
         }
         if !removed.is_empty() {
             self.share(EntityAction::Destroy { id }, None, now_us);
@@ -931,6 +985,9 @@ impl Session {
         if self.role != Role::Server || !self.entities.set_owner(id, owner) {
             return false;
         }
+        // A new owner starts a new input stream.
+        self.input_buffers.remove(&id);
+        self.server_inputs.remove(&id);
         self.share(EntityAction::SetOwner { id, owner }, None, now_us);
         true
     }
@@ -1118,6 +1175,7 @@ impl Session {
                 for r in &removed {
                     self.repl.remove_entity(r.id);
                     self.repl.forget_received(r.id);
+                    self.forget_input(r.id);
                 }
                 let n = removed.len();
                 for (i, record) in removed.into_iter().enumerate() {
@@ -1244,9 +1302,12 @@ impl Session {
         self.repl.decode_state(scene, bytes)
     }
 
-    /// The property values snapshots delivered since the last call, in arrival order.
+    /// The property values snapshots delivered since the last call, in arrival order. WP4: the hot
+    /// fields of entities this side predicts are not among them (they go to the prediction's
+    /// confirmed mirror; see [`Session::take_rollback`]).
     pub fn drain_state_updates(&mut self) -> Vec<StateUpdate> {
-        self.repl.drain_updates()
+        self.route_updates();
+        self.pass_updates.drain(..).collect()
     }
 
     pub fn set_entity_priority(&mut self, id: NetId, priority: f32) {
@@ -1286,6 +1347,10 @@ impl Session {
                 if let Some(ack) = self.repl.take_ack() {
                     self.send(SERVER, &Message::Ack(ack), now_us);
                 }
+                if let Some(msg) = self.owner_inputs.take_msg() {
+                    self.input_stats.messages_sent += 1;
+                    self.send(SERVER, &Message::Input(input::encode_msg(&msg)), now_us);
+                }
             }
             Role::Server => {
                 let tick = self.clock.tick();
@@ -1314,6 +1379,228 @@ impl Session {
                 }
             }
         }
+    }
+}
+
+/// Input and prediction (WP4, docs/PLAN_NETCODE.md 2.1 "Input", 2.5).
+///
+/// The tick mapping: a client predicts the server's future. Its local tick follows the server's (set at
+/// `Welcome`, the offset estimated by `Time`); the *predicted tick* is `local tick + lead`, where the lead
+/// covers half the round trip plus jitter and a margin ([`predict::lead_target`]). The owner simulates
+/// predicted tick P at its local tick, records its hot state for P, and stamps the frame it samples at
+/// that moment with `P + input_delay`, so the frame reaches the server before the server simulates that
+/// tick. A snapshot of server tick T is then compared with the owner's history at T. On the server the
+/// predicted tick is its own tick.
+impl Session {
+    fn route_updates(&mut self) {
+        while let Some(u) = self.repl.poll_update() {
+            if self.prediction.diverts(u.id, u.part, u.field) {
+                self.prediction
+                    .confirm(u.id, u.part, u.field, u.value, u.tick);
+            } else {
+                self.pass_updates.push_back(u);
+            }
+        }
+    }
+
+    fn forget_input(&mut self, id: NetId) {
+        self.prediction.untrack(id);
+        self.owner_inputs.forget(id);
+        self.input_buffers.remove(&id);
+        self.server_inputs.remove(&id);
+    }
+
+    fn on_input(&mut self, peer: PeerId, body: &[u8], now_tick: u64) {
+        let Some(msg) = input::decode_msg(body) else {
+            self.stats.decode_errors += 1;
+            return;
+        };
+        self.input_stats.messages_received += 1;
+        for (id, frames) in msg.entities {
+            if self.entities.get(id).is_none_or(|r| r.owner != peer) {
+                self.input_stats.refused += 1;
+                continue;
+            }
+            let buf = self.input_buffers.entry(id).or_default();
+            for (k, f) in frames.into_iter().enumerate() {
+                let Some(t) = msg.tick.checked_sub(k as u64) else {
+                    break;
+                };
+                self.input_stats.frames_received += 1;
+                buf.insert(t, f, now_tick);
+            }
+        }
+    }
+
+    /// Per tick: the server takes this tick's frame for every client-owned entity; a client updates its
+    /// lead and the adaptive delay.
+    fn input_tick(&mut self, tick: u64) {
+        match self.role {
+            Role::Server => {
+                self.server_inputs.clear();
+                let owned: Vec<NetId> = self
+                    .entities
+                    .iter()
+                    .filter(|r| r.owner != SERVER && r.owner != 0)
+                    .map(|r| r.id)
+                    .collect();
+                self.input_buffers.retain(|id, _| owned.contains(id));
+                for id in owned {
+                    let taken = self.input_buffers.entry(id).or_default().take(tick);
+                    if taken.repeated {
+                        self.input_stats.repeated += 1;
+                    }
+                    self.server_inputs.insert(id, taken);
+                }
+            }
+            Role::Client => {
+                let tick_ms = self.clock.tick_us() / 1000.0;
+                let Some(state) = self.peers.get(SERVER) else {
+                    return;
+                };
+                let (Some(rtt), Some(jitter)) = (state.rtt.rtt_ms(), state.rtt.jitter_ms()) else {
+                    return;
+                };
+                let rtt_ticks = rtt / tick_ms;
+                let target = predict::lead_target(self.clock.offset(), rtt_ticks, jitter / tick_ms);
+                self.lead = Some(predict::next_lead(self.lead, target));
+                let interacting = self.interaction;
+                if let Some(a) = self.adaptive.as_mut() {
+                    a.set_interacting(interacting);
+                    a.step((rtt_ticks / 2.0).ceil());
+                }
+            }
+        }
+    }
+
+    /// The server tick this side simulates now: a client's predicted tick, the server's own tick.
+    pub fn predicted_tick(&self) -> u64 {
+        let tick = self.clock.tick();
+        match self.role {
+            Role::Server => tick,
+            Role::Client => {
+                let lead = self.lead.unwrap_or(predict::LEAD_MARGIN as i64);
+                (tick as i64 + lead).max(0) as u64
+            }
+        }
+    }
+
+    /// The client's prediction lead in ticks (0 on the server; None before the round trip is known).
+    pub fn prediction_lead(&self) -> Option<i64> {
+        match self.role {
+            Role::Server => Some(0),
+            Role::Client => self.lead,
+        }
+    }
+
+    /// `Net.input_delay_ticks`: frames sampled now apply this many ticks later.
+    pub fn set_input_delay(&mut self, ticks: u32) {
+        self.input_delay = ticks.min(60);
+    }
+
+    /// `Net.adaptive_delay` (experimental): on adds the adaptive controller.
+    pub fn set_adaptive_delay(&mut self, on: bool) {
+        match (on, self.adaptive.is_some()) {
+            (true, false) => self.adaptive = Some(AdaptiveDelay::default()),
+            (false, true) => self.adaptive = None,
+            _ => {}
+        }
+    }
+
+    /// The hook the adaptive delay ramps on (WP9 and WP14 may drive it): this peer is interacting
+    /// (with a contested object, an opponent). Distinct from [`Session::set_interacting`], which is the
+    /// snapshot priority hook.
+    pub fn set_interaction(&mut self, on: bool) {
+        self.interaction = on;
+    }
+
+    /// The effective input delay in ticks (the fixed delay plus the adaptive part).
+    pub fn input_delay(&self) -> u32 {
+        self.input_delay + self.adaptive.as_ref().map_or(0, AdaptiveDelay::ticks)
+    }
+
+    pub fn adaptive_delay(&self) -> Option<&AdaptiveDelay> {
+        self.adaptive.as_ref()
+    }
+
+    /// The owner sampled `frame` for entity `id` this tick: stored for the tick it applies to
+    /// (`predicted_tick() + input_delay()`, returned) and sent with the next packets.
+    pub fn local_input(&mut self, id: NetId, frame: InputFrame) -> u64 {
+        let t = self.predicted_tick() + u64::from(self.input_delay());
+        self.owner_inputs.store(id, t, frame);
+        t
+    }
+
+    /// The owner's frame of `id` for `tick` (the tick it applies to).
+    pub fn owner_frame(&self, id: NetId, tick: u64) -> Option<&InputFrame> {
+        self.owner_inputs.get(id, tick)
+    }
+
+    /// Server: the frame client-owned entity `id` uses this tick.
+    pub fn server_input(&self, id: NetId) -> Option<&TakenFrame> {
+        self.server_inputs.get(&id)
+    }
+
+    /// Owner: start (or restart with an empty history) predicting `id` under `policy`. `initial`
+    /// seeds the confirmed state (the `Create`'s decoded values). False for an unknown entity or scene.
+    pub fn track_prediction(
+        &mut self,
+        id: NetId,
+        policy: Policy,
+        initial: &[(u16, u16, Value)],
+    ) -> bool {
+        let Some(scene) = self.entities.get(id).map(|r| r.scene) else {
+            return false;
+        };
+        let Some(table) = self.repl.table(scene) else {
+            return false;
+        };
+        let table = table.clone();
+        self.prediction.track(id, &table, policy, initial);
+        true
+    }
+
+    pub fn untrack_prediction(&mut self, id: NetId) {
+        self.prediction.untrack(id);
+        self.owner_inputs.forget(id);
+    }
+
+    pub fn is_predicted(&self, id: NetId) -> bool {
+        self.prediction.is_tracked(id)
+    }
+
+    pub fn set_prediction_policy(&mut self, id: NetId, policy: Policy) {
+        self.prediction.set_policy(id, policy);
+    }
+
+    /// Owner: the hot state of `id` after simulating predicted tick `tick` (values in
+    /// [`Prediction::hot_fields`] order).
+    pub fn record_prediction(&mut self, id: NetId, tick: u64, values: Vec<Value>) {
+        self.prediction.record(id, tick, values);
+    }
+
+    pub fn prediction(&self) -> &Prediction {
+        &self.prediction
+    }
+
+    pub fn set_max_rollback_ticks(&mut self, n: u32) {
+        self.prediction.set_max_ticks(n);
+        self.owner_inputs.set_keep(u64::from(n.max(1)) + 16);
+    }
+
+    /// The rollback the confirmations of this tick ask for, if any (call once per tick, after the
+    /// packets were processed).
+    pub fn take_rollback(&mut self) -> Option<Rollback> {
+        self.route_updates();
+        self.prediction.evaluate()
+    }
+
+    pub fn predict_stats(&self) -> PredictStats {
+        self.prediction.stats.clone()
+    }
+
+    pub fn input_stats(&self) -> InputStats {
+        self.input_stats
     }
 }
 
@@ -2190,5 +2477,289 @@ mod tests {
             }
         }
         assert_eq!(seen, last, "the latest value arrived despite 30% loss");
+    }
+
+    // WP4: input and prediction through the session.
+
+    /// A connected pair with entity `id` of SCENE owned by the client (peer 2), tracked by the client.
+    fn predicted_pair(policy: Policy) -> (Pair, NetId) {
+        let mut p = connected_pair();
+        p.server.register_scene(SCENE, 42);
+        p.server.register_props(SCENE, props(), names());
+        let id = p
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "P", 2, 3, std::vec![]).with_values(state(0.0)),
+                p.now,
+            )
+            .unwrap();
+        p.step();
+        client_registers(&mut p);
+        let ev = entity_events(&mut p.client);
+        let EntityEvent::Create { create, .. } = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        let init = p
+            .client
+            .decode_state(create.scene_hash, &create.initial_state)
+            .unwrap();
+        assert!(p.client.track_prediction(id, policy, &init));
+        (p, id)
+    }
+
+    struct Sim {
+        server_x: f32,
+        client_x: f32,
+        rollbacks: Vec<Rollback>,
+    }
+
+    /// One tick of a "move right while pressed" entity on both sides: the client samples `press`,
+    /// simulates its predicted tick with the frame for it and records; the server simulates with the
+    /// frame it holds for its tick and records. `marker` stamps each frame with its tick.
+    fn sim_step(p: &mut Pair, id: NetId, sim: &mut Sim, press: bool) {
+        p.step();
+        if let Some(r) = p.client.take_rollback() {
+            // Restore and replay like gdnet does.
+            let Value::Vector2([x, _]) = r.entities[0].1[0].2 else {
+                panic!()
+            };
+            sim.client_x = x;
+            let now = p.client.predicted_tick();
+            for t in r.to_tick + 1..now {
+                if p.client.owner_frame(id, t).is_some_and(|f| f.is_pressed(0)) {
+                    sim.client_x += 1.0;
+                }
+                p.client
+                    .record_prediction(id, t, std::vec![Value::Vector2([sim.client_x, 1.0])]);
+            }
+            sim.rollbacks.push(r);
+        }
+        let mut f = InputFrame::new(2);
+        f.set_action(0, press, 1.0);
+        let stamp = p.client.predicted_tick() + u64::from(p.client.input_delay());
+        f.set(input::name_hash("tick"), Value::Int(stamp as i64));
+        let t = p.client.local_input(id, f);
+        assert_eq!(t, stamp);
+        let pt = p.client.predicted_tick();
+        if p.client
+            .owner_frame(id, pt)
+            .is_some_and(|f| f.is_pressed(0))
+        {
+            sim.client_x += 1.0;
+        }
+        p.client
+            .record_prediction(id, pt, std::vec![Value::Vector2([sim.client_x, 1.0])]);
+        let st = p.server.current_tick();
+        if let Some(taken) = p.server.server_input(id) {
+            assert_eq!(taken.tick, st);
+            if !taken.repeated && taken.frame.get(input::name_hash("tick")).is_some() {
+                assert_eq!(
+                    taken.frame.get(input::name_hash("tick")),
+                    Some(&Value::Int(st as i64)),
+                    "the frame lands on the tick it was stamped with"
+                );
+            }
+            if taken.frame.is_pressed(0) {
+                sim.server_x += 1.0;
+            }
+        }
+        p.server
+            .record_part(id, 0, &[(0, Value::Vector2([sim.server_x, 1.0]))]);
+        p.server.send_snapshots(p.now);
+        p.client.send_snapshots(p.now);
+    }
+
+    /// The owner's prediction for the server's current tick equals the server's state.
+    fn assert_converged(p: &Pair, id: NetId, sim: &Sim) {
+        let st = p.server.current_tick();
+        let h = p
+            .client
+            .prediction()
+            .history_at(id, st)
+            .expect("history at the server tick");
+        assert_eq!(
+            h[0].2,
+            Value::Vector2([sim.server_x, 1.0]),
+            "the prediction for tick {st} (lead {:?}, client now {})",
+            p.client.prediction_lead(),
+            sim.client_x
+        );
+    }
+
+    #[test]
+    fn predicted_input_lands_on_the_server_tick_and_converges() {
+        let (mut p, id) = predicted_pair(Policy::Check);
+        let mut sim = Sim {
+            server_x: 0.0,
+            client_x: 0.0,
+            rollbacks: Vec::new(),
+        };
+        for _ in 0..30 {
+            sim_step(&mut p, id, &mut sim, false);
+        }
+        assert!(p.client.prediction_lead().is_some_and(|l| l >= 2));
+        for _ in 0..20 {
+            sim_step(&mut p, id, &mut sim, true);
+        }
+        for _ in 0..20 {
+            sim_step(&mut p, id, &mut sim, false);
+        }
+        assert_eq!(sim.client_x, 20.0, "the owner moved immediately, 20 ticks");
+        assert_eq!(sim.server_x, 20.0, "the server ran the same 20 frames");
+        assert!(sim.rollbacks.is_empty(), "{:?}", sim.rollbacks);
+        assert!(p.client.predict_stats().confirmations > 0);
+        assert_eq!(p.server.input_stats().refused, 0);
+        // Hot fields of a predicted entity never reach gdnet as plain updates.
+        assert!(p
+            .client
+            .drain_state_updates()
+            .iter()
+            .all(|u| u.part != 0 || u.field != 0));
+    }
+
+    #[test]
+    fn a_server_impulse_rolls_back_once_to_its_tick() {
+        let (mut p, id) = predicted_pair(Policy::Check);
+        let mut sim = Sim {
+            server_x: 0.0,
+            client_x: 0.0,
+            rollbacks: Vec::new(),
+        };
+        for _ in 0..30 {
+            sim_step(&mut p, id, &mut sim, true);
+        }
+        assert!(sim.rollbacks.is_empty());
+        sim.server_x += 50.0;
+        let impulse_tick = p.server.current_tick() + 1;
+        for _ in 0..30 {
+            sim_step(&mut p, id, &mut sim, true);
+        }
+        assert_eq!(sim.rollbacks.len(), 1, "{:?}", sim.rollbacks);
+        assert_eq!(sim.rollbacks[0].to_tick, impulse_tick);
+        assert_converged(&p, id, &sim);
+    }
+
+    #[test]
+    fn disabled_entities_get_their_state_and_never_roll_back() {
+        let (mut p, id) = predicted_pair(Policy::Disabled);
+        let mut sim = Sim {
+            server_x: 0.0,
+            client_x: 0.0,
+            rollbacks: Vec::new(),
+        };
+        let mut seen = 0;
+        for i in 0..40 {
+            if i == 20 {
+                sim.server_x += 50.0;
+            }
+            sim_step(&mut p, id, &mut sim, true);
+            seen += p
+                .client
+                .drain_state_updates()
+                .iter()
+                .filter(|u| u.id == id && u.part == 0 && u.field == 0)
+                .count();
+        }
+        assert!(sim.rollbacks.is_empty());
+        assert!(seen > 0, "snapshot values pass through");
+    }
+
+    #[test]
+    fn always_rolls_back_at_every_confirmation() {
+        let (mut p, id) = predicted_pair(Policy::Always);
+        let mut sim = Sim {
+            server_x: 0.0,
+            client_x: 0.0,
+            rollbacks: Vec::new(),
+        };
+        for _ in 0..30 {
+            sim_step(&mut p, id, &mut sim, true);
+        }
+        assert!(sim.rollbacks.len() > 10, "{}", sim.rollbacks.len());
+        assert_converged(&p, id, &sim);
+    }
+
+    #[test]
+    fn delay_shifts_the_applied_tick() {
+        let (mut p, id) = predicted_pair(Policy::Check);
+        p.client.set_input_delay(2);
+        let mut sim = Sim {
+            server_x: 0.0,
+            client_x: 0.0,
+            rollbacks: Vec::new(),
+        };
+        for _ in 0..30 {
+            sim_step(&mut p, id, &mut sim, false);
+        }
+        sim_step(&mut p, id, &mut sim, true);
+        assert_eq!(sim.client_x, 0.0, "a press is not applied on its tick");
+        sim_step(&mut p, id, &mut sim, true);
+        assert_eq!(sim.client_x, 0.0);
+        sim_step(&mut p, id, &mut sim, true);
+        assert_eq!(sim.client_x, 1.0, "two ticks later");
+        for _ in 0..20 {
+            sim_step(&mut p, id, &mut sim, false);
+        }
+        assert_eq!(
+            sim.client_x, sim.server_x,
+            "both stopped after the same presses"
+        );
+        assert!(sim.rollbacks.is_empty(), "{:?}", sim.rollbacks);
+    }
+
+    #[test]
+    fn input_from_a_non_owner_is_refused() {
+        let (mut p, id) = predicted_pair(Policy::Check);
+        p.server.set_owner(id, SERVER, p.now);
+        let mut sim = Sim {
+            server_x: 0.0,
+            client_x: 0.0,
+            rollbacks: Vec::new(),
+        };
+        for _ in 0..5 {
+            sim_step(&mut p, id, &mut sim, true);
+        }
+        assert!(p.server.input_stats().refused > 0);
+        assert!(
+            p.server.server_input(id).is_none(),
+            "a server-owned entity takes no frames"
+        );
+        assert_eq!(sim.server_x, 0.0);
+    }
+
+    #[test]
+    fn a_lost_frame_is_repeated_by_the_server() {
+        let mut p = connected_pair();
+        p.server.register_scene(SCENE, 42);
+        p.server.register_props(SCENE, props(), names());
+        let id = p
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "P", 2, 3, std::vec![]).with_values(state(0.0)),
+                p.now,
+            )
+            .unwrap();
+        // No input ever arrives: every tick repeats (an empty frame).
+        for _ in 0..4 {
+            p.step();
+        }
+        let t = p.server.server_input(id).unwrap();
+        assert!(t.repeated);
+        assert!(p.server.input_stats().repeated >= 4);
+    }
+
+    #[test]
+    fn adaptive_delay_ramps_only_while_interacting() {
+        let mut c = Session::client(SessionConfig::new(60));
+        c.set_adaptive_delay(true);
+        assert_eq!(c.input_delay(), 0);
+        c.set_input_delay(1);
+        assert_eq!(c.input_delay(), 1);
+        assert!(c.adaptive_delay().is_some_and(|a| !a.is_interacting()));
+        c.set_interaction(true);
+        c.set_adaptive_delay(false);
+        assert!(c.adaptive_delay().is_none());
     }
 }

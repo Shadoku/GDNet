@@ -210,6 +210,11 @@ fn make_desc(name: &str, tag: TypeTag, entry: Option<&Entry>, tick_rate: u32) ->
             | TypeTag::Color
     );
     d.interpolate = entry.and_then(|e| e.interpolate).unwrap_or(hot && numeric);
+    // WP4: the prediction tolerance. Positions and vectors 1 mm in the quantiser's units (0.001), a
+    // float 1e-4; other types compare exactly whatever the number (predict.rs `within`).
+    if tag == TypeTag::Float {
+        d.tolerance = 1e-4;
+    }
     if let Some(t) = entry.and_then(|e| e.tolerance) {
         d.tolerance = t;
     }

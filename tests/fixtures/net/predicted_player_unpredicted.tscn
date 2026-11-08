@@ -1,0 +1,20 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/fixtures/net/predicted_player.gd" id="1_player"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_body"]
+size = Vector2(16, 16)
+
+[node name="Player" type="CharacterBody2D"]
+collision_layer = 0
+collision_mask = 0
+script = ExtResource("1_player")
+
+[node name="Shape" type="CollisionShape2D" parent="."]
+shape = SubResource("RectangleShape2D_body")
+
+[node name="Steps" type="AudioStreamPlayer" parent="."]
+
+[node name="NetEntity" type="NetEntity" parent="."]
+inherit_profile = true
+predict = 2

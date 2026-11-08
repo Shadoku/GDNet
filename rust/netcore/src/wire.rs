@@ -107,6 +107,8 @@ pub enum Message {
     Ack(Ack),
     /// WP3: one field sent reliably.
     Field(FieldMsg),
+    /// WP4: input frames, bit-packed (see input.rs; not postcard).
+    Input(Vec<u8>),
 }
 
 /// The kind bytes. 0 is never used, so a zeroed buffer is not a message.
@@ -120,13 +122,14 @@ pub mod kind {
     pub const SNAPSHOT: u8 = 7;
     pub const ACK: u8 = 8;
     pub const FIELD: u8 = 9;
+    pub const INPUT: u8 = 10;
 }
 
 /// The channel a message of kind `k` travels on (for byte counters of received packets).
 pub fn channel_of_kind(k: u8) -> Channel {
     match k {
         kind::PING | kind::PONG => Channel::Diagnostics,
-        kind::SNAPSHOT | kind::ACK => Channel::Unreliable,
+        kind::SNAPSHOT | kind::ACK | kind::INPUT => Channel::Unreliable,
         _ => Channel::Reliable,
     }
 }
@@ -161,6 +164,7 @@ impl Message {
             Message::Snapshot(_) => kind::SNAPSHOT,
             Message::Ack(_) => kind::ACK,
             Message::Field(_) => kind::FIELD,
+            Message::Input(_) => kind::INPUT,
         }
     }
 
@@ -172,7 +176,7 @@ impl Message {
             | Message::Reject(_)
             | Message::Entity(_)
             | Message::Field(_) => Channel::Reliable,
-            Message::Snapshot(_) | Message::Ack(_) => Channel::Unreliable,
+            Message::Snapshot(_) | Message::Ack(_) | Message::Input(_) => Channel::Unreliable,
             Message::Ping(_) | Message::Pong(_) => Channel::Diagnostics,
         }
     }
@@ -202,6 +206,12 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         }
         Message::Ack(m) => body(kind::ACK, m),
         Message::Field(m) => body(kind::FIELD, m),
+        Message::Input(b) => {
+            let mut out = Vec::with_capacity(b.len() + 1);
+            out.push(kind::INPUT);
+            out.extend_from_slice(b);
+            out
+        }
     }
 }
 
@@ -222,6 +232,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         kind::SNAPSHOT => Message::Snapshot(rest.to_vec()),
         kind::ACK => Message::Ack(parse(k, rest)?),
         kind::FIELD => Message::Field(parse(k, rest)?),
+        kind::INPUT => Message::Input(rest.to_vec()),
         other => return Err(WireError::UnknownKind(other)),
     })
 }
@@ -406,9 +417,13 @@ mod tests {
                 hash: 9,
                 path: "res://a.tscn".into(),
                 parts_hash: 77,
-                props: crate::props::ScenePropsTable::new(std::vec![std::vec![
-                    crate::props::PropDesc::new("position", crate::props::TypeTag::Vector2)
-                ]]),
+                props: crate::props::ScenePropsTable {
+                    parts: std::vec![std::vec![crate::props::PropDesc::new(
+                        "position",
+                        crate::props::TypeTag::Vector2
+                    )]],
+                    inputs: std::vec!["jump".into()],
+                },
             },
             EntityAction::Create(CreateAction {
                 id: 65_537,
@@ -440,6 +455,9 @@ mod tests {
             bits: 9,
             data: std::vec![1, 2],
         }));
+        roundtrip(Message::Input(std::vec![4, 5]));
+        assert_eq!(Message::Input(Vec::new()).channel(), Channel::Unreliable);
+        assert_eq!(channel_of_kind(kind::INPUT), Channel::Unreliable);
         assert_eq!(channel_of_kind(kind::SNAPSHOT), Channel::Unreliable);
         assert_eq!(channel_of_kind(kind::FIELD), Channel::Reliable);
         assert_eq!(channel_of_kind(kind::PONG), Channel::Diagnostics);

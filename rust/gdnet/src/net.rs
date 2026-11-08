@@ -20,15 +20,21 @@
 //! project settings `gdnet/sync/cold_poll_ticks`, `gdnet/budget/bytes_per_second`). Sessions read them
 //! when they start. `Net` is a `tool` class: it is created in the editor too (the singleton is registered
 //! at the scene init stage), which gdext's v0.6 placeholder migration requires to be explicit.
+//!
+//! WP4: `input(node)` (the entity's `NetInput`, input.rs), `is_fresh()` (tick.rs), the properties
+//! `input_delay_ticks` and `adaptive_delay`, the signal `rolled_back(node, from_tick, to_tick)` (relayed
+//! from the default session) and `global_input_warnings()`.
 
 use crate::configure::{self, Op};
 use crate::emulation::NetEmulation;
+use crate::input::NetInput;
 use crate::manager::{
     entity_root_of, net_entity_of, NetManager, LOCAL_GROUP, META_OWNER, META_PRIORITY,
 };
 use crate::pipe_peer::NetPipePeer;
 use crate::profiles::{self, NetProfiles};
 use crate::session::{tick_rate, NetSession};
+use crate::tick;
 use godot::classes::node::InternalMode;
 use godot::classes::{ENetMultiplayerPeer, Engine, MultiplayerPeer, Node, PackedScene, SceneTree};
 use godot::global::Error;
@@ -54,7 +60,7 @@ fn scene_root_of(node: &Gd<Node>) -> Gd<Node> {
     node.clone()
 }
 
-const RELAYED: [(&str, &str); 8] = [
+const RELAYED: [(&str, &str); 9] = [
     ("peer_joined", "_on_peer_joined"),
     ("peer_left", "_on_peer_left"),
     ("connected", "_on_connected"),
@@ -63,6 +69,7 @@ const RELAYED: [(&str, &str); 8] = [
     ("entity_spawned", "_on_entity_spawned"),
     ("entity_despawning", "_on_entity_despawning"),
     ("spawn_refused", "_on_spawn_refused"),
+    ("rolled_back", "_on_rolled_back"),
 ];
 
 #[derive(GodotClass)]
@@ -91,6 +98,14 @@ pub struct Net {
     /// Snapshot bytes per second per peer (0 = `gdnet/budget/bytes_per_second`, default 32,768).
     #[var(get = get_budget_bytes_per_s, set = set_budget_bytes_per_s)]
     budget_bytes_per_s: i64,
+    /// WP4: owners apply the input they sample this many ticks later (and stamp it accordingly), which
+    /// trades responsiveness for fewer rollbacks. Default 0; applies to every session at once.
+    #[var(get = get_input_delay_ticks, set = set_input_delay_ticks)]
+    input_delay_ticks: i64,
+    /// WP4, experimental (D10): ramps extra input delay in while an interaction is flagged and back out
+    /// afterwards. Default off.
+    #[var(get = get_adaptive_delay, set = set_adaptive_delay)]
+    adaptive_delay: bool,
 }
 
 #[godot_api]
@@ -136,6 +151,54 @@ impl Net {
     fn set_budget_bytes_per_s(&mut self, v: i64) {
         self.budget_bytes_per_s = v.max(0);
         profiles::set_budget((v > 0).then_some(v as u32));
+    }
+
+    #[func]
+    fn get_input_delay_ticks(&self) -> i64 {
+        i64::from(tick::input_delay())
+    }
+
+    #[func]
+    fn set_input_delay_ticks(&mut self, v: i64) {
+        self.input_delay_ticks = v.clamp(0, 60);
+        tick::set_input_delay(self.input_delay_ticks as u32);
+    }
+
+    #[func]
+    fn get_adaptive_delay(&self) -> bool {
+        tick::adaptive_delay()
+    }
+
+    #[func]
+    fn set_adaptive_delay(&mut self, v: bool) {
+        self.adaptive_delay = v;
+        tick::set_adaptive_delay(v);
+    }
+
+    /// The input of the entity `node` belongs to (rung 1): on its owner the frame sampled for this tick,
+    /// on the server the frame the owner sent for this tick, and for an entity the server owns (or
+    /// offline, or an unmanaged node) the real `Input`. Use it instead of `Input` in `_physics_process`.
+    #[func]
+    fn input(&self, node: Gd<Node>) -> Gd<NetInput> {
+        entity_root_of(&node)
+            .and_then(|(root, m)| m.bind().input_of(&root))
+            .unwrap_or_else(NetInput::new_live)
+    }
+
+    /// False while gdnet replays ticks after a rollback (the same `_physics_process` runs again for ticks
+    /// already shown); true otherwise. Guard one-shot effects (sounds, particles) with it.
+    #[func]
+    fn is_fresh(&self) -> bool {
+        tick::is_fresh()
+    }
+
+    /// The scripts the global-`Input` check warned about so far (D14), for tools and tests.
+    #[func]
+    fn global_input_warnings(&self) -> PackedStringArray {
+        tick::warned_scripts()
+            .iter()
+            .map(|s| GString::from(s.as_str()))
+            .collect()
     }
 
     /// Corrects what the entity `node` belongs to replicates (rung 3): `state: ["+prop", "-prop"]`,
@@ -270,6 +333,10 @@ impl Net {
     fn entity_despawning(node: Gd<Node>);
     #[signal]
     fn spawn_refused(node: Gd<Node>);
+    /// WP4: an entity this peer predicts was restored to the server's state at `to_tick` and replayed
+    /// up to `from_tick` (relayed from the default session).
+    #[signal]
+    fn rolled_back(node: Gd<Node>, from_tick: i64, to_tick: i64);
 
     /// Enrols `node`'s subtree as if `node` were a `NetManager` (its scene instances become entities).
     /// For nodes outside any manager; call it on every peer, at the same path, before spawning under it.
@@ -531,6 +598,18 @@ impl Net {
     fn _on_entity_despawning(&mut self, node: Gd<Node>) {
         self.base_mut()
             .emit_signal("entity_despawning", &[node.to_variant()]);
+    }
+
+    #[func]
+    fn _on_rolled_back(&mut self, node: Gd<Node>, from_tick: i64, to_tick: i64) {
+        self.base_mut().emit_signal(
+            "rolled_back",
+            &[
+                node.to_variant(),
+                from_tick.to_variant(),
+                to_tick.to_variant(),
+            ],
+        );
     }
 
     #[func]

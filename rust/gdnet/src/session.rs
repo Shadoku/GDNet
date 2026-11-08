@@ -17,10 +17,12 @@
 
 use crate::api_ext::NetMultiplayerApi;
 use crate::emulation::{settings_of, NetEmulation};
-use crate::manager::{NetManager, MANAGERS_GROUP};
+use crate::manager::{NetManager, TickCtx, MANAGERS_GROUP};
 use crate::pipe_peer::NetPipePeer;
 use crate::poll::{NetPoller, POLLER_NODE};
 use crate::profiles;
+use crate::replay;
+use crate::tick;
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::node::InternalMode;
 use godot::classes::{
@@ -106,6 +108,8 @@ pub struct NetSession {
     debug_perturb_property: GString,
     poller_added: bool,
     stats: Counters,
+    /// WP4: the predicted tick of the previous step (a jump means the lead grew: catch up).
+    last_ptick: Option<u64>,
 }
 
 /// Byte and timing counters behind `stats()` (2.7, the WP8 meter's source).
@@ -122,6 +126,11 @@ struct Counters {
     poll_us_window: u64,
     poll_ms_avg: f64,
     record_calls: u64,
+    /// WP4.
+    rollbacks: u64,
+    replayed_ticks: u64,
+    window_start_rollbacks: u64,
+    rollbacks_per_s: u64,
 }
 
 #[godot_api]
@@ -186,6 +195,10 @@ impl NetSession {
     /// A client-side spawn was refused (spawn policy `server_only`); the node is freed.
     #[signal]
     fn spawn_refused(node: Gd<Node>);
+    /// WP4: the owner restored the entity `node` to the server's state at `to_tick` and replayed it up to
+    /// `from_tick`.
+    #[signal]
+    fn rolled_back(node: Gd<Node>, from_tick: i64, to_tick: i64);
 
     #[func]
     fn get_budget_bytes_per_s(&self) -> i64 {
@@ -227,7 +240,11 @@ impl NetSession {
     /// `budget_bytes_per_s`, `cold_poll_ticks`, and netcore's snapshot counters (`snapshots_sent`,
     /// `snapshot_bytes`, `snapshot_entities_sent`, `snapshot_fields_sent`, `reliable_fields_sent`,
     /// `snapshots_received`, `snapshots_stale`, `snapshots_unacked`, `fields_received`, `fallbacks`,
-    /// `changes`).
+    /// `changes`). WP4: `rollbacks` (total), `rollbacks_per_s` (the last full second),
+    /// `replayed_ticks`, `inputs_repeated` (server: ticks a client's last frame was repeated),
+    /// `input_frames_received`, `input_messages_sent`, `prediction_confirmations`,
+    /// `prediction_mismatches`, `prediction_stale`, `prediction_lead` (ticks; -1 unknown),
+    /// `input_delay` (effective ticks), `predicted_tick`.
     #[func]
     pub fn stats(&self) -> VarDictionary {
         let c = &self.stats;
@@ -255,7 +272,21 @@ impl NetSession {
             d.set("fields_received", r.fields_received as i64);
             d.set("fallbacks", r.fallbacks as i64);
             d.set("changes", r.changes as i64);
+            let i = core.input_stats();
+            let p = core.predict_stats();
+            d.set("inputs_repeated", i.repeated as i64);
+            d.set("input_frames_received", i.frames_received as i64);
+            d.set("input_messages_sent", i.messages_sent as i64);
+            d.set("prediction_confirmations", p.confirmations as i64);
+            d.set("prediction_mismatches", p.mismatches as i64);
+            d.set("prediction_stale", p.stale as i64);
+            d.set("prediction_lead", core.prediction_lead().unwrap_or(-1));
+            d.set("input_delay", i64::from(core.input_delay()));
+            d.set("predicted_tick", core.predicted_tick() as i64);
         }
+        d.set("rollbacks", c.rollbacks as i64);
+        d.set("rollbacks_per_s", c.rollbacks_per_s as i64);
+        d.set("replayed_ticks", c.replayed_ticks as i64);
         d
     }
 
@@ -373,6 +404,7 @@ impl NetSession {
         cfg.protocol_salt = self.debug_protocol_salt as u64;
         cfg.profiles_hash = profiles::global_profiles().hash();
         cfg.budget_bytes_per_s = self.effective_budget();
+        cfg.max_rollback_ticks = tick::max_rollback_ticks(cfg.tick_rate);
         let hosting = peer.get_unique_id() == 1;
         let mut core = if hosting {
             Session::server(cfg)
@@ -395,6 +427,7 @@ impl NetSession {
         self.inbox.clear();
         self.applied = None;
         self.stats = Counters::default();
+        self.last_ptick = None;
         self.apply_emulation();
         self.base_mut().set_physics_process(true);
         Error::OK
@@ -575,6 +608,7 @@ impl NetSession {
             core.tick(now);
         }
         self.sync_managers();
+        self.input_step();
         let (events, tick) = {
             let Some(core) = self.core.as_mut() else {
                 return;
@@ -650,6 +684,26 @@ impl NetSession {
             self.stats.poll_us_window += us;
             self.stats.record_calls += 1;
         }
+        if !self.is_server() && self.is_connected() {
+            // WP4: the owner records its predicted entities' hot state and queues its sampled frames.
+            let managers = self.managers();
+            let (mut hist, mut frames) = (Vec::new(), Vec::new());
+            {
+                let _guard = self.base_mut();
+                for (_, mut m) in managers {
+                    m.bind_mut().record_owned(&mut hist, &mut frames);
+                }
+            }
+            if let Some(core) = self.core.as_mut() {
+                let p = core.predicted_tick();
+                for (id, values) in hist {
+                    core.record_prediction(id, p, values);
+                }
+                for (id, f) in frames {
+                    core.local_input(id, f);
+                }
+            }
+        }
         let outgoing = match self.core.as_mut() {
             Some(core) => {
                 core.send_snapshots(now);
@@ -703,6 +757,8 @@ impl NetSession {
             }
             c.window_start_sent = c.sent;
             c.window_start_received = c.received;
+            c.rollbacks_per_s = c.rollbacks - c.window_start_rollbacks;
+            c.window_start_rollbacks = c.rollbacks;
             c.poll_ms_avg = c.poll_us_window as f64 / 1000.0 / f64::from(c.window_ticks);
             c.poll_us_window = 0;
             c.window_ticks = 0;
@@ -850,6 +906,71 @@ impl NetSession {
             if !sts.is_empty() {
                 m.bind_mut().apply_states(sts);
             }
+        }
+    }
+
+    /// 2.2 steps 2-4 (WP4): who simulates and prediction tracking, then a rollback and its replay when
+    /// netcore asks for one, then this tick's inputs (sampling on owners, received frames on the server,
+    /// `_net_input()`), then `_net_tick` for the parts that define it. The parts' own
+    /// `_physics_process` runs after this node, as the fresh tick.
+    fn input_step(&mut self) {
+        if !self.is_connected() {
+            return;
+        }
+        let managers = self.managers();
+        let ctx = {
+            let Some(core) = self.core.as_mut() else {
+                return;
+            };
+            core.set_input_delay(tick::input_delay());
+            core.set_adaptive_delay(tick::adaptive_delay());
+            TickCtx {
+                is_server: core.role() == netcore::Role::Server,
+                local_id: core.local_id(),
+                tick: core.predicted_tick(),
+                delay0: core.input_delay() == 0,
+                delta: 1.0 / f64::from(core.tick_rate()),
+            }
+        };
+        if managers.is_empty() {
+            return;
+        }
+        let me = self.to_gd();
+        {
+            let _guard = self.base_mut();
+            for (_, m) in &managers {
+                let mut m = m.clone();
+                m.bind_mut().gate_and_track(&me);
+            }
+        }
+        let rollback = self.core.as_mut().and_then(|c| c.take_rollback());
+        // The lead grew: the predicted ticks it skipped are simulated now (a rollback replays them).
+        let catch_up = match (self.last_ptick, &rollback) {
+            (Some(last), None) if !ctx.is_server && ctx.tick > last + 1 => Some(last + 1),
+            _ => None,
+        };
+        self.last_ptick = Some(ctx.tick);
+        let replayed = {
+            let _guard = self.base_mut();
+            let replayed = rollback
+                .as_ref()
+                .map(|rb| replay::rollback(&me, &managers, rb, ctx.tick, ctx.delta));
+            if let Some(from) = catch_up {
+                replay::catch_up(&me, &managers, from, ctx.tick, ctx.delta);
+            }
+            for (_, m) in &managers {
+                let mut m = m.clone();
+                m.bind_mut().prepare_inputs(&me, &ctx);
+            }
+            for (_, m) in &managers {
+                let mut m = m.clone();
+                m.bind_mut().net_ticks(&ctx);
+            }
+            replayed
+        };
+        if let Some(n) = replayed {
+            self.stats.rollbacks += 1;
+            self.stats.replayed_ticks += n;
         }
     }
 

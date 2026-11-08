@@ -7,10 +7,49 @@
 //! `poll_seconds`) replace the inferred profile unless `inherit_profile` is on, which adds them to it;
 //! `priority` scales the entity's share of the snapshot budget; `input_properties` is kept for WP4.
 //!
+//! WP4: `simulate` (who runs the entity's `_physics_process`), `predict` (the owner's reconciliation
+//! policy), `input_actions` (narrows the manager's action list), `input_properties` (properties that
+//! travel in the input frame: read on the owner after `_net_input()`, written on the server before the
+//! tick) and the signal `rolled_back(from_tick, to_tick)`.
+//!
 //! Scripts that extend `NetEntity` may override `_net_spawned(info)` and `_net_despawning()`; scripts on
 //! any other part get the same calls when they define those methods.
 
 use godot::prelude::*;
+
+/// `NetEntity.simulate`: who runs the entity's `_physics_process` (D13).
+#[derive(GodotConvert, Var, Export, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[godot(via = i64)]
+pub enum Simulate {
+    /// The server and the owner; replicas only show the server's state.
+    #[default]
+    OwnerAndServer = 0,
+    /// Every peer (cosmetic local simulations).
+    Everywhere = 1,
+}
+
+/// `NetEntity.predict`: how the owner reconciles its prediction with the server (2.5).
+#[derive(GodotConvert, Var, Export, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[godot(via = i64)]
+pub enum Predict {
+    /// Roll back and replay when a confirmed value differs beyond its tolerance.
+    #[default]
+    Check = 0,
+    /// Roll back and replay at every confirmed tick (debugging).
+    Always = 1,
+    /// No prediction: the owner sends its input and shows the server's state.
+    Disabled = 2,
+}
+
+impl Predict {
+    pub fn policy(self) -> netcore::Policy {
+        match self {
+            Predict::Check => netcore::Policy::Check,
+            Predict::Always => netcore::Policy::Always,
+            Predict::Disabled => netcore::Policy::Disabled,
+        }
+    }
+}
 
 #[derive(GodotClass)]
 #[class(init, base = Node)]
@@ -35,10 +74,23 @@ pub struct NetEntity {
     #[export]
     #[var(pub)]
     state_options: VarDictionary,
-    /// Input properties (used from WP4).
+    /// Properties that travel in the input frame (`prop` or `Part:prop`): read on the owner after
+    /// `_net_input()`, written on the server (and in a replay) before the tick.
     #[export]
     #[var(pub)]
     input_properties: Array<NodePath>,
+    /// Narrows the manager's `input_actions` for this entity (empty: all of them).
+    #[export]
+    #[var(pub)]
+    input_actions: PackedStringArray,
+    /// Who runs `_physics_process`: `owner_and_server` (default) or `everywhere`.
+    #[export]
+    #[var(pub)]
+    simulate: Simulate,
+    /// The owner's reconciliation: `check` (default), `always` or `disabled` (no prediction).
+    #[export]
+    #[var(pub)]
+    predict: Predict,
     /// Scales this entity's share of each peer's snapshot budget (2.7).
     #[export]
     #[var(pub)]
@@ -61,6 +113,11 @@ impl NetEntity {
     /// `is_authority`.
     #[func(virtual)]
     fn net_spawned(&self, _info: VarDictionary) {}
+
+    /// The owner restored this entity to the server's state at `to_tick` and replayed its ticks up to
+    /// `from_tick` (the predicted tick it was at).
+    #[signal]
+    fn rolled_back(from_tick: i64, to_tick: i64);
 
     /// Called on every part of an entity just before it is freed by gdnet (on a client) or when its
     /// despawn is announced (on the authority).
