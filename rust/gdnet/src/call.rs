@@ -60,10 +60,26 @@ impl FromGodot for NetArg {
     }
 }
 
-// SAFETY: the only default value of a `NetArg` parameter is `NetArg::absent()`, a Variant holding an RID
-// (a plain 64-bit value without a reference count), created per call; cloning it is thread-safe and it
-// offers no way to mutate a shared value.
-unsafe impl godot::meta::GodotImmutable for NetArg {}
+// SAFETY: gdext 0.5.5 (`godot-core` `meta/traits.rs`) asks an implementor to be `Copy`, or to have a
+// thread-safe `clone()` whose clones offer no way to mutate the value or race. The trait is used only by
+// `#[opt(default = ...)]` (`private::opt_default_value`), which passes every default through
+// `into_runtime_immutable` before turning it into the Variant Godot stores and copies per call. That
+// method is overridden below to return `NetArg::absent()` whatever it is given, so every `NetArg` that
+// takes this path is a Variant holding the RID sentinel `NO_ARG`: a plain 64-bit value with no reference
+// count, no heap data and no interior mutability, whose Variant copy (`variant_new_copy`) is a bitwise
+// copy. Such a value is independent per instance (as good as `Copy`), so the contract holds. A `NetArg`
+// built from a caller's argument (which may hold an Array or an Object) never goes through this trait.
+// gdext leaves `Rid` and `Variant` out of its own impls for general values; the restriction to one fixed
+// RID that no server ever sees is what makes this impl sound (review 2026-11-08).
+unsafe impl godot::meta::GodotImmutable for NetArg {
+    fn into_runtime_immutable(self) -> Self {
+        debug_assert!(
+            self.is_absent(),
+            "a NetArg default must be NetArg::absent()"
+        );
+        NetArg::absent()
+    }
+}
 
 impl NetArg {
     /// The default of a left-out slot.
