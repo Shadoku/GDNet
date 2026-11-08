@@ -2121,6 +2121,16 @@ impl Session {
         self.repl.set_interacting(peer, id, on);
     }
 
+    /// WP14: the entities marked as interacting with `peer` (server), ascending.
+    pub fn interacting(&self, peer: PeerId) -> Vec<NetId> {
+        self.repl.interacting(peer)
+    }
+
+    /// WP14: how many snapshots carried `id` to `peer` (server).
+    pub fn entity_sends(&self, peer: PeerId, id: NetId) -> u64 {
+        self.repl.sends(peer, id)
+    }
+
     pub fn set_budget(&mut self, bytes_per_s: u32) {
         self.budget_bytes_per_s = bytes_per_s.max(1);
     }
@@ -2159,6 +2169,7 @@ impl Session {
                 let tick = self.clock.tick();
                 let rate = self.tick_rate();
                 let budget = self.budget_bytes_per_s;
+                self.repl.begin_tick();
                 for peer in self.peers.joined() {
                     let entities = &self.entities;
                     let owner_of = |id: NetId| entities.get(id).map(|r| r.owner);

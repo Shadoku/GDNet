@@ -85,6 +85,8 @@ struct PeerEntity {
     sent: Vec<u32>,
     accum: f64,
     interacting: bool,
+    /// WP14: snapshots that carried this entity to the peer (diagnostics).
+    sends: u64,
 }
 
 impl PeerEntity {
@@ -94,6 +96,7 @@ impl PeerEntity {
             sent: std::vec![0; n],
             accum: 0.0,
             interacting: false,
+            sends: 0,
         }
     }
 
@@ -175,6 +178,23 @@ pub struct ReplStats {
     pub decode_errors: u64,
     /// Fields recorded with a new value.
     pub changes: u64,
+    /// WP14 (budget degradation): candidates with pending fields that a snapshot left out entirely
+    /// (the budget or the MTU ran out first), summed over peers and ticks; `_tick` = this tick's.
+    pub deferred_entities: u64,
+    /// WP14: pending fields a snapshot did not carry (left-out entities and the rest of partly sent
+    /// ones).
+    pub deferred_fields: u64,
+    pub deferred_entities_tick: u64,
+    pub deferred_fields_tick: u64,
+}
+
+impl ReplStats {
+    fn defer(&mut self, entities: usize, fields: usize) {
+        self.deferred_entities += entities as u64;
+        self.deferred_fields += fields as u64;
+        self.deferred_entities_tick += entities as u64;
+        self.deferred_fields_tick += fields as u64;
+    }
 }
 
 /// What a snapshot pass produced for one peer.
@@ -512,6 +532,31 @@ impl Replication {
         }
     }
 
+    /// WP14: starts a server tick's snapshot pass (zeroes the per-tick deferred counters).
+    pub fn begin_tick(&mut self) {
+        self.stats.deferred_entities_tick = 0;
+        self.stats.deferred_fields_tick = 0;
+    }
+
+    /// WP14: the entities marked as interacting with `peer`, ascending.
+    pub fn interacting(&self, peer: PeerId) -> Vec<NetId> {
+        self.peers.get(&peer).map_or_else(Vec::new, |p| {
+            p.entities
+                .iter()
+                .filter(|(_, e)| e.interacting)
+                .map(|(id, _)| *id)
+                .collect()
+        })
+    }
+
+    /// WP14: how many snapshots carried `id` to `peer` (diagnostics and tests).
+    pub fn sends(&self, peer: PeerId, id: NetId) -> u64 {
+        self.peers
+            .get(&peer)
+            .and_then(|p| p.entities.get(&id))
+            .map_or(0, |e| e.sends)
+    }
+
     /// The hook WP14 scores: marks `id` as interacting with `peer` (weight 100 instead of 1).
     pub fn set_interacting(&mut self, peer: PeerId, id: NetId, on: bool) {
         let n = self.entities.get(&id).map_or(0, |s| s.fields.len());
@@ -597,8 +642,8 @@ impl Replication {
                 settle(&mut p.entities, &f.fields, false);
             }
         }
-        // Candidates and reliable fields.
-        let mut cands: Vec<(NetId, f64)> = Vec::new();
+        // Candidates (id, accumulated sum, pending fields) and reliable fields.
+        let mut cands: Vec<(NetId, f64, usize)> = Vec::new();
         for (&id, state) in &self.entities {
             if skip(id) {
                 continue;
@@ -611,7 +656,7 @@ impl Replication {
                 .entry(id)
                 .or_insert_with(|| PeerEntity::new(state.fields.len()));
             pe.fit(state.fields.len());
-            let mut any = false;
+            let mut any = 0usize;
             let mut flat = 0usize;
             for (pi, part) in table.parts.iter().enumerate() {
                 for (fi, d) in part.iter().enumerate() {
@@ -633,23 +678,28 @@ impl Replication {
                             pe.sent[flat] = fs.version;
                             self.stats.reliable_fields_sent += 1;
                         } else {
-                            any = true;
+                            any += 1;
                         }
                     }
                     flat += 1;
                 }
             }
-            if any {
+            if any > 0 {
                 let owned = owner_of(id) == Some(peer);
                 pe.accum += priority::weight(owned, pe.interacting, state.priority);
-                cands.push((id, pe.accum));
+                cands.push((id, pe.accum, any));
             }
         }
         let allowance = p.budget.allowance();
-        if cands.is_empty() || allowance == 0 {
+        if cands.is_empty() {
             return out;
         }
-        priority::order(&mut cands);
+        if allowance == 0 {
+            let fields: usize = cands.iter().map(|c| c.2).sum();
+            self.stats.defer(cands.len(), fields);
+            return out;
+        }
+        cands.sort_by(|a, b| priority::cmp(a.0, a.1, b.0, b.1));
         let header = Header {
             tick: server_tick,
             baseline: p.acked_tick,
@@ -660,9 +710,12 @@ impl Replication {
         snapshot::write_header(&mut w, header);
         let mut carried: Vec<(NetId, u32, u32)> = Vec::new();
         let mut entities_sent = 0u64;
-        for (id, _) in cands {
+        let (mut left_out, mut fields_left) = (0usize, 0usize);
+        for (id, _, n_pending) in cands {
             if limit.saturating_sub(used) < 64 {
-                break;
+                left_out += 1;
+                fields_left += n_pending;
+                continue;
             }
             let Some(state) = self.entities.get(&id) else {
                 continue;
@@ -696,8 +749,11 @@ impl Replication {
                 }
             }
             if chosen.is_empty() {
+                left_out += 1;
+                fields_left += n_pending;
                 continue;
             }
+            fields_left += n_pending - chosen.len();
             let fields: Vec<(u16, u16, &Encoded)> = chosen
                 .iter()
                 .zip(&flats)
@@ -712,9 +768,11 @@ impl Replication {
                 carried.push((id, fl as u32, v));
             }
             pe.accum = 0.0;
+            pe.sends += 1;
             entities_sent += 1;
             self.stats.fields_sent += flats.len() as u64;
         }
+        self.stats.defer(left_out, fields_left);
         if carried.is_empty() {
             return out;
         }
@@ -923,6 +981,164 @@ mod tests {
 
     fn build(r: &mut Replication, tick: u64, budget: u32) -> Outbound {
         r.build(2, tick, tick, RATE, budget, &|_| Some(1), &|_| false)
+    }
+
+    const BODY: u64 = 77;
+
+    /// A RigidBody2D ball as gdnet infers it: hot position, rotation, both velocities (WP14); cold
+    /// visible, modulate, z_index; a shape part with `disabled`.
+    fn body_table() -> ScenePropsTable {
+        ScenePropsTable::new(std::vec![
+            std::vec![
+                PropDesc::new("position", TypeTag::Vector2).hot(Quant::Mm),
+                PropDesc::new("rotation", TypeTag::Float).hot(Quant::Deg),
+                PropDesc::new("scale", TypeTag::Vector2).hot(Quant::Mm),
+                PropDesc::new("linear_velocity", TypeTag::Vector2).hot(Quant::Mm),
+                PropDesc::new("angular_velocity", TypeTag::Float).hot(Quant::Mm),
+                PropDesc::new("visible", TypeTag::Bool),
+                PropDesc::new("z_index", TypeTag::Int),
+            ],
+            std::vec![PropDesc::new("disabled", TypeTag::Bool)],
+        ])
+    }
+
+    fn move_body(r: &mut Replication, id: NetId, t: u64) {
+        let f = t as f32 * 0.016 + id as f32;
+        let vals = [
+            (
+                0,
+                Value::Vector2([300.0 + 100.0 * f.sin(), 200.0 + 80.0 * f.cos()]),
+            ),
+            (1, Value::Float(f64::from(f % 3.0))),
+            (3, Value::Vector2([100.0 * f.cos(), -80.0 * f.sin()])),
+            (4, Value::Float(f64::from(2.0 * f.sin()))),
+        ];
+        r.record_part(id, BODY, 0, &vals, t);
+    }
+
+    /// A server with one peer and `n` bodies the peer already holds.
+    fn pit(n: u32) -> Replication {
+        let mut r = Replication::default();
+        r.register_table(BODY, body_table());
+        r.add_peer(2, 0);
+        let init = std::vec![
+            std::vec![
+                Value::Vector2([0.0, 0.0]),
+                Value::Float(0.0),
+                Value::Vector2([1.0, 1.0]),
+                Value::Vector2([0.0, 0.0]),
+                Value::Float(0.0),
+                Value::Bool(true),
+                Value::Int(0),
+            ],
+            std::vec![Value::Bool(false)],
+        ];
+        for id in 1..=n {
+            r.add_entity(id, BODY, &init, 0);
+            r.mark_synced(2, id);
+        }
+        r
+    }
+
+    /// Ticks `ticks` of a pit where every body moves, acking every snapshot; returns the snapshot sizes.
+    fn run_pit(r: &mut Replication, from: u64, ticks: u64, budget: u32) -> Vec<usize> {
+        let mut c = Replication::default();
+        c.register_table(BODY, body_table());
+        let n = r.entity_count() as u32;
+        let mut sizes = Vec::new();
+        for t in from..from + ticks {
+            for id in 1..=n {
+                move_body(r, id, t);
+            }
+            let out = r.build(2, t, t, RATE, budget, &|_| Some(1), &|_| false);
+            if let Some(body) = out.snapshot {
+                sizes.push(body.len() + 1);
+                c.on_snapshot(&body, &|_| Some(BODY));
+                c.drain_updates();
+                if let Some(ack) = c.take_ack() {
+                    r.on_ack(2, ack, t);
+                }
+            }
+        }
+        sizes
+    }
+
+    #[test]
+    fn three_hundred_bodies_pack_into_mtu_sized_snapshots() {
+        let mut r = pit(300);
+        // A budget far above what fits: every snapshot is limited by the MTU alone.
+        let sizes = run_pit(&mut r, 1, 120, 10_000_000);
+        assert_eq!(sizes.len(), 120);
+        assert!(sizes.iter().all(|s| *s <= MTU), "{sizes:?}");
+        let min = *sizes.iter().min().unwrap();
+        assert!(
+            min >= MTU - 24,
+            "a full backlog leaves little room unused: {min}"
+        );
+        let per_body = r.stats.snapshot_bytes as f64 / r.stats.entities_sent as f64;
+        // 4 hot fields (position and linear velocity 3 bytes per axis at `mm`, rotation and angular
+        // velocity 2 bytes each), about 15.5 bytes of values, plus the entry header: the "more" bit,
+        // the id varint (2 bytes above 127), the record length varint (2 bytes) and the masks (9 bits),
+        // about 5 bytes. Measured 2026-11-08: 20.6 bytes per body update.
+        assert!(per_body < 22.0, "bytes per body update {per_body}");
+        assert!(
+            r.stats.deferred_entities > 0,
+            "300 moving bodies do not fit an MTU a tick"
+        );
+    }
+
+    #[test]
+    fn near_bodies_are_sent_ten_times_as_often_as_far_ones() {
+        let mut r = pit(300);
+        for id in 1..=20 {
+            r.set_interacting(2, id, true);
+        }
+        assert_eq!(r.interacting(2), (1..=20).collect::<Vec<_>>());
+        run_pit(&mut r, 1, 600, 32_768);
+        let near: u64 = (1..=20).map(|id| r.sends(2, id)).sum::<u64>() / 20;
+        let far: u64 = (21..=300).map(|id| r.sends(2, id)).sum::<u64>() / 280;
+        std::println!("near {near} far {far}");
+        assert!(
+            near >= 500,
+            "near bodies go out (nearly) every tick: {near} of 600"
+        );
+        assert!(near >= 10 * far.max(1), "near {near} vs far {far}");
+        assert!(far >= 1, "far bodies still go out now and then: {far}");
+        assert!(r.stats.snapshot_bytes <= 10 * 32_768 + 3 * MTU as u64);
+    }
+
+    #[test]
+    fn deferred_counters_count_what_the_budget_left_out() {
+        let mut r = pit(50);
+        r.begin_tick();
+        run_pit(&mut r, 1, 60, 10_000_000);
+        assert_eq!(
+            r.stats.deferred_entities, 0,
+            "everything fits a generous budget"
+        );
+        assert_eq!(r.stats.deferred_fields, 0);
+        run_pit(&mut r, 61, 60, 4_096);
+        let s = r.stats;
+        assert!(
+            s.deferred_entities > 0 && s.deferred_fields >= s.deferred_entities,
+            "{s:?}"
+        );
+        r.begin_tick();
+        assert_eq!(r.stats.deferred_entities_tick, 0);
+        run_pit(&mut r, 121, 1, 4_096);
+        assert!(r.stats.deferred_entities_tick > 0);
+        // A settled pit: nothing pending, nothing deferred, no bytes.
+        let mut r = pit(300);
+        let sizes = run_pit(&mut r, 0, 0, 32_768);
+        assert!(sizes.is_empty());
+        for t in 1..60 {
+            assert!(build_body(&mut r, t).snapshot.is_none());
+        }
+        assert_eq!(r.stats.deferred_entities + r.stats.snapshot_bytes, 0);
+    }
+
+    fn build_body(r: &mut Replication, t: u64) -> Outbound {
+        r.build(2, t, t, RATE, 32_768, &|_| Some(1), &|_| false)
     }
 
     #[test]

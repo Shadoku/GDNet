@@ -24,6 +24,7 @@ mod methods;
 mod net;
 mod overlay;
 mod parts;
+mod physics;
 mod pipe_peer;
 mod poll;
 mod profiles;

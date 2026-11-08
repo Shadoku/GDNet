@@ -74,7 +74,7 @@ func refresh() -> void:
 	_put("out", "out %6d B/s  (ch0 %d  ch1 %d  ch2 %d)" % [bo[0] + bo[1] + bo[2], bo[0], bo[1], bo[2]])
 	_put("entities", "entities %d  in scope %d" % [d.get("entities", 0), d.get("entities_in_scope", 0)])
 	_put("state", "snapshots %d B/s (%d total)  keyed %d B/s" % [d.get("snapshot_bytes_per_s", 0), d.get("snapshot_bytes", 0), d.get("keyed_bytes_per_s", 0)])
-	_put("budget", "budget %d%% of %d B/s per peer" % [roundi(100.0 * float(d.get("budget_use", 0.0))), d.get("budget_bytes_per_s", 0)])
+	_put("budget", "budget %d%% of %d B/s per peer  deferred: %d ent/s  interacting %d" % [roundi(100.0 * float(d.get("budget_use", 0.0))), d.get("budget_bytes_per_s", 0), d.get("deferred_entities_per_s", 0), d.get("interacting", 0)])
 	_put("calls", "calls out %d/s  in %d/s  refused %d" % [d.get("calls_sent_per_s", 0), d.get("calls_received_per_s", 0), d.get("calls_refused", 0)])
 	_put("prediction", "rollbacks %d/s  replayed %d  inputs repeated %d" % [d.get("rollbacks_per_s", 0), d.get("replayed_ticks", 0), d.get("inputs_repeated", 0)])
 	_put("poll", "poll %.3f ms (avg %.3f)" % [d.get("poll_ms", 0.0), d.get("poll_ms_avg", 0.0)])

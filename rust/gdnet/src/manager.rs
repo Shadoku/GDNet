@@ -197,6 +197,12 @@ pub struct NetManager {
     /// (its owner's `scene_file_path`), else its path relative to the session's branch.
     #[export]
     room: GString,
+    /// WP14 (2.11): the entities of this manager within this distance of a peer's player count as
+    /// interacting with that peer (priority weight 100 instead of 1), in the entities' units (pixels in
+    /// 2D, metres in 3D). 0: the project setting `gdnet/budget/interaction_radius` (300 px, 3 m in 3D);
+    /// negative: no proximity scoring for this manager (contacts with the player still count).
+    #[export]
+    interaction_radius: f64,
     /// Profiles laid over the global ones for this manager's entities (3.1).
     #[export]
     #[var(get = get_profiles, set = set_profiles)]
@@ -2806,6 +2812,23 @@ impl NetManager {
                 p.manager = key;
             }
         }
+    }
+
+    /// WP14: the `interaction_radius` property (0 = the project setting).
+    pub fn interaction_radius_setting(&self) -> f64 {
+        self.interaction_radius
+    }
+
+    /// WP14: every spawned entity's id and root node, in enrolment order.
+    pub fn roots(&self) -> Vec<(NetId, Gd<Node>)> {
+        self.order
+            .iter()
+            .filter_map(|iid| {
+                let id = self.entries.get(iid)?.id?;
+                let n = Gd::<Node>::try_from_instance_id(*iid).ok()?;
+                Some((id, n))
+            })
+            .collect()
     }
 
     /// The root node of entity `id` under this manager.

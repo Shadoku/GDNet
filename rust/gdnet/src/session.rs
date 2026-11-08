@@ -38,7 +38,7 @@ use netcore::call::Verb;
 use netcore::session::EntityEvent;
 use netcore::{EmulSettings, Event, KeyEvent, Reliability, Session, SessionConfig, StateUpdate};
 use netcore::{NetId, ParentRef};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Meta on a session's `NetMultiplayerApi`: the session's instance id (how a `NetManager` finds the
@@ -156,6 +156,15 @@ pub struct NetSession {
     pub(crate) travel_target: Option<String>,
     pub(crate) local_room: String,
     pub(crate) travelling_client: bool,
+    /// WP14, server: each peer's interacting set as last given to netcore (physics.rs).
+    interacting: HashMap<u32, BTreeSet<NetId>>,
+    /// WP14: microseconds the last interaction pass took.
+    interaction_us: u64,
+    /// WP14: entities hash telemetry samples per tick on this server; -1 = the project setting
+    /// `gdnet/debug/hash_sample` (default 16). Changes apply at once.
+    #[var(get = get_hash_sample, set = set_hash_sample)]
+    #[init(val = -1)]
+    hash_sample: i64,
 }
 
 /// WP8: the group every session joins (the overlay and the meter find sessions through it).
@@ -197,6 +206,9 @@ struct Counters {
     snapshot_bytes_per_s: u64,
     window_start_keyed: u64,
     keyed_bytes_per_s: u64,
+    /// WP14: deferred entities and fields per second.
+    window_start_deferred: [u64; 2],
+    deferred_per_s: [u64; 2],
 }
 
 #[godot_api]
@@ -610,6 +622,45 @@ impl NetSession {
     }
 
     #[func]
+    fn get_hash_sample(&self) -> i64 {
+        self.hash_sample
+    }
+
+    #[func]
+    fn set_hash_sample(&mut self, v: i64) {
+        self.hash_sample = v.max(-1);
+        let n = self.effective_hash_sample();
+        if let Some(c) = self.core.as_mut() {
+            let on = c.hash_telemetry();
+            c.set_hash_telemetry(on, n);
+        }
+    }
+
+    /// WP14, server: the net ids marked as interacting with `peer` this tick (near or touching its
+    /// player), ascending; empty on a client.
+    #[func]
+    pub fn interacting(&self, peer: i64) -> PackedInt64Array {
+        let ids = self
+            .core
+            .as_ref()
+            .map(|c| c.interacting(peer.max(0) as u32))
+            .unwrap_or_default();
+        ids.into_iter().map(i64::from).collect()
+    }
+
+    /// WP14, server: how many snapshots carried the entity `node` belongs to to `peer` (0 on a client
+    /// or for an unmanaged node).
+    #[func]
+    pub fn entity_sends(&self, node: Gd<Node>, peer: i64) -> i64 {
+        let Some(id) = entity_root_of(&node).map(|(root, m)| m.bind().net_id_of(&root)) else {
+            return 0;
+        };
+        self.core
+            .as_ref()
+            .map_or(0, |c| c.entity_sends(peer.max(0) as u32, id) as i64)
+    }
+
+    #[func]
     fn get_cold_poll_ticks(&self) -> i64 {
         self.cold_poll_ticks
     }
@@ -670,6 +721,17 @@ impl NetSession {
             d.set("fields_received", r.fields_received as i64);
             d.set("fallbacks", r.fallbacks as i64);
             d.set("changes", r.changes as i64);
+            // WP14: budget degradation and interaction scoring.
+            d.set("deferred_entities", r.deferred_entities as i64);
+            d.set("deferred_fields", r.deferred_fields as i64);
+            d.set("deferred_entities_tick", r.deferred_entities_tick as i64);
+            d.set("deferred_fields_tick", r.deferred_fields_tick as i64);
+            d.set("deferred_entities_per_s", c.deferred_per_s[0] as i64);
+            d.set("deferred_fields_per_s", c.deferred_per_s[1] as i64);
+            let n: usize = self.interacting.values().map(BTreeSet::len).sum();
+            d.set("interacting", n as i64);
+            d.set("interaction_ms", self.interaction_us as f64 / 1000.0);
+            d.set("hash_sample", i64::from(self.effective_hash_sample()));
             let i = core.input_stats();
             let p = core.predict_stats();
             d.set("inputs_repeated", i.repeated as i64);
@@ -976,7 +1038,7 @@ impl NetSession {
             interp::adaptive(),
             interp::teleport_distance(),
         );
-        core.set_hash_telemetry(crate::hash::telemetry(), crate::hash::sample());
+        core.set_hash_telemetry(crate::hash::telemetry(), self.effective_hash_sample());
         core.set_hash_refresh(crate::hash::refresh_s());
         let now = now_us();
         if hosting {
@@ -1276,6 +1338,7 @@ impl NetSession {
             self.stats.poll_us_last = us;
             self.stats.poll_us_window += us;
             self.stats.record_calls += 1;
+            self.interaction_pass();
         }
         if !self.is_server() && self.is_connected() {
             // WP4: the owner records its predicted entities' hot state and queues its sampled frames.
@@ -1524,10 +1587,69 @@ impl NetSession {
                 let kb = k.bytes_sent + k.bytes_received;
                 c.keyed_bytes_per_s = kb - c.window_start_keyed;
                 c.window_start_keyed = kb;
+                let r = core.repl_stats();
+                let now = [r.deferred_entities, r.deferred_fields];
+                for (i, n) in now.iter().enumerate() {
+                    c.deferred_per_s[i] = n - c.window_start_deferred[i];
+                }
+                c.window_start_deferred = now;
             }
             c.poll_ms_avg = c.poll_us_window as f64 / 1000.0 / f64::from(c.window_ticks);
             c.poll_us_window = 0;
             c.window_ticks = 0;
+        }
+    }
+
+    /// WP14, server: scores interaction (physics.rs) and hands the changes to netcore, before this
+    /// tick's snapshots are built.
+    fn interaction_pass(&mut self) {
+        let t0 = now_us();
+        // The server's own player (a host) receives no snapshots: nothing to score for it.
+        let players: Vec<(u32, NetId)> = self
+            .core
+            .as_ref()
+            .map(|c| c.players())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(peer, _)| *peer != netcore::SERVER)
+            .collect();
+        if players.is_empty() && self.interacting.is_empty() {
+            self.interaction_us = 0;
+            return;
+        }
+        let managers = self.managers();
+        let sets = crate::physics::interacting_sets(&managers, &players);
+        let mut next: HashMap<u32, BTreeSet<NetId>> = HashMap::new();
+        for (peer, set) in sets {
+            next.entry(peer).or_default().extend(set);
+        }
+        let prev = std::mem::take(&mut self.interacting);
+        if let Some(core) = self.core.as_mut() {
+            for (peer, old) in &prev {
+                let new = next.get(peer);
+                for id in old {
+                    if new.is_none_or(|n| !n.contains(id)) {
+                        core.set_interacting(*peer, *id, false);
+                    }
+                }
+            }
+            // Every tick, not only on change: an entity that left a peer's scope and came back starts
+            // with a fresh per-peer record.
+            for (peer, set) in &next {
+                for id in set {
+                    core.set_interacting(*peer, *id, true);
+                }
+            }
+        }
+        self.interacting = next;
+        self.interaction_us = now_us().saturating_sub(t0);
+    }
+
+    fn effective_hash_sample(&self) -> u32 {
+        if self.hash_sample >= 0 {
+            self.hash_sample.min(1024) as u32
+        } else {
+            crate::hash::sample()
         }
     }
 
@@ -1947,6 +2069,7 @@ impl NetSession {
         if self.core.is_none() {
             return;
         }
+        self.interacting.clear();
         for (_, call) in self.calls.drain() {
             NetCall::resolve(
                 &call,
