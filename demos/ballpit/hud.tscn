@@ -1,0 +1,44 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://demos/ballpit/hud.gd" id="1_hud"]
+
+[node name="Hud" type="VBoxContainer"]
+offset_left = 8.0
+offset_top = 8.0
+offset_right = 248.0
+offset_bottom = 248.0
+script = ExtResource("1_hud")
+
+[node name="BallsLabel" type="Label" parent="."]
+layout_mode = 2
+text = "Balls"
+
+[node name="Balls" type="HSlider" parent="."]
+layout_mode = 2
+max_value = 600.0
+step = 10.0
+value = 300.0
+
+[node name="BudgetLabel" type="Label" parent="."]
+layout_mode = 2
+text = "Budget"
+
+[node name="Budget" type="HSlider" parent="."]
+layout_mode = 2
+min_value = 2048.0
+max_value = 65536.0
+step = 2048.0
+value = 32768.0
+
+[node name="Trusted" type="CheckBox" parent="."]
+layout_mode = 2
+text = "Trusted paddles (client_owned)"
+
+[node name="Shake" type="Button" parent="."]
+layout_mode = 2
+text = "Shake"
+
+[node name="Meter" type="CheckBox" parent="."]
+layout_mode = 2
+button_pressed = true
+text = "Meter (F9)"

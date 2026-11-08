@@ -1,0 +1,16 @@
+[gd_scene format=3]
+
+[sub_resource type="CircleShape2D" id="CircleShape2D_ball"]
+radius = 8.0
+
+[node name="Ball" type="RigidBody2D"]
+collision_layer = 2
+collision_mask = 7
+angular_damp = 3.0
+
+[node name="Shape" type="CollisionShape2D" parent="."]
+shape = SubResource("CircleShape2D_ball")
+
+[node name="Body" type="Polygon2D" parent="."]
+color = Color(1, 0.55, 0.25, 1)
+polygon = PackedVector2Array(0, -8, 5.7, -5.7, 8, 0, 5.7, 5.7, 0, 8, -5.7, 5.7, -8, 0, -5.7, -5.7)

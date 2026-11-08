@@ -131,6 +131,6 @@ part needs the editor and is checked by hand only.
 | `gdnet/debug/meter` | false | when `Net` starts a session: show the meter |
 | `gdnet/debug/overlay` | false | when `Net` starts a session: show the overlay |
 | `gdnet/debug/hash_telemetry` | true | when any session starts |
-| `gdnet/debug/hash_sample` | 16 | when any session starts (entities per tick, 0..1024) |
+| `gdnet/debug/hash_sample` | 16 | when any session starts (entities per tick, 0..1024); WP14: `NetSession.hash_sample` overrides it per session, at once (-1 = the setting) |
 | `gdnet/debug/emulation_preset` | `off` | when `Net` starts a session without `Net.emulation` |
 | `gdnet/debug/emulation/<field>` | 0 | for the `custom` preset |

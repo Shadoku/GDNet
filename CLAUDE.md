@@ -86,6 +86,9 @@ Never say a change works without a passing check. If you cannot run Godot
   `tests/fixtures/zero_change/`: keep its scripts free of `Net.` (a test checks).
   Rooms and travel (WP13): `tests/integration/test_doors_demo.gd` runs `demos/doors/` in every branch
   (a `World` per branch, `NetSession.levels()`, a door's `body_entered` emitted on the server).
+  Physics bodies (WP14): `tests/integration/test_ballpit_demo.gd` runs `demos/ballpit/` (a pit per branch;
+  the clients' pits shift their collision layers with `layer_shift`, since the branches share one physics
+  space; set `timeout_sec` for scenes that need seconds to settle).
 
 ## Design for testability
 
@@ -114,7 +117,8 @@ rust/                  Cargo workspace: netcore (sans-IO protocol engine, no god
 addons/gdnet/          gdnet.gdextension + bin/<platform>/ (built, ignored) + addon assets (WP8: meter.tscn/.gd)
 docs/guide/            the gdnet user guide, one page per topic (01_sessions.md, ...)
 demos/                 instructional demos, each a worked example with a README whose code listings a
-                       test diffs against the files (WP13: doors/ = players travelling between levels)
+                       test diffs against the files (WP13: doors/ = players travelling between levels;
+                       WP14: ballpit/ = hundreds of RigidBody2D balls, priority and the byte budget)
 tools/check.py         the one command to verify the project
 tools/validate_scripts.gd   compiles every script; used by check.py
 tools/install_godot.sh downloads the pinned Godot into ~/.cache/godot
