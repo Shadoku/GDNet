@@ -66,14 +66,23 @@ half a second gets full state. Values too large for a snapshot (over 1,000 bytes
 | `quantize` | encoding | precision |
 |---|---|---|
 | `raw` | f32 per vector component, f64 for a float | exact |
-| `mm` | fixed point, 0.001 units, zigzag varint | 0.0005 |
-| `cm` | fixed point, 0.01 units | 0.005 |
+| `mm` | fixed point, a millimetre per step, zigzag varint: 0.001 units in 3D, 0.1 px in 2D | half a step: 0.0005 m / 0.05 px |
+| `cm` | fixed point, a centimetre per step: 0.01 units in 3D, 1 px in 2D | 0.005 m / 0.5 px |
 | `deg` | an angle wrapped to one turn, 16 bits | 0.0055 degrees (replicas get the angle in [-PI, PI)) |
 | `smallest3` | a unit quaternion's three smallest components, 47 bits | about 2e-5 |
 | `f16` | half precision per component | about 1/2048 relative |
 
 Defaults: hot vectors and transforms `mm`, quaternions `smallest3`, hot colours `f16`, everything else
-`raw`. For a 2D game in pixels `cm` is plenty: `Net.configure(node, {"quantize": {"position": "cm"}})`.
+`raw`.
+
+**Units (decision D17).** 3D lengths are metres. 2D lengths are pixels, read at 100 px per metre (the
+scale WP5's interpolation thresholds use), so in 2D `mm` is a 0.1 px step and `cm` a 1 px step. This
+applies to `Vector2` values and a `Transform2D`'s origin; `Vector2i` is sent as integers; angles
+(`rotation` at `deg`) have no length; a plain `float` has no dimension gdnet can know, so `mm` on a float
+is 0.001 of its unit (an `angular_velocity` in rad/s, for instance). The default `mm` (0.1 px) is finer than
+any screen shows; `Net.configure(node, {"quantize": {"position": "cm"}})` (1 px) saves about a byte per
+axis for positions in the hundreds to thousands of pixels. The 2D prediction tolerance follows: 0.1 px by
+default (one `mm` step).
 
 ## Bandwidth
 

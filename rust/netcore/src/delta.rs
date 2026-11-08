@@ -1076,11 +1076,13 @@ mod tests {
             "a full backlog leaves little room unused: {min}"
         );
         let per_body = r.stats.snapshot_bytes as f64 / r.stats.entities_sent as f64;
-        // 4 hot fields (position and linear velocity 3 bytes per axis at `mm`, rotation and angular
-        // velocity 2 bytes each), about 15.5 bytes of values, plus the entry header: the "more" bit,
-        // the id varint (2 bytes above 127), the record length varint (2 bytes) and the masks (9 bits),
-        // about 5 bytes. Measured 2026-11-08: 20.6 bytes per body update.
-        assert!(per_body < 22.0, "bytes per body update {per_body}");
+        std::println!("bytes per body update {per_body:.2}");
+        // 4 hot fields (position and linear velocity 2 bytes per axis at `mm` = 0.1 px (D17), rotation
+        // and angular velocity 2 bytes each), about 12 bytes of values, plus the entry header: the
+        // "more" bit, the id varint (2 bytes above 127), the record length varint (1 byte) and the
+        // masks (9 bits), about 4 bytes. Measured 2026-11-08: 20.6 bytes per body update at WP14's
+        // 0.001 px step, 15.7 at D17's 0.1 px.
+        assert!(per_body < 17.0, "bytes per body update {per_body}");
         assert!(
             r.stats.deferred_entities > 0,
             "300 moving bodies do not fit an MTU a tick"
@@ -1145,8 +1147,11 @@ mod tests {
     fn records_detect_changes_by_their_quantised_value() {
         let mut r = server(1);
         assert!(!set_x(&mut r, 1, 0.0, 1), "same value");
-        assert!(!set_x(&mut r, 1, 0.0002, 2), "below one mm: same encoding");
-        assert!(set_x(&mut r, 1, 0.002, 3));
+        assert!(
+            !set_x(&mut r, 1, 0.02, 2),
+            "below one mm (0.1 px, D17): same encoding"
+        );
+        assert!(set_x(&mut r, 1, 0.2, 3));
         let v = r.entity(1).unwrap().fields[0].version;
         assert_eq!(v, 2);
     }
@@ -1295,7 +1300,8 @@ mod tests {
         let mut owned_sent = 0;
         for t in 1..=120u64 {
             for id in 1..=20 {
-                set_x(&mut r, id, t as f32 * id as f32, t);
+                // D17: x100 keeps the WP3 encodings' sizes at the 0.1 px step.
+                set_x(&mut r, id, t as f32 * id as f32 * 100.0, t);
             }
             let out = r.build(
                 2,

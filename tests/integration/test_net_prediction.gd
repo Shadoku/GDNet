@@ -78,10 +78,16 @@ func _spawn(managers: Dictionary, scene: PackedScene, peer: int, node_name: Stri
 	return out
 
 
+## One mm in 2D: 0.1 px, one `mm` quantiser step and the default prediction tolerance of a Vector2
+## (decision D17). The owner resumes from the server's quantised state, so after a correction it sits
+## within half a step of the server's exact value.
+const MM := 0.1
+
+
 ## Ticks until `a` and `b` are within 1 mm (or `limit`); returns -1 when they never met.
 func _ticks_to_converge(a: Node2D, b: Node2D, limit: int) -> int:
 	for t in limit:
-		if a.position.distance_to(b.position) < 0.001:
+		if a.position.distance_to(b.position) < MM:
 			return t
 		await get_tree().physics_frame
 	return -1
@@ -163,7 +169,7 @@ func test_a_server_impulse_rolls_back_once_and_converges() -> void:
 	assert_eq(_rolled["Server"].size(), 0, "the server never rolls back")
 	var r: Array = _rolled["ClientA"][0]
 	assert_gt(r[0], r[1], "rolled back from the predicted tick to the confirmed one")
-	assert_lt(cp.position.distance_to(sp.position), 0.001, "converged within 1 mm")
+	assert_lt(cp.position.distance_to(sp.position), MM, "converged within 1 mm")
 	var stats: Dictionary = net.client_sessions[0].stats()
 	assert_eq(stats["rollbacks"], 1)
 	assert_gt(stats["replayed_ticks"], 0)
@@ -209,7 +215,7 @@ func test_replicas_do_not_simulate_and_everywhere_opts_out() -> void:
 	Input.action_press("right")
 	await _frames(30)
 	Input.action_release("right")
-	assert_true(await net.wait_until(func() -> bool: return replica.position.distance_to(copies["Server"].position) < 0.01 and copies["Server"].position.x > 0.0), "the replica follows")
+	assert_true(await net.wait_until(func() -> bool: return replica.position.distance_to(copies["Server"].position) < MM and copies["Server"].position.x > 0.0), "the replica follows")
 
 
 func test_ownership_change_moves_simulation() -> void:
@@ -239,7 +245,7 @@ func test_the_hosts_own_player_never_rolls_back() -> void:
 	await _frames(20)
 	Input.action_release("right")
 	sp.position.y += 50.0
-	assert_true(await net.wait_until(func() -> bool: return rp.position.distance_to(sp.position) < 0.01), "the replica follows")
+	assert_true(await net.wait_until(func() -> bool: return rp.position.distance_to(sp.position) < MM), "the replica follows")
 	await _frames(10)
 	assert_eq(_rolled["Server"].size(), 0)
 	assert_eq(_rolled["ClientA"].size(), 0)
@@ -297,7 +303,7 @@ func test_predict_disabled_never_rolls_back() -> void:
 	await _frames(20)
 	Input.action_release("right")
 	sp.position.x += 50.0
-	assert_true(await net.wait_until(func() -> bool: return cp.position.distance_to(sp.position) < 0.01 and sp.position.x > 50.0), "the owner follows the server")
+	assert_true(await net.wait_until(func() -> bool: return cp.position.distance_to(sp.position) < MM and sp.position.x > 50.0), "the owner follows the server")
 	await _frames(10)
 	assert_eq(_rolled["ClientA"].size(), 0)
 	assert_eq(net.client_sessions[0].stats()["rollbacks"], 0)

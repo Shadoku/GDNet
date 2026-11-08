@@ -289,6 +289,11 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
     })
 }
 
+/// The wire format version, an item of [`Protocol`]: raised whenever the bytes of an existing message
+/// change meaning while the crate version stays. 1 = WP0-WP14; 2 = D17 (2D `mm`/`cm` steps of 0.1 px
+/// and 1 px instead of 0.001 px and 0.01 px).
+pub const WIRE_FORMAT: u32 = 2;
+
 /// The protocol description both ends must agree on (3.3). WP1 covers the netcore version, the tick
 /// rate and a debug salt; later packages append scene part tables, profiles and option sets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,6 +321,7 @@ impl Protocol {
         Self {
             items: std::vec![
                 item("netcore version", crate::VERSION.into()),
+                item("wire format", std::format!("{WIRE_FORMAT}")),
                 item("tick rate", std::format!("{tick_rate}")),
                 item("protocol salt", std::format!("{salt}")),
                 item("profiles", std::format!("{profiles_hash:016x}")),
@@ -725,6 +731,16 @@ mod tests {
             a.mismatch(&slow.items, slow.hash(), "server", "client")
                 .as_deref(),
             Some("protocol mismatch: tick rate differs (server 60, client 30)")
+        );
+        // D17: a WP0-WP14 peer (wire format 1) is named as such.
+        let mut old = Protocol::new(60, 0);
+        for it in old.items.iter_mut().filter(|i| i.name == "wire format") {
+            it.value = "1".into();
+        }
+        assert_eq!(
+            a.mismatch(&old.items, old.hash(), "server", "client")
+                .as_deref(),
+            Some("protocol mismatch: wire format differs (server 2, client 1)")
         );
         // Same items, forged hash.
         assert_eq!(

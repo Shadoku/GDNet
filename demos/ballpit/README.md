@@ -492,9 +492,9 @@ session in a game): snapshot bytes per second per peer, applied at once.
 
 ## Bandwidth
 
-Three hundred moving balls do not fit in any sensible budget: each update of a ball is about 20.6 bytes
+Three hundred moving balls do not fit in any sensible budget: each update of a ball is about 16 bytes
 (4 changed fields, quantised, plus the entry's header), so updating all of them every tick at 60 Hz would
-take 370 KB/s per client. gdnet's default budget is 32 KB/s. What decides which balls go out?
+take 280 KB/s per client. gdnet's default budget is 32 KB/s. What decides which balls go out?
 
 **Most-recent-state.** A snapshot carries only fields that changed since the client last acknowledged
 them, and a lost snapshot is never resent: its fields are simply still pending, and the next snapshot
@@ -514,8 +514,8 @@ about 0.4 ms for 300 bodies on the test machine (`interaction_ms` in `stats()`).
 
 **The budget.** A token bucket per client fills at `budget_bytes_per_s` and the snapshot never exceeds it,
 nor the 1,200-byte MTU (the bucket holds at most two MTUs of slack). With the budget halved to 16 KB/s
-the test measures 16,387 B/s sent over a one-second window (one snapshot of 273 bytes a tick, about 13
-ball updates), the balls near the paddle updated on every tick they moved, and the far moving balls on 3 %
+the test measures 16,379 B/s sent over a one-second window (one snapshot of 273 bytes a tick, about 17
+ball updates), the balls near the paddle updated on every tick they moved, and the far moving balls on 5 %
 of theirs: they *degrade*, they are not dropped, and the budget is not exceeded by more than the slack.
 
 **The meter** (F9, on at start) shows it all. The `budget` line reads, for example,

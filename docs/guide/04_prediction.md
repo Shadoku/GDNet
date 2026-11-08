@@ -150,7 +150,8 @@ after script does for `$Steps.play()`. Just-pressed edges are recomputed from th
 ## Rollback
 
 A rollback happens when the server's state for a tick differs from the owner's prediction beyond the
-property's tolerance: 1 mm for positions and vectors (in the quantiser's units), 1e-4 for floats, exact
+property's tolerance: 1 mm for positions and vectors (0.001 in 3D, 0.1 px in 2D: one `mm` step, decision
+D17), 1e-4 for floats, exact
 for everything else (change it with `Net.configure(node, {"tolerance": ...})` or a profile entry). Typical
 causes: the server moved the player (a teleport, a push), the server saw something the owner did not, or
 input arrived too late. The owner restores the confirmed state, replays to the present and emits

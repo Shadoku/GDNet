@@ -86,7 +86,7 @@ in the number of entities: about 0.4 ms for 300 bodies per tick in the demo's te
 `interaction_ms`). The server's own player (a host) is not scored: it receives no snapshots.
 
 Choose the radius by the budget: every interacting body that moves costs a full update each tick. In the
-Ballpit demo a body update is about 20.6 bytes, so the halved 16 KB/s budget carries about 13 updates a
+Ballpit demo a body update is about 15.8 bytes, so the halved 16 KB/s budget carries about 17 updates a
 tick; a 50 px radius around the paddle keeps the interacting set below that, and those balls update on
 every tick they move.
 
@@ -128,13 +128,14 @@ budget 100% of 16384 B/s per peer  deferred: 17205 ent/s  interacting 4
 
 ## What a body update costs
 
-A ball's update carries its changed hot fields, quantised (position and linear velocity at `mm`: 3 bytes
-per axis for values in the hundreds of pixels; rotation 2 bytes; angular velocity 2 bytes), plus an entry
-header: one bit, the net id as a varint (2 bytes above 127), the record length as a varint (2 bytes) and
-the dirty masks (9 bits for a ball). About 20.6 bytes in all; 300 moving bodies fill MTU-sized snapshots
-to within 24 bytes. Two levers exist if that matters for a game: a coarser quantiser (`Vector2` at `mm`
-is 1/1000 of a pixel; `cm` saves a byte per axis) through `Net.configure` or a profile, and fewer hot
-properties (a body whose `scale` never changes costs nothing for it: only changed fields travel).
+A ball's update carries its changed hot fields, quantised (position and linear velocity at `mm`, which in
+2D is 0.1 px: 2 bytes per axis for values in the hundreds of pixels; rotation 2 bytes; angular velocity 2
+bytes), plus an entry header: one bit, the net id as a varint (2 bytes above 127), the record length as a
+varint (1 byte) and the dirty masks (9 bits for a ball). About 15.8 bytes in all (20.6 before decision D17
+made 2D `mm` a 0.1 px step instead of 0.001 px); 300 moving bodies fill MTU-sized snapshots to within 24
+bytes. Two levers exist if that matters for a game: a coarser quantiser (`cm` is a 1 px step in 2D and
+saves about a byte per axis for fast or far-flung bodies) through `Net.configure` or a profile, and fewer
+hot properties (a body whose `scale` never changes costs nothing for it: only changed fields travel).
 
 ## Hash telemetry with many bodies
 

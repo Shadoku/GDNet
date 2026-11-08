@@ -84,9 +84,10 @@ pub enum Quant {
     /// Full width: f32 per vector component, f64 for a float.
     #[default]
     Raw,
-    /// Fixed point, 0.001 units per step (zigzag varint per component).
+    /// Fixed point, a millimetre per step (zigzag varint per component): 0.001 of the unit, or 0.1 px
+    /// for the 2D pixel types `Vector2` and a `Transform2D` origin (D17: 100 px per metre).
     Mm,
-    /// Fixed point, 0.01 units per step.
+    /// Fixed point, a centimetre per step: 0.01 of the unit, 1 px for the 2D pixel types.
     Cm,
     /// An angle in radians wrapped to one turn, 16 bits per component.
     Deg,

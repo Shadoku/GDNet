@@ -210,10 +210,13 @@ fn make_desc(name: &str, tag: TypeTag, entry: Option<&Entry>, tick_rate: u32) ->
             | TypeTag::Color
     );
     d.interpolate = entry.and_then(|e| e.interpolate).unwrap_or(hot && numeric);
-    // WP4: the prediction tolerance. Positions and vectors 1 mm in the quantiser's units (0.001), a
-    // float 1e-4; other types compare exactly whatever the number (predict.rs `within`).
-    if tag == TypeTag::Float {
-        d.tolerance = 1e-4;
+    // WP4: the prediction tolerance. Positions and vectors 1 mm: 0.001 in 3D, 0.1 px for the 2D
+    // pixel types (D17: one `mm` step at 100 px per metre); a float 1e-4; other types compare
+    // exactly whatever the number (predict.rs `within`).
+    match tag {
+        TypeTag::Float => d.tolerance = 1e-4,
+        TypeTag::Vector2 | TypeTag::Transform2D => d.tolerance = 0.1,
+        _ => {}
     }
     if let Some(t) = entry.and_then(|e| e.tolerance) {
         d.tolerance = t;

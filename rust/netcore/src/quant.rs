@@ -5,7 +5,8 @@
 //! property value is encoded by [`encode`] according to its [`TypeTag`] and [`Quant`] and decoded by
 //! [`decode`]. The same packer will carry WP4's input frames.
 //!
-//! Precision (round trip, see the tests): `mm` 0.0005, `cm` 0.005, `deg` one turn / 65,536
+//! Precision (round trip, see the tests): `mm` 0.0005, `cm` 0.005 of the unit (D17: a 2D `Vector2` and
+//! a `Transform2D` origin are pixels at 100 px per metre, so `mm` is 0.05 px and `cm` 0.5 px there), `deg` one turn / 65,536
 //! (0.0055 degrees), `smallest3` 2.2e-5 per sent component (6e-5 for the derived largest one), `f16`
 //! about 1/2048 relative.
 
@@ -238,12 +239,36 @@ pub fn f16_to_f32(h: u16) -> f32 {
 const TURN: f64 = core::f64::consts::TAU;
 const S3_MAX: f64 = 32_767.0;
 
-fn fixed_scale(q: Quant) -> Option<f64> {
+/// D17: 2D lengths are pixels at [`PX_PER_METRE`] pixels per metre, 3D lengths (and every other type)
+/// are in the type's own unit, read as metres.
+pub const PX_PER_METRE: f64 = 100.0;
+
+/// Steps per unit of a fixed-point quantiser for a component of a value in `units` units per metre
+/// (1 for metres and unitless values, [`PX_PER_METRE`] for 2D pixel types): `mm` is a thousandth of a
+/// metre, `cm` a hundredth, so in 2D `mm` steps by 0.1 px and `cm` by 1 px.
+fn fixed_scale_in(q: Quant, units: f64) -> Option<f64> {
     match q {
-        Quant::Mm => Some(1000.0),
-        Quant::Cm => Some(100.0),
+        Quant::Mm => Some(1000.0 / units),
+        Quant::Cm => Some(100.0 / units),
         _ => None,
     }
+}
+
+fn fixed_scale(q: Quant) -> Option<f64> {
+    fixed_scale_in(q, 1.0)
+}
+
+/// Units per metre of a type's length components (D17): pixels for the 2D vector types.
+fn units_of(ty: TypeTag) -> f64 {
+    match ty {
+        TypeTag::Vector2 | TypeTag::Transform2D => PX_PER_METRE,
+        _ => 1.0,
+    }
+}
+
+/// The step of a fixed-point quantiser for `ty` (`None` for the others): `mm` on a `Vector2` is 0.1.
+pub fn fixed_step(ty: TypeTag, q: Quant) -> Option<f64> {
+    fixed_scale_in(q, units_of(ty)).map(|s| 1.0 / s)
 }
 
 fn write_fixed(w: &mut BitWriter, x: f64, scale: f64) {
@@ -267,9 +292,10 @@ fn read_angle(r: &mut BitReader) -> Option<f64> {
     Some(f64::from(q) / 65_536.0 * TURN)
 }
 
-/// One f32 component with `q` (raw 32 bits, fixed point, half, or an angle).
-fn write_comp(w: &mut BitWriter, x: f32, q: Quant) {
-    if let Some(scale) = fixed_scale(q) {
+/// One f32 component with `q` (raw 32 bits, fixed point, half, or an angle), lengths in `units`
+/// units per metre.
+fn write_comp(w: &mut BitWriter, x: f32, q: Quant, units: f64) {
+    if let Some(scale) = fixed_scale_in(q, units) {
         write_fixed(w, f64::from(x), scale);
         return;
     }
@@ -280,8 +306,8 @@ fn write_comp(w: &mut BitWriter, x: f32, q: Quant) {
     }
 }
 
-fn read_comp(r: &mut BitReader, q: Quant) -> Option<f32> {
-    if let Some(scale) = fixed_scale(q) {
+fn read_comp(r: &mut BitReader, q: Quant, units: f64) -> Option<f32> {
+    if let Some(scale) = fixed_scale_in(q, units) {
         return Some((r.read_zigzag()? as f64 / scale) as f32);
     }
     Some(match q {
@@ -292,15 +318,23 @@ fn read_comp(r: &mut BitReader, q: Quant) -> Option<f32> {
 }
 
 fn write_comps(w: &mut BitWriter, xs: &[f32], q: Quant) {
+    write_comps_in(w, xs, q, 1.0);
+}
+
+fn write_comps_in(w: &mut BitWriter, xs: &[f32], q: Quant, units: f64) {
     for &x in xs {
-        write_comp(w, x, q);
+        write_comp(w, x, q, units);
     }
 }
 
 fn read_comps<const N: usize>(r: &mut BitReader, q: Quant) -> Option<[f32; N]> {
+    read_comps_in(r, q, 1.0)
+}
+
+fn read_comps_in<const N: usize>(r: &mut BitReader, q: Quant, units: f64) -> Option<[f32; N]> {
     let mut out = [0.0f32; N];
     for v in out.iter_mut() {
-        *v = read_comp(r, q)?;
+        *v = read_comp(r, q, units)?;
     }
     Some(out)
 }
@@ -396,7 +430,7 @@ pub fn encode(w: &mut BitWriter, ty: TypeTag, q: Quant, value: &Value) {
             Quant::F16 => w.write_bits(u64::from(f32_to_f16(*f as f32)), 16),
             _ => w.write_bits(f.to_bits(), 64),
         },
-        (TypeTag::Vector2, Value::Vector2(v)) => write_comps(w, v, vec_quant(q)),
+        (TypeTag::Vector2, Value::Vector2(v)) => write_comps_in(w, v, vec_quant(q), PX_PER_METRE),
         (TypeTag::Vector3, Value::Vector3(v)) => write_comps(w, v, vec_quant(q)),
         (TypeTag::Vector4, Value::Vector4(v)) => write_comps(w, v, vec_quant(q)),
         (TypeTag::Vector2i, Value::Vector2i(v)) => {
@@ -412,7 +446,7 @@ pub fn encode(w: &mut BitWriter, ty: TypeTag, q: Quant, value: &Value) {
         },
         (TypeTag::Transform2D, Value::Transform2D(v)) => {
             write_comps(w, &v[..4], basis_quant(q));
-            write_comps(w, &v[4..], vec_quant(q));
+            write_comps_in(w, &v[4..], vec_quant(q), PX_PER_METRE);
         }
         (TypeTag::Transform3D, Value::Transform3D(v)) => {
             write_comps(w, &v[..9], basis_quant(q));
@@ -439,7 +473,7 @@ pub fn decode(r: &mut BitReader, ty: TypeTag, q: Quant) -> Option<Value> {
             Quant::F16 => f64::from(f16_to_f32(r.read_bits(16)? as u16)),
             _ => f64::from_bits(r.read_bits(64)?),
         }),
-        TypeTag::Vector2 => Value::Vector2(read_comps(r, vec_quant(q))?),
+        TypeTag::Vector2 => Value::Vector2(read_comps_in(r, vec_quant(q), PX_PER_METRE)?),
         TypeTag::Vector3 => Value::Vector3(read_comps(r, vec_quant(q))?),
         TypeTag::Vector4 => Value::Vector4(read_comps(r, vec_quant(q))?),
         TypeTag::Vector2i => Value::Vector2i([read_i32(r)?, read_i32(r)?]),
@@ -451,7 +485,7 @@ pub fn decode(r: &mut BitReader, ty: TypeTag, q: Quant) -> Option<Value> {
         }),
         TypeTag::Transform2D => {
             let b: [f32; 4] = read_comps(r, basis_quant(q))?;
-            let o: [f32; 2] = read_comps(r, vec_quant(q))?;
+            let o: [f32; 2] = read_comps_in(r, vec_quant(q), PX_PER_METRE)?;
             Value::Transform2D([b[0], b[1], b[2], b[3], o[0], o[1]])
         }
         TypeTag::Transform3D => {
@@ -609,15 +643,31 @@ mod tests {
 
     #[test]
     fn mm_and_cm_positions() {
-        let v = Value::Vector2([1234.5678, -0.0004]);
+        // D17: a Vector2 is in pixels at 100 px per metre, so mm steps by 0.1 px and cm by 1 px.
+        let v = Value::Vector2([1234.5678, -0.04]);
         let Value::Vector2(mm) = roundtrip(TypeTag::Vector2, Quant::Mm, &v) else {
             panic!()
         };
-        close(&mm, &[1234.5678, -0.0004], 0.0005 + 1e-4);
+        close(&mm, &[1234.5678, -0.04], 0.05 + 1e-4);
+        assert_eq!(mm, [1234.6, 0.0], "0.1 px steps");
         let Value::Vector2(cm) = roundtrip(TypeTag::Vector2, Quant::Cm, &v) else {
             panic!()
         };
-        close(&cm, &[1234.5678, 0.0], 0.005 + 1e-4);
+        close(&cm, &[1234.5678, 0.0], 0.5 + 1e-4);
+        assert_eq!(cm, [1235.0, 0.0], "1 px steps");
+        assert_eq!(fixed_step(TypeTag::Vector2, Quant::Mm), Some(0.1));
+        assert_eq!(fixed_step(TypeTag::Vector2, Quant::Cm), Some(1.0));
+        assert_eq!(fixed_step(TypeTag::Vector3, Quant::Mm), Some(0.001));
+        assert_eq!(fixed_step(TypeTag::Vector3, Quant::Cm), Some(0.01));
+        assert_eq!(fixed_step(TypeTag::Vector2, Quant::Deg), None);
+        // A Transform2D's origin is in pixels too; its basis stays raw.
+        let t = Value::Transform2D([0.6, 0.8, -0.8, 0.6, 10.04, -20.06]);
+        let Value::Transform2D(t2) = roundtrip(TypeTag::Transform2D, Quant::Mm, &t) else {
+            panic!()
+        };
+        assert_eq!(&t2[..4], &[0.6, 0.8, -0.8, 0.6]);
+        close(&t2[4..], &[10.0, -20.1], 1e-4);
+        // 3D keeps metres: mm is 0.001 m.
         let Value::Vector3(v3) = roundtrip(
             TypeTag::Vector3,
             Quant::Mm,
@@ -626,19 +676,37 @@ mod tests {
             panic!()
         };
         close(&v3, &[1e6, -1e6, 3.0001], 0.07);
+        let Value::Vector3(c3) = roundtrip(
+            TypeTag::Vector3,
+            Quant::Cm,
+            &Value::Vector3([1.234, -0.004, 0.0]),
+        ) else {
+            panic!()
+        };
+        close(&c3, &[1.23, 0.0, 0.0], 1e-6);
+        // A float has no dimension known to netcore: mm stays 0.001 of its unit (radians, rad/s).
         let Value::Float(f) = roundtrip(TypeTag::Float, Quant::Mm, &Value::Float(-2.5813)) else {
             panic!()
         };
         assert!((f + 2.5813).abs() <= 0.0005 + 1e-9);
-        // A small mm value is small on the wire.
+        // A small mm value is small on the wire: a 2D position a few px from the origin is one byte
+        // per axis, a typical on-screen one (hundreds of px) two.
         let mut w = BitWriter::new();
         encode(
             &mut w,
             TypeTag::Vector2,
             Quant::Mm,
-            &Value::Vector2([0.05, 0.0]),
+            &Value::Vector2([5.0, 0.0]),
         );
-        assert!(w.bit_len() <= 24, "{} bits", w.bit_len());
+        assert_eq!(w.bit_len(), 16, "{} bits", w.bit_len());
+        let mut w = BitWriter::new();
+        encode(
+            &mut w,
+            TypeTag::Vector2,
+            Quant::Mm,
+            &Value::Vector2([640.0, -360.0]),
+        );
+        assert_eq!(w.bit_len(), 32, "{} bits", w.bit_len());
     }
 
     #[test]
@@ -749,7 +817,7 @@ mod tests {
         ) else {
             panic!()
         };
-        close(&t, &[0.6, 0.8, -0.8, 0.6, 10.12345, 2.0], 0.0006);
+        close(&t, &[0.6, 0.8, -0.8, 0.6, 10.12345, 2.0], 0.05 + 1e-4);
         assert_eq!(&t[..4], &[0.6, 0.8, -0.8, 0.6]);
     }
 

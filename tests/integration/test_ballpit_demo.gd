@@ -65,6 +65,11 @@ func _settle(f: NetFixture, timeout: float) -> bool:
 
 
 ## The largest distance between a server ball and its client copy (rotation counted as 10 px/rad).
+## Converged: a replica holds the server's position quantised at `mm`, 0.1 px steps in 2D (decision
+## D17), so it may differ by half a step on each axis: 0.05 x sqrt(2) = 0.0707 px.
+const CONVERGED_PX := 0.075
+
+
 func _max_error(server: Node, client: Node) -> float:
 	var worst := 0.0
 	for b in _balls(server):
@@ -94,7 +99,7 @@ func test_balls_settle_converge_and_cost_nothing_asleep() -> void:
 		var t0 := Time.get_ticks_msec()
 		assert_true(await _settle(f, 8.0), "the pile settles: every ball sleeps")
 		var settled_s := (Time.get_ticks_msec() - t0) / 1000.0
-		assert_true(await f.wait_until(func() -> bool: return _max_error(f.server, c) < 0.05, 3.0), "the client converged: %.4f" % _max_error(f.server, c))
+		assert_true(await f.wait_until(func() -> bool: return _max_error(f.server, c) < CONVERGED_PX, 3.0), "the client converged: %.4f" % _max_error(f.server, c))
 		for b in _balls(c):
 			assert_true(b.freeze, "replica %s is frozen" % b.name)
 			assert_false(b.is_physics_processing(), "replica %s does not simulate" % b.name)
@@ -135,7 +140,7 @@ func test_a_paddle_push_is_predicted_and_the_balls_follow() -> void:
 	var cid := net.peer_id(c)
 	assert_true(await net.wait_until(func() -> bool: return net.session(c).entity_count() == FEW + 1, 5.0))
 	assert_true(await _settle(net, 8.0), "settled")
-	assert_true(await net.wait_until(func() -> bool: return _max_error(net.server, c) < 0.05, 3.0), "converged")
+	assert_true(await net.wait_until(func() -> bool: return _max_error(net.server, c) < CONVERGED_PX, 3.0), "converged")
 	await _frames(Engine.physics_ticks_per_second)
 	var sp: Node2D = net.server.get_node("Pit/NetManager/paddle%d" % cid)
 	var cp: Node2D = c.get_node("Pit/NetManager/paddle%d" % cid)
@@ -191,7 +196,7 @@ func test_a_paddle_push_is_predicted_and_the_balls_follow() -> void:
 	var settle_ticks := roundi((Time.get_ticks_msec() - t1) / 1000.0 * Engine.physics_ticks_per_second)
 	var ticks := 0
 	var coarse := -1
-	while _max_error(net.server, c) >= 0.05 and ticks < 180:
+	while _max_error(net.server, c) >= CONVERGED_PX and ticks < 180:
 		if coarse < 0 and _max_error(net.server, c) < 0.5:
 			coarse = ticks
 		await get_tree().physics_frame
@@ -199,7 +204,7 @@ func test_a_paddle_push_is_predicted_and_the_balls_follow() -> void:
 	if coarse < 0:
 		coarse = ticks
 	assert_lt(ticks, 180, "the pushed balls converge on the client: %.4f" % _max_error(net.server, c))
-	print("ballpit push: the owner's paddle moved at once; %d interacting balls at the deepest point; the owner saw balls move %d ticks after its press and %d ticks after the server moved them (50 ms each way); the server settled (asleep for half a second) %d ticks after the push ended; the client was within 0.5 px %d ticks and within 0.05 px %d ticks after that" % [interacting.size(), client_moved + 1, seen, settle_ticks, coarse, ticks])
+	print("ballpit push: the owner's paddle moved at once; %d interacting balls at the deepest point; the owner saw balls move %d ticks after its press and %d ticks after the server moved them (50 ms each way); the server settled (asleep for half a second) %d ticks after the push ended; the client was within 0.5 px %d ticks and within %.3f px %d ticks after that" % [interacting.size(), client_moved + 1, seen, settle_ticks, coarse, CONVERGED_PX, ticks])
 	assert_lt(seen, 20, "a push is seen within one round trip plus the jitter buffer")
 	for b in _balls(c):
 		assert_true(b.freeze and not b.is_physics_processing(), "no double simulation of %s" % b.name)

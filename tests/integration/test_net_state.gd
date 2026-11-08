@@ -127,6 +127,11 @@ const INHERITED := preload("res://tests/fixtures/net/inherited.tscn")
 const BENCH := preload("res://tests/fixtures/net/bench.tscn")
 
 
+## Half a `mm` step of a 2D position (0.1 px, decision D17) on both axes, as a distance: the most a
+## replica's quantised copy differs from the server's value (0.05 x sqrt(2)).
+const HALF_STEP := 0.071
+
+
 func _crate(crate_name: String) -> Node2D:
 	var c: Node2D = CRATE.instantiate()
 	c.name = crate_name
@@ -164,7 +169,7 @@ func test_the_initial_state_arrives_before_net_spawned() -> void:
 			seen["position"] = (n as Node2D).position
 			seen["flip"] = (n.get_node("Sprite") as Sprite2D).flip_h)
 		assert_true(await f.wait_until(func() -> bool: return seen.has("position")))
-		assert_true(_near(seen["position"], Vector2(123.5, -40.25), 0.001), "position at spawn: %s" % seen["position"])
+		assert_true(_near(seen["position"], Vector2(123.5, -40.25), HALF_STEP), "position at spawn: %s" % seen["position"])
 		assert_true(seen["flip"], "a cold property at spawn too")
 		assert_almost_eq((client.get_node("World/Placed") as Node2D).rotation, 1.25, 0.001))
 	assert_true(ok)
@@ -388,7 +393,7 @@ func test_fields_converge_under_loss() -> void:
 	assert_true(await net.wait_until(func() -> bool:
 		for c in crates:
 			var r: Node2D = client.get_node("World/" + String(c.name))
-			if not _near(r.position, c.position, 0.001) or absf(angle_difference(r.rotation, c.rotation)) > 0.001:
+			if not _near(r.position, c.position, HALF_STEP) or absf(angle_difference(r.rotation, c.rotation)) > 0.001:
 				return false
 		return (client.get_node("World/Move2/Sprite") as Sprite2D).flip_v, 4.0), "every field converged")
 	var stats: Dictionary = net.session(client).stats()

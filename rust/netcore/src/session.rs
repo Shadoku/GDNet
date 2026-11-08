@@ -5425,7 +5425,7 @@ mod tests {
         let before = p.server.replication().entity_hash(id).unwrap();
         assert!(p
             .server
-            .record_part(id, 0, &[(0, Value::Vector2([5.001, 1.0]))]));
+            .record_part(id, 0, &[(0, Value::Vector2([5.1, 1.0]))])); // 1 mm = 0.1 px (D17)
         let after = p.server.replication().entity_hash(id).unwrap();
         assert_ne!(before, after);
         // Back to the same value: the same hash.
