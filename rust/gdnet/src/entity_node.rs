@@ -4,7 +4,7 @@
 //! part of the outer one). `net_id` is filled in when the entity is spawned. WP3 adds the property lists
 //! and options: `state_properties` (`"Part:prop"` or `"prop"` paths relative to the entity root) with
 //! `state_options` (per path: `schedule`, `quantize`, `interpolate`, `tolerance`, `reliable`,
-//! `poll_seconds`) replace the inferred profile unless `inherit_profile` is on, which adds them to it;
+//! `poll_seconds`, WP5 `teleport_distance`) replace the inferred profile unless `inherit_profile` is on, which adds them to it;
 //! `priority` scales the entity's share of the snapshot budget; `input_properties` is kept for WP4.
 //!
 //! WP4: `simulate` (who runs the entity's `_physics_process`), `predict` (the owner's reconciliation
@@ -70,7 +70,7 @@ pub struct NetEntity {
     #[var(pub)]
     state_properties: Array<NodePath>,
     /// Options per `state_properties` path (or property name): `{schedule, quantize, interpolate,
-    /// tolerance, reliable, poll_seconds}`.
+    /// tolerance, reliable, poll_seconds, teleport_distance}`.
     #[export]
     #[var(pub)]
     state_options: VarDictionary,

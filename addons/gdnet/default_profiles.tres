@@ -73,13 +73,13 @@ classes = {
 "schedule": "cold"
 }],
 "CharacterBody2D": [{
-"interpolate": false,
+"interpolate": true,
 "name": "velocity",
 "quantize": "mm",
 "schedule": "hot"
 }],
 "CharacterBody3D": [{
-"interpolate": false,
+"interpolate": true,
 "name": "velocity",
 "quantize": "mm",
 "schedule": "hot"
@@ -192,23 +192,23 @@ classes = {
 "schedule": "cold"
 }],
 "RigidBody2D": [{
-"interpolate": false,
+"interpolate": true,
 "name": "linear_velocity",
 "quantize": "mm",
 "schedule": "hot"
 }, {
-"interpolate": false,
+"interpolate": true,
 "name": "angular_velocity",
 "quantize": "mm",
 "schedule": "hot"
 }],
 "RigidBody3D": [{
-"interpolate": false,
+"interpolate": true,
 "name": "linear_velocity",
 "quantize": "mm",
 "schedule": "hot"
 }, {
-"interpolate": false,
+"interpolate": true,
 "name": "angular_velocity",
 "quantize": "mm",
 "schedule": "hot"

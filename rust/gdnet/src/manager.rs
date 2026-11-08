@@ -65,6 +65,9 @@ pub type Recorded = (NetId, u16, Vec<(u16, Value)>);
 
 type PartNodes = Rc<Vec<Option<Gd<Node>>>>;
 
+/// WP5: a field showing an owned offset: its node, its accessor, the simulated value to restore.
+type Shown = (Gd<Node>, crate::infer::RtField, Value);
+
 /// Who may spawn entities under a manager.
 #[derive(GodotConvert, Var, Export, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[godot(via = i64)]
@@ -198,6 +201,9 @@ pub struct NetManager {
     local_id: u32,
     warned_bare: bool,
     connected_signals: bool,
+    /// WP5: owned fields showing an offset this render frame: (node, field, the simulated value to put
+    /// back before the next tick).
+    owned_shown: HashMap<(NetId, u16, u16), Shown>,
 }
 
 #[godot_api]
@@ -442,6 +448,7 @@ impl NetManager {
         if let Some(e) = self.entries.remove(&iid) {
             if let Some(id) = e.id {
                 self.by_id.remove(&id);
+                self.owned_shown.retain(|k, _| k.0 != id);
             }
             if let Ok(mut n) = Gd::<Node>::try_from_instance_id(iid) {
                 if n.has_meta(META_MANAGER) {
@@ -754,8 +761,18 @@ impl NetManager {
                     let values = s
                         .bind_mut()
                         .with_core(|c, _| c.decode_state(create.scene_hash, &create.initial_state))
-                        .flatten();
-                    let writes = state_writes(rt, &nodes, values.unwrap_or_default());
+                        .flatten()
+                        .unwrap_or_default();
+                    // WP5: a replica's interpolated fields start their sample buffers from it.
+                    if !self.is_server {
+                        let id = create.id;
+                        s.bind_mut().with_core(|c, _| {
+                            for (p, f, v) in &values {
+                                c.interp_seed(id, *p, *f, v.clone());
+                            }
+                        });
+                    }
+                    let writes = state_writes(rt, &nodes, values);
                     let _guard = self.base_mut();
                     for (n, f, v) in writes {
                         apply::write(&n, &f, &v);
@@ -824,6 +841,12 @@ impl NetManager {
                 let Some(iid) = self.by_id.get(&id).copied() else {
                     return;
                 };
+                // WP5 (and WP7's hook): a new authority starts with fresh interpolation buffers.
+                {
+                    let mut s = session.clone();
+                    s.bind_mut().with_core(|c, _| c.interp_reset(id));
+                }
+                self.owned_shown.retain(|k, _| k.0 != id);
                 if let Some(e) = self.entries.get_mut(&iid) {
                     e.owner = owner;
                 }
@@ -1128,8 +1151,8 @@ impl NetManager {
         }
     }
 
-    /// Applies snapshot values to replicas (snapping; interpolation is WP5). Entities this peer spawned
-    /// itself keep their own state.
+    /// Applies snapshot values to replicas, snapping (WP5: netcore keeps a replica's `interpolate`
+    /// fields for `apply_interp` instead). Entities this peer spawned itself keep their own state.
     pub fn apply_states(&mut self, updates: Vec<StateUpdate>) {
         let mut writes = Vec::new();
         for u in updates {
@@ -1277,6 +1300,8 @@ impl NetManager {
             }
             if let Some(want) = track {
                 let mut s = session.clone();
+                // WP5: replica buffers or owned offsets of the old role do not carry over.
+                s.bind_mut().with_core(|c, _| c.interp_reset(id));
                 match want {
                     Some(policy) => {
                         let initial = {
@@ -1620,6 +1645,151 @@ impl NetManager {
     /// The `NetInput` of the entity rooted at `root` (None before it is spawned).
     pub fn input_of(&self, root: &Gd<Node>) -> Option<Gd<NetInput>> {
         self.entries.get(&root.instance_id())?.input.clone()
+    }
+}
+
+/// WP5: interpolation and owned offsets (docs/PLAN_NETCODE.md 2.2 step 7, 2.5; see interp.rs). The
+/// session calls `apply_interp` and `show_owned` from its `_process` and `restore_owned` at the start of
+/// its physics step; `replay::rollback` calls `interp_hot` before and after a replay.
+impl NetManager {
+    /// The node and field of (entity, part, field) for a remote entity.
+    fn remote_field(
+        &self,
+        id: NetId,
+        part: u16,
+        field: u16,
+    ) -> Option<(Gd<Node>, crate::infer::RtField)> {
+        let e = self.by_id.get(&id).and_then(|i| self.entries.get(i))?;
+        if e.origin == Origin::Local {
+            return None;
+        }
+        let rt = e.props.as_ref()?;
+        let node = e.nodes.get(usize::from(part))?.clone()?;
+        let f = rt
+            .fields
+            .get(usize::from(part))?
+            .get(usize::from(field))?
+            .clone();
+        Some((node, f))
+    }
+
+    /// Writes the values netcore sampled for this manager's replicas this render frame.
+    pub fn apply_interp(&mut self, values: Vec<((NetId, u16, u16), Value)>) {
+        let writes: Vec<_> = values
+            .into_iter()
+            .filter_map(|((id, p, f), v)| self.remote_field(id, p, f).map(|(n, rf)| (n, rf, v)))
+            .collect();
+        let _guard = self.base_mut();
+        for (n, f, v) in writes {
+            if n.is_instance_valid() {
+                apply::write(&n, &f, &v);
+            }
+        }
+    }
+
+    /// Shows the owned offsets of `keys` (this manager's entities): `property = simulated + offset`,
+    /// remembering the simulated value; fields whose offset ended get their simulated value back.
+    pub fn show_owned(&mut self, session: &Gd<NetSession>, keys: &[(NetId, u16, u16)]) {
+        let gone: Vec<_> = self
+            .owned_shown
+            .keys()
+            .filter(|k| !keys.contains(k))
+            .copied()
+            .collect();
+        let restores: Vec<_> = gone
+            .into_iter()
+            .filter_map(|k| self.owned_shown.remove(&k))
+            .collect();
+        let mut known = Vec::new();
+        let mut unread = Vec::new();
+        for k in keys {
+            match self.owned_shown.get(k) {
+                Some((n, f, sim)) => known.push((*k, n.clone(), f.clone(), sim.clone())),
+                None => {
+                    if let Some((n, f)) = self.remote_field(k.0, k.1, k.2) {
+                        unread.push((*k, n, f));
+                    }
+                }
+            }
+        }
+        {
+            let _guard = self.base_mut();
+            for (n, f, sim) in &restores {
+                if n.is_instance_valid() {
+                    apply::write(n, f, sim);
+                }
+            }
+            for (k, n, f) in unread {
+                if n.is_instance_valid() {
+                    let sim = apply::read(&n, &f);
+                    known.push((k, n, f, sim));
+                }
+            }
+        }
+        let mut s = session.clone();
+        let shown: Vec<Option<Value>> = s
+            .bind_mut()
+            .with_core(|c, _| {
+                known
+                    .iter()
+                    .map(|(k, _, _, sim)| c.apply_owned_offset(k.0, k.1, k.2, sim))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut kept = Vec::new();
+        {
+            let _guard = self.base_mut();
+            for ((k, n, f, sim), v) in known.into_iter().zip(shown) {
+                let Some(v) = v else { continue };
+                if n.is_instance_valid() {
+                    apply::write(&n, &f, &v);
+                    kept.push((k, (n, f, sim)));
+                }
+            }
+        }
+        self.owned_shown.extend(kept);
+    }
+
+    /// Puts the simulated values back (before the next physics tick).
+    pub fn restore_owned(&mut self) {
+        let shown: Vec<_> = self.owned_shown.drain().map(|(_, v)| v).collect();
+        let _guard = self.base_mut();
+        for (n, f, sim) in shown {
+            if n.is_instance_valid() {
+                apply::write(&n, &f, &sim);
+            }
+        }
+    }
+
+    /// The current values of the interpolated hot fields of `ids` (for the rollback blend).
+    pub fn interp_hot(&mut self, ids: &[NetId]) -> Vec<((NetId, u16, u16), Value)> {
+        let mut work = Vec::new();
+        for id in ids {
+            let Some(e) = self.by_id.get(id).and_then(|i| self.entries.get(i)) else {
+                continue;
+            };
+            let Some(rt) = e.props.clone() else { continue };
+            work.push((*id, rt, e.nodes.clone()));
+        }
+        let mut out = Vec::new();
+        let _guard = self.base_mut();
+        for (id, rt, nodes) in work {
+            for (p, hot) in rt.hot.iter().enumerate() {
+                let Some(Some(n)) = nodes.get(p) else {
+                    continue;
+                };
+                if !n.is_instance_valid() {
+                    continue;
+                }
+                for &f in hot {
+                    let field = &rt.fields[p][usize::from(f)];
+                    if field.interp {
+                        out.push(((id, p as u16, f), apply::read(n, field)));
+                    }
+                }
+            }
+        }
+        out
     }
 }
 

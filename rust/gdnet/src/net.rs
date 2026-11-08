@@ -24,6 +24,8 @@
 //! WP4: `input(node)` (the entity's `NetInput`, input.rs), `is_fresh()` (tick.rs), the properties
 //! `input_delay_ticks` and `adaptive_delay`, the signal `rolled_back(node, from_tick, to_tick)` (relayed
 //! from the default session) and `global_input_warnings()`.
+//!
+//! WP5: the read-only `jitter_buffer_ticks` (interp.rs) and the `teleport_distance` key of `configure()`.
 
 use crate::configure::{self, Op};
 use crate::emulation::NetEmulation;
@@ -106,6 +108,11 @@ pub struct Net {
     /// afterwards. Default off.
     #[var(get = get_adaptive_delay, set = set_adaptive_delay)]
     adaptive_delay: bool,
+    /// WP5: the effective jitter buffer in ticks (read only): the default session's current value
+    /// while it is a client, else `gdnet/interpolation/jitter_buffer_ticks` (default 2).
+    #[var(get = get_jitter_buffer_ticks, no_set)]
+    #[allow(dead_code)]
+    jitter_buffer_ticks: i64,
 }
 
 #[godot_api]
@@ -165,6 +172,14 @@ impl Net {
     }
 
     #[func]
+    fn get_jitter_buffer_ticks(&self) -> i64 {
+        match self.session.as_ref() {
+            Some(s) => s.bind().get_jitter_buffer_ticks(),
+            None => i64::from(crate::interp::jitter_buffer_ticks()),
+        }
+    }
+
+    #[func]
     fn get_adaptive_delay(&self) -> bool {
         tick::adaptive_delay()
     }
@@ -202,8 +217,8 @@ impl Net {
     }
 
     /// Corrects what the entity `node` belongs to replicates (rung 3): `state: ["+prop", "-prop"]`,
-    /// `quantize: {prop: "cm"}`, `send: {prop: "hot"}`, `tolerance`, `interpolate` change the property
-    /// table of the entity's scene and must be made before that scene's first spawn on this peer, the
+    /// `quantize: {prop: "cm"}`, `send: {prop: "hot"}`, `tolerance`, `interpolate`, `teleport_distance`
+    /// change the property table of the entity's scene and must be made before that scene's first spawn on this peer, the
     /// same way on every peer; `priority` applies to this entity at any time. Paths are `prop` or
     /// `Part:prop`, relative to `node`.
     #[func]
@@ -270,6 +285,17 @@ impl Net {
                             for (p, t) in d.iter_shared() {
                                 let t = profiles::number(&t).unwrap_or(0.0) as f32;
                                 ops.push(Op::Tolerance(Some(path(&p.to_string())), t));
+                            }
+                        }
+                    }
+                },
+                "teleport_distance" => match profiles::number(&v) {
+                    Some(t) => ops.push(Op::Teleport(None, t.max(0.0) as f32)),
+                    None => {
+                        if let Ok(d) = v.try_to::<VarDictionary>() {
+                            for (p, t) in d.iter_shared() {
+                                let t = profiles::number(&t).unwrap_or(0.0).max(0.0) as f32;
+                                ops.push(Op::Teleport(Some(path(&p.to_string())), t));
                             }
                         }
                     }

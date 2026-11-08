@@ -17,6 +17,7 @@
 
 use crate::api_ext::NetMultiplayerApi;
 use crate::emulation::{settings_of, NetEmulation};
+use crate::interp;
 use crate::manager::{NetManager, TickCtx, MANAGERS_GROUP};
 use crate::pipe_peer::NetPipePeer;
 use crate::poll::{NetPoller, POLLER_NODE};
@@ -60,6 +61,10 @@ enum Restore {
 }
 
 /// The callbacks a session connects on the wrapped `SceneMultiplayer`.
+/// WP5: the tree signal the owned offsets come off at (emitted at the start of every physics frame,
+/// before any node's `_physics_process`, and before code awaiting it resumes).
+const PHYSICS_FRAME_HOOK: (&str, &str) = ("physics_frame", "_on_physics_frame");
+
 const HOOKS: [(&str, &str); 6] = [
     ("peer_packet", "_on_peer_packet"),
     ("peer_connected", "_on_peer_connected"),
@@ -110,6 +115,12 @@ pub struct NetSession {
     stats: Counters,
     /// WP4: the predicted tick of the previous step (a jump means the lead grew: catch up).
     last_ptick: Option<u64>,
+    /// WP5: the effective jitter buffer in ticks (read only; a client's adapts, see interp.rs).
+    #[var(get = get_jitter_buffer_ticks, no_set)]
+    #[allow(dead_code)]
+    jitter_buffer_ticks: i64,
+    /// WP5: owned offsets were shown in the last render frame (restore them before the next tick).
+    owned_active: bool,
 }
 
 /// Byte and timing counters behind `stats()` (2.7, the WP8 meter's source).
@@ -131,6 +142,11 @@ struct Counters {
     replayed_ticks: u64,
     window_start_rollbacks: u64,
     rollbacks_per_s: u64,
+    /// WP5.
+    window_start_late: u64,
+    late_per_s: u64,
+    window_start_corrections: u64,
+    corrections_per_s: u64,
 }
 
 #[godot_api]
@@ -138,6 +154,12 @@ impl INode for NetSession {
     fn ready(&mut self) {
         self.base_mut().set_process_priority(-1000);
         self.base_mut().set_physics_process_priority(-1000);
+        // Gate G0: no render-frame work unless a client session runs (start() turns it on).
+        let client = self
+            .core
+            .as_ref()
+            .is_some_and(|c| c.role() == netcore::Role::Client);
+        self.base_mut().set_process(client);
         if !self.poller_added {
             self.poller_added = true;
             let mut poller = NetPoller::new_alloc();
@@ -151,6 +173,11 @@ impl INode for NetSession {
 
     fn physics_process(&mut self, _delta: f64) {
         self.step();
+    }
+
+    /// 2.2 step 7 (WP5): interpolated replicas and owned offsets, once per render frame.
+    fn process(&mut self, _delta: f64) {
+        self.render_frame();
     }
 
     /// A session whose node leaves the tree ends (as `leave()`): freeing a branch ends its session.
@@ -244,7 +271,10 @@ impl NetSession {
     /// `replayed_ticks`, `inputs_repeated` (server: ticks a client's last frame was repeated),
     /// `input_frames_received`, `input_messages_sent`, `prediction_confirmations`,
     /// `prediction_mismatches`, `prediction_stale`, `prediction_lead` (ticks; -1 unknown),
-    /// `input_delay` (effective ticks), `predicted_tick`.
+    /// `input_delay` (effective ticks), `predicted_tick`. WP5: `jitter_buffer_ticks` (effective),
+    /// `render_lag_ticks` (newest snapshot tick minus the render tick), `late_snapshots` (total) and
+    /// `late_snapshots_per_s`, `offset_corrections` (corrections turned into decaying offsets, replicas
+    /// and owned blends) and `offset_corrections_per_s`, `interp_teleports`.
     #[func]
     pub fn stats(&self) -> VarDictionary {
         let c = &self.stats;
@@ -287,7 +317,38 @@ impl NetSession {
         d.set("rollbacks", c.rollbacks as i64);
         d.set("rollbacks_per_s", c.rollbacks_per_s as i64);
         d.set("replayed_ticks", c.replayed_ticks as i64);
+        d.set("jitter_buffer_ticks", self.get_jitter_buffer_ticks());
+        let (lag, i) = self
+            .core
+            .as_ref()
+            .map_or((0.0, Default::default()), |core| {
+                (
+                    core.interp().timeline.render_lag(),
+                    core.interp().timeline.stats,
+                )
+            });
+        let i: netcore::InterpStats = i;
+        d.set("render_lag_ticks", lag);
+        d.set("late_snapshots", i.late_snapshots as i64);
+        d.set("late_snapshots_per_s", c.late_per_s as i64);
+        d.set("offset_corrections", i.corrections as i64);
+        d.set("offset_corrections_per_s", c.corrections_per_s as i64);
+        d.set("interp_teleports", i.teleports as i64);
         d
+    }
+
+    /// WP5: the effective jitter buffer in ticks: a client's current (adaptive) value, else the
+    /// project setting `gdnet/interpolation/jitter_buffer_ticks` (default 2).
+    #[func]
+    pub fn get_jitter_buffer_ticks(&self) -> i64 {
+        i64::from(
+            self.core
+                .as_ref()
+                .filter(|c| c.role() == netcore::Role::Client)
+                .map_or_else(interp::jitter_buffer_ticks, |c| {
+                    c.interp().timeline.buffer()
+                }),
+        )
     }
 
     #[func]
@@ -411,6 +472,11 @@ impl NetSession {
         } else {
             Session::client(cfg)
         };
+        core.set_interpolation(
+            interp::jitter_buffer_ticks(),
+            interp::adaptive(),
+            interp::teleport_distance(),
+        );
         let now = now_us();
         if hosting {
             for id in inner.get_peers().as_slice() {
@@ -428,8 +494,16 @@ impl NetSession {
         self.applied = None;
         self.stats = Counters::default();
         self.last_ptick = None;
+        self.owned_active = false;
+        if !hosting {
+            let cb = Callable::from_object_method(&me, PHYSICS_FRAME_HOOK.1);
+            if !tree.is_connected(PHYSICS_FRAME_HOOK.0, &cb) {
+                tree.connect(PHYSICS_FRAME_HOOK.0, &cb);
+            }
+        }
         self.apply_emulation();
         self.base_mut().set_physics_process(true);
+        self.base_mut().set_process(!hosting);
         Error::OK
     }
 
@@ -548,6 +622,12 @@ impl NetSession {
         }
     }
 
+    /// WP5: the start of a physics frame: the owned offsets the last render frame showed come off.
+    #[func]
+    fn _on_physics_frame(&mut self) {
+        self.restore_owned_offsets();
+    }
+
     #[func]
     fn _on_peer_connected(&mut self, id: i64) {
         let now = now_us();
@@ -595,6 +675,9 @@ impl NetSession {
         if self.core.is_none() {
             return;
         }
+        // WP5: the owned offsets come off before anything simulates (normally already done at the
+        // tree's `physics_frame`).
+        self.restore_owned_offsets();
         self.apply_emulation();
         let now = now_us();
         let inbox = std::mem::take(&mut self.inbox);
@@ -759,6 +842,13 @@ impl NetSession {
             c.window_start_received = c.received;
             c.rollbacks_per_s = c.rollbacks - c.window_start_rollbacks;
             c.window_start_rollbacks = c.rollbacks;
+            if let Some(core) = self.core.as_ref() {
+                let i = core.interp().timeline.stats;
+                c.late_per_s = i.late_snapshots - c.window_start_late;
+                c.window_start_late = i.late_snapshots;
+                c.corrections_per_s = i.corrections - c.window_start_corrections;
+                c.window_start_corrections = i.corrections;
+            }
             c.poll_ms_avg = c.poll_us_window as f64 / 1000.0 / f64::from(c.window_ticks);
             c.poll_us_window = 0;
             c.window_ticks = 0;
@@ -1000,10 +1090,20 @@ impl NetSession {
     }
 
     fn stop(&mut self) {
+        if self.core.is_none() {
+            return;
+        }
+        self.restore_owned_offsets();
         let Some(_core) = self.core.take() else {
             return;
         };
         let me = self.to_gd();
+        if let Some(mut tree) = scene_tree() {
+            let cb = Callable::from_object_method(&me, PHYSICS_FRAME_HOOK.1);
+            if tree.is_connected(PHYSICS_FRAME_HOOK.0, &cb) {
+                tree.disconnect(PHYSICS_FRAME_HOOK.0, &cb);
+            }
+        }
         if let Some(mut inner) = self.inner.take() {
             for (signal, method) in HOOKS {
                 let cb = Callable::from_object_method(&me, method);
@@ -1037,6 +1137,63 @@ impl NetSession {
         self.inbox.clear();
         self.applied = None;
         self.base_mut().set_physics_process(false);
+        self.base_mut().set_process(false);
+    }
+
+    /// 2.2 step 7 (WP5, see interp.rs): advances the render timeline, writes the replicas' interpolated
+    /// fields that changed, and shows the owned offsets (`property = simulated + offset`). A client's
+    /// session only; anything else returns at once.
+    fn render_frame(&mut self) {
+        let (values, owned) = {
+            let Some(core) = self.core.as_mut() else {
+                return;
+            };
+            if core.role() != netcore::Role::Client || !core.is_connected() {
+                return;
+            }
+            let values = core.interp_frame(now_us());
+            (values, core.owned_offset_keys())
+        };
+        if values.is_empty() && owned.is_empty() && !self.owned_active {
+            return;
+        }
+        self.owned_active = !owned.is_empty();
+        let (mut by_key, mut owned_by_key) = (HashMap::new(), HashMap::new());
+        if let Some(core) = self.core.as_ref() {
+            let key_of = |id: netcore::NetId| core.entities().get(id).map(|r| r.parent.manager);
+            for (k, v) in values {
+                if let Some(m) = key_of(k.0) {
+                    by_key.entry(m).or_insert_with(Vec::new).push((k, v));
+                }
+            }
+            for k in owned {
+                if let Some(m) = key_of(k.0) {
+                    owned_by_key.entry(m).or_insert_with(Vec::new).push(k);
+                }
+            }
+        }
+        let managers = self.managers();
+        let me = self.to_gd();
+        let _guard = self.base_mut();
+        for (key, mut m) in managers {
+            if let Some(vals) = by_key.remove(&key) {
+                m.bind_mut().apply_interp(vals);
+            }
+            let keys = owned_by_key.remove(&key).unwrap_or_default();
+            m.bind_mut().show_owned(&me, &keys);
+        }
+    }
+
+    /// Writes the simulated values back where the last render frame showed owned offsets.
+    fn restore_owned_offsets(&mut self) {
+        if !self.owned_active {
+            return;
+        }
+        let managers = self.managers();
+        let _guard = self.base_mut();
+        for (_, mut m) in managers {
+            m.bind_mut().restore_owned();
+        }
     }
 }
 

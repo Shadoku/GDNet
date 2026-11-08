@@ -32,7 +32,9 @@ func _level_diff(s: Node, c: Node) -> String:
 	var cp: CharacterBody2D = c.get_node("Player")
 	if not _near(sp.position, cp.position, 4.0):
 		out.append("player position %s vs %s" % [sp.position, cp.position])
-	if not _near(sp.velocity, cp.velocity, 2.0):
+	# WP5: velocity is interpolated, so the replica shows it about a jitter buffer (plus a tick of
+	# transit) later; the wanderer turns 1.2 px/s per tick, hence 6 (five ticks) instead of WP3's 2.
+	if not _near(sp.velocity, cp.velocity, 6.0):
 		out.append("player velocity %s vs %s" % [sp.velocity, cp.velocity])
 	var ss: AnimatedSprite2D = s.get_node("Player/Sprite")
 	var cs: AnimatedSprite2D = c.get_node("Player/Sprite")
@@ -118,6 +120,7 @@ func test_g7_a_plain_scene_replicates_with_no_script_edits() -> void:
 
 
 const CRATE := preload("res://tests/fixtures/net/crate.tscn")
+const CRATE_SNAP := preload("res://tests/fixtures/net/crate_snap.tscn")
 const CONFIGURED := preload("res://tests/fixtures/net/configured.tscn")
 const LISTED := preload("res://tests/fixtures/net/listed.tscn")
 const INHERITED := preload("res://tests/fixtures/net/inherited.tscn")
@@ -286,11 +289,12 @@ func test_g4_idle_entities_cost_almost_nothing() -> void:
 	assert_lt(total, 400, "100 idle entities cost under 400 B/s (pings only)")
 
 
-func _moving_crates(count: int) -> Array[Node2D]:
+func _moving_crates(count: int, scene: PackedScene = CRATE) -> Array[Node2D]:
 	var managers := net.add_managers()
 	var crates: Array[Node2D] = []
 	for i in count:
-		var c := _crate("Move%d" % i)
+		var c: Node2D = scene.instantiate()
+		c.name = "Move%d" % i
 		managers["Server"].add_child(c)
 		crates.append(c)
 	net.server_session.ticked.connect(func(t: int) -> void:
@@ -320,7 +324,12 @@ func test_g4_a_halved_budget_updates_far_entities_less_often() -> void:
 	net.start()
 	assert_true(await net.wait_connected())
 	net.server_session.budget_bytes_per_s = 16384
-	var crates := _moving_crates(100)
+	# WP5: interpolated replicas change every render frame, so the updates are counted on a copy of the
+	# crate whose transform snaps (the replication under test is the same).
+	var probe: Node = CRATE_SNAP.instantiate()
+	Net.configure(probe, {"interpolate": false})
+	probe.free()
+	var crates := _moving_crates(100, CRATE_SNAP)
 	# The first ten matter more (priority 10, the stand-in for "near" until WP7's interest scoring).
 	for i in 10:
 		Net.configure(crates[i], {"priority": 10})

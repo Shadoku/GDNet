@@ -8,7 +8,8 @@
 //! change after the scene's table was derived on this peer is refused with an error.
 //!
 //! Keys: `state: ["+prop", "-prop", "+Part:prop"]`, `quantize: {prop: "cm"}`, `send: {prop: "hot"}`,
-//! `tolerance: float | {prop: float}`, `interpolate: bool | {prop: bool}` (table changes); `priority`
+//! `tolerance: float | {prop: float}`, `interpolate: bool | {prop: bool}`, WP5 `teleport_distance: float |
+//! {prop: float}` (table changes); `priority`
 //! (per entity, any time); anything else (`radius`, `lag_compensated`, ...) is kept for later packages
 //! in the root's `_net_config` meta.
 
@@ -29,6 +30,8 @@ pub enum Op {
     /// None = every property.
     Tolerance(Option<PropPath>, f32),
     Interpolate(Option<PropPath>, bool),
+    /// WP5: the teleport distance (None = every property).
+    Teleport(Option<PropPath>, f32),
 }
 
 thread_local! {

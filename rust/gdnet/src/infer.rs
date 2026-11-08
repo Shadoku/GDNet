@@ -219,6 +219,9 @@ fn make_desc(name: &str, tag: TypeTag, entry: Option<&Entry>, tick_rate: u32) ->
         d.tolerance = t;
     }
     d.reliable = entry.and_then(|e| e.reliable).unwrap_or(false);
+    if let Some(t) = entry.and_then(|e| e.teleport_distance) {
+        d.teleport_distance = t.max(0.0);
+    }
     if let Some(s) = entry.and_then(|e| e.poll_seconds) {
         d.slow_ticks = (s * tick_rate as f32).round().max(1.0) as u32;
     }
@@ -419,6 +422,13 @@ pub fn derive(
                     .flatten()
                     .for_each(|(d, _)| d.interpolate = on),
             },
+            Op::Teleport(path, t) => match path {
+                Some(path) => with_desc(scene, &mut parts, &path, |d| d.teleport_distance = t),
+                None => parts
+                    .iter_mut()
+                    .flatten()
+                    .for_each(|(d, _)| d.teleport_distance = t),
+            },
         }
     }
     // Debug hook: perturb one property's quantiser on this side.
@@ -476,6 +486,8 @@ pub enum Accessor {
 pub struct RtField {
     pub acc: Accessor,
     pub ty: TypeTag,
+    /// WP5: the `interpolate` option (replicas sample it; owners blend it after a rollback).
+    pub interp: bool,
 }
 
 /// A derived table with cached `StringName`s and hot/cold field lists, owned by a manager.
@@ -502,7 +514,11 @@ impl RuntimeProps {
                     AccessKind::AnimPosition => Accessor::AnimPosition(name),
                     AccessKind::Resource => Accessor::Resource(name),
                 };
-                f.push(RtField { acc, ty: d.ty });
+                f.push(RtField {
+                    acc,
+                    ty: d.ty,
+                    interp: d.interpolate,
+                });
                 if d.schedule == Schedule::Hot {
                     h.push(i as u16);
                 } else {

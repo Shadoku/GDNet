@@ -163,6 +163,10 @@ pub struct PropDesc {
     pub reliable: bool,
     /// 0, or: only resent when another property of the part changed, or after this many ticks.
     pub slow_ticks: u32,
+    /// WP5: a correction larger than this snaps on replicas instead of blending (property units; 0 =
+    /// `gdnet/interpolation/teleport_distance`, else automatic: see `interp::Params`).
+    #[serde(default)]
+    pub teleport_distance: f32,
 }
 
 // Tolerances are compared bit for bit: a table is equal only when both sides wrote the same numbers.
@@ -180,6 +184,7 @@ impl PropDesc {
             tolerance: 0.001,
             reliable: false,
             slow_ticks: 0,
+            teleport_distance: 0.0,
         }
     }
 
@@ -192,7 +197,7 @@ impl PropDesc {
     /// A readable description (mismatch reasons).
     pub fn describe(&self) -> String {
         std::format!(
-            "{}: {} {} {}{}{} tolerance {}{}",
+            "{}: {} {} {}{}{} tolerance {}{}{}",
             self.name,
             self.ty.name(),
             self.schedule.name(),
@@ -206,6 +211,11 @@ impl PropDesc {
             self.tolerance,
             if self.slow_ticks > 0 {
                 std::format!(" slow {}", self.slow_ticks)
+            } else {
+                String::new()
+            },
+            if self.teleport_distance > 0.0 {
+                std::format!(" teleport {}", self.teleport_distance)
             } else {
                 String::new()
             }
@@ -224,6 +234,11 @@ impl PropDesc {
         out.push(u8::from(self.reliable));
         out.extend_from_slice(&self.tolerance.to_bits().to_le_bytes());
         out.extend_from_slice(&self.slow_ticks.to_le_bytes());
+        // WP5: tables without a teleport distance hash as before.
+        if self.teleport_distance > 0.0 {
+            out.extend_from_slice(b"teleport");
+            out.extend_from_slice(&self.teleport_distance.to_bits().to_le_bytes());
+        }
     }
 }
 

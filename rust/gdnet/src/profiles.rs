@@ -3,7 +3,8 @@
 //!
 //! A `NetProfiles` resource maps class names to arrays of property entries:
 //! `{name, schedule? ("hot" | "cold"; "send" is accepted too), quantize? ("raw" | "mm" | "cm" | "deg" |
-//! "smallest3" | "f16"), interpolate?, tolerance?, reliable?, poll_seconds?, remove?}`. A class mapped
+//! "smallest3" | "f16"), interpolate?, tolerance?, reliable?, poll_seconds?, teleport_distance? (WP5),
+//! remove?}`. A class mapped
 //! to an empty array syncs nothing and stops the walk up its class hierarchy (cameras, timers, audio
 //! players). `merge(other)` lays `other` over this one: an entry replaces the entry of the same name,
 //! `{name, remove: true}` drops it, an empty array empties the class.
@@ -47,6 +48,8 @@ pub struct Entry {
     pub tolerance: Option<f32>,
     pub reliable: Option<bool>,
     pub poll_seconds: Option<f32>,
+    /// WP5: a replica snaps instead of blending a correction larger than this (property units).
+    pub teleport_distance: Option<f32>,
     pub remove: bool,
 }
 
@@ -70,6 +73,7 @@ impl Entry {
             tolerance: f("tolerance"),
             reliable: b("reliable"),
             poll_seconds: f("poll_seconds"),
+            teleport_distance: f("teleport_distance"),
             remove: b("remove").unwrap_or(false),
         })
     }
@@ -95,6 +99,9 @@ impl Entry {
         if let Some(p) = self.poll_seconds {
             d.set("poll_seconds", f64::from(p));
         }
+        if let Some(t) = self.teleport_distance {
+            d.set("teleport_distance", f64::from(t));
+        }
         if self.remove {
             d.set("remove", true);
         }
@@ -102,8 +109,12 @@ impl Entry {
     }
 
     fn render(&self) -> String {
+        let teleport = self
+            .teleport_distance
+            .map(|t| format!("|teleport {}", t.to_bits()))
+            .unwrap_or_default();
         format!(
-            "{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+            "{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}{}",
             self.name,
             self.schedule.map(Schedule::name),
             self.quant.map(Quant::name),
@@ -111,7 +122,8 @@ impl Entry {
             self.tolerance.map(f32::to_bits),
             self.reliable,
             self.poll_seconds.map(f32::to_bits),
-            self.remove
+            self.remove,
+            teleport
         )
     }
 }
@@ -248,13 +260,13 @@ pub fn builtin() -> Profiles {
     );
     put(
         &["CharacterBody2D", "CharacterBody3D"],
-        vec![hot("velocity", Quant::Mm, false)],
+        vec![hot("velocity", Quant::Mm, true)],
     );
     put(
         &["RigidBody2D", "RigidBody3D"],
         vec![
-            hot("linear_velocity", Quant::Mm, false),
-            hot("angular_velocity", Quant::Mm, false),
+            hot("linear_velocity", Quant::Mm, true),
+            hot("angular_velocity", Quant::Mm, true),
         ],
     );
     put(

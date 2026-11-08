@@ -12,6 +12,7 @@ mod emulation;
 mod entity_node;
 mod infer;
 mod input;
+mod interp;
 mod manager;
 mod net;
 mod parts;

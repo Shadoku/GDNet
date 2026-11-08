@@ -11,7 +11,8 @@
 //! WP3: [`props`] (property tables), [`quant`] (bit packing, quantisers), [`snapshot`] (the snapshot
 //! format), [`priority`] (accumulator and budget), [`delta`] (dirty tracking, acked baselines, packing).
 //! WP4: [`input`] (input frames, redundancy, the server's input buffer, adaptive delay), [`predict`]
-//! (prediction histories, mismatch detection, rollback requests, the tick lead).
+//! (prediction histories, mismatch detection, rollback requests, the tick lead). WP5: [`interp`] (the
+//! render timeline, the adaptive jitter buffer, sample buffers, error offsets).
 
 #![forbid(unsafe_code)]
 
@@ -20,6 +21,7 @@ pub mod delta;
 pub mod emul;
 pub mod entity;
 pub mod input;
+pub mod interp;
 pub mod peers;
 pub mod predict;
 pub mod priority;
@@ -36,6 +38,7 @@ pub use entity::{
     MANAGER_ROOT,
 };
 pub use input::{InputFrame, InputMsg, TakenFrame};
+pub use interp::{Interp, InterpStats};
 pub use peers::{PeerId, SERVER};
 pub use predict::{Policy, Rollback};
 pub use props::{PropDesc, Quant, ScenePropsTable, Schedule, TypeTag, Value};

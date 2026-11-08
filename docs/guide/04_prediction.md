@@ -7,9 +7,9 @@ the other clients at all. This page is the rung 1 tutorial of `docs/PLAN_NETCODE
 after, what `Net.input` returns where, who simulates, `Net.is_fresh()`, rollback, the engine-state
 caveat, input delay and the settings.
 
-What is not here yet: other clients **snap** to the server's state (interpolation is WP5); behaviour calls
-(`Net.sync`) are WP6; changing who may take an entity (`transfer`) and trusting a client's own state
-(`client_owned`) are WP7.
+What is not here yet: behaviour calls (`Net.sync`) are WP6; changing who may take an entity (`transfer`)
+and trusting a client's own state (`client_owned`) are WP7. How the other clients show the player
+(interpolation) and how the owner blends a correction is `05_interpolation.md`.
 
 ## Before and after
 

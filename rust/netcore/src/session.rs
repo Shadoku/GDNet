@@ -25,9 +25,10 @@ use crate::entity::{
     CreateAction, EntityAction, EntityRecord, EntityTable, HeldQueue, IdAllocator, NetId, ParentRef,
 };
 use crate::input::{self, AdaptiveDelay, InputBuffer, InputFrame, OwnerInputs, TakenFrame};
+use crate::interp::Interp;
 use crate::peers::{PeerId, PeerTable, Stage, SERVER};
 use crate::predict::{self, Policy, PredictStats, Prediction, Rollback};
-use crate::props::{ScenePropsTable, Value};
+use crate::props::{PropDesc, ScenePropsTable, Value};
 use crate::wire::{
     self, Hello, IdRange, Message, Ping, Pong, Protocol, Reject, Reliability, Welcome,
 };
@@ -200,6 +201,8 @@ pub struct Session {
     adaptive: Option<AdaptiveDelay>,
     interaction: bool,
     input_stats: InputStats,
+    /// WP5 client side: the render timeline, replicas' sample buffers, error and owned offsets.
+    interp: Interp,
 }
 
 /// WP4 input counters.
@@ -288,6 +291,7 @@ impl Session {
             adaptive: None,
             interaction: false,
             input_stats: InputStats::default(),
+            interp: Interp::new(rate),
         }
     }
 
@@ -523,6 +527,11 @@ impl Session {
                 self.route_updates();
                 if let Some(t) = applied {
                     self.prediction.mark_confirmed(t);
+                }
+                // WP5: every arrival measures the jitter, a stale (overtaken) one too.
+                let tick = applied.or_else(|| crate::quant::BitReader::new(&body).read_varint());
+                if let Some(t) = tick {
+                    self.interp.timeline.on_snapshot(t, now_us);
                 }
             }
             Message::Field(f) if self.role == Role::Client && peer == SERVER => {
@@ -1397,13 +1406,30 @@ impl Session {
             if self.prediction.diverts(u.id, u.part, u.field) {
                 self.prediction
                     .confirm(u.id, u.part, u.field, u.value, u.tick);
+            } else if let Some(desc) = self.interpolated_desc(u.id, u.part, u.field) {
+                // WP5: an interpolated field of a replica goes to its sample buffer; gdnet writes the
+                // sampled value each render frame (`interp_frame`).
+                self.interp
+                    .push((u.id, u.part, u.field), &desc, u.tick, u.value);
             } else {
                 self.pass_updates.push_back(u);
             }
         }
     }
 
+    /// WP5: the descriptor of a field this client interpolates: an `interpolate` field of an entity it
+    /// does not predict.
+    fn interpolated_desc(&self, id: NetId, part: u16, field: u16) -> Option<PropDesc> {
+        if self.role != Role::Client || self.prediction.is_tracked(id) {
+            return None;
+        }
+        let scene = self.entities.get(id)?.scene;
+        let d = self.repl.table(scene)?.get(part, field)?;
+        d.interpolate.then(|| d.clone())
+    }
+
     fn forget_input(&mut self, id: NetId) {
+        self.interp.reset(id);
         self.prediction.untrack(id);
         self.owner_inputs.forget(id);
         self.input_buffers.remove(&id);
@@ -1601,6 +1627,94 @@ impl Session {
 
     pub fn input_stats(&self) -> InputStats {
         self.input_stats
+    }
+}
+
+/// Interpolation and smoothing (WP5, docs/PLAN_NETCODE.md 2.2 step 7, 2.5; see [`crate::interp`]).
+impl Session {
+    /// Sets the jitter buffer's starting value (1..=6 ticks), whether it adapts, and the default
+    /// teleport distance (0 = automatic).
+    pub fn set_interpolation(&mut self, buffer_ticks: u32, adaptive: bool, teleport: f64) {
+        self.interp.timeline.configure(buffer_ticks, adaptive);
+        self.interp.set_default_teleport(teleport);
+    }
+
+    pub fn interp(&self) -> &Interp {
+        &self.interp
+    }
+
+    /// One render frame (2.2 step 7): advances the render timeline, decays the offsets and returns
+    /// the replica fields whose displayed value changed, for gdnet to write.
+    pub fn interp_frame(&mut self, now_us: u64) -> Vec<((NetId, u16, u16), Value)> {
+        if self.role != Role::Client {
+            return Vec::new();
+        }
+        self.route_updates();
+        self.interp.frame(now_us)
+    }
+
+    /// A replica's initial value of an interpolated field (from its `Create`): held until the first
+    /// snapshot sample, so the first movement starts from it.
+    pub fn interp_seed(&mut self, id: NetId, part: u16, field: u16, value: Value) {
+        if let Some(desc) = self.interpolated_desc(id, part, field) {
+            self.interp.seed((id, part, field), &desc, value);
+        }
+    }
+
+    /// Whether this client interpolates the field (it is a replica's `interpolate` field).
+    pub fn is_interpolated(&self, id: NetId, part: u16, field: u16) -> bool {
+        self.interpolated_desc(id, part, field).is_some()
+    }
+
+    /// After a rollback of an owned entity: keeps `displayed - replayed` as the field's owned offset
+    /// (see [`Interp::blend_owned`]). Only for `interpolate` fields.
+    pub fn blend_owned(
+        &mut self,
+        id: NetId,
+        part: u16,
+        field: u16,
+        displayed: &Value,
+        replayed: &Value,
+    ) -> bool {
+        let Some(scene) = self.entities.get(id).map(|r| r.scene) else {
+            return false;
+        };
+        let Some(desc) = self
+            .repl
+            .table(scene)
+            .and_then(|t| t.get(part, field))
+            .cloned()
+        else {
+            return false;
+        };
+        if !desc.interpolate {
+            return false;
+        }
+        self.interp
+            .blend_owned((id, part, field), &desc, displayed, replayed)
+    }
+
+    /// The owned fields that have an offset to show.
+    pub fn owned_offset_keys(&self) -> Vec<(NetId, u16, u16)> {
+        self.interp.owned_keys()
+    }
+
+    /// `sim` with the field's owned offset added (None without an offset).
+    pub fn apply_owned_offset(
+        &self,
+        id: NetId,
+        part: u16,
+        field: u16,
+        sim: &Value,
+    ) -> Option<Value> {
+        self.interp
+            .owned_offset((id, part, field))
+            .map(|o| o.apply(sim))
+    }
+
+    /// Forgets the samples and offsets of `id` (its authority changed: WP7 calls this too).
+    pub fn interp_reset(&mut self, id: NetId) {
+        self.interp.reset(id);
     }
 }
 
@@ -2347,6 +2461,62 @@ mod tests {
         assert_eq!(ups.len(), 1, "{ups:?}");
         assert_eq!(ups[0].value, Value::Vector2([6.0, 1.0]));
         assert_eq!(p.server.repl_stats().snapshots_sent, 1);
+    }
+
+    /// WP5: a replica's `interpolate` field goes to the sample buffer and is written per render frame;
+    /// other fields still pass through.
+    #[test]
+    fn interpolated_fields_of_replicas_are_sampled_not_passed() {
+        let mut p = connected_pair();
+        let mut table = props();
+        table.parts[0][0].interpolate = true;
+        p.server.register_scene(SCENE, 42);
+        p.server.register_props(SCENE, table.clone(), names());
+        let id = p
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "A", 1, 3, std::vec![]).with_values(state(5.0)),
+                p.now,
+            )
+            .unwrap();
+        p.step();
+        p.client.register_scene(SCENE, 42);
+        assert!(p.client.register_props(SCENE, table, names()));
+        let _ = entity_events(&mut p.client);
+        assert!(p.client.is_interpolated(id, 0, 0));
+        assert!(!p.client.is_interpolated(id, 0, 1));
+        assert!(
+            !p.server.is_interpolated(id, 0, 0),
+            "the server never interpolates"
+        );
+        p.client.interp_seed(id, 0, 0, Value::Vector2([5.0, 1.0]));
+        for k in 0..10 {
+            p.server.record_part(
+                id,
+                0,
+                &[
+                    (0, Value::Vector2([6.0 + k as f32, 1.0])),
+                    (1, Value::Bool(k % 2 == 0)),
+                ],
+            );
+            step_sync(&mut p);
+        }
+        let ups = p.client.drain_state_updates();
+        assert!(!ups.is_empty());
+        assert!(
+            ups.iter().all(|u| u.field == 1),
+            "only the bool passes: {ups:?}"
+        );
+        let out = p.client.interp_frame(p.now);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, (id, 0, 0));
+        let Value::Vector2(v) = out[0].1 else {
+            panic!()
+        };
+        assert!(v[0] > 5.0 && v[0] < 16.0, "{v:?}");
+        assert!(p.client.interp().timeline.stats.snapshots >= 9);
+        assert!(p.server.interp_frame(p.now).is_empty());
     }
 
     #[test]
