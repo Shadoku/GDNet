@@ -1,7 +1,7 @@
 extends SceneTree
 ## Headless unit-test runner. No addons required.
 ##
-##   godot --headless --path . -s tests/framework/runner.gd [-- [--filter=<substr>] [--verbose] [--junit=<path>]]
+##   godot --headless --path . -s tests/framework/runner.gd [-- [--filter=<substr>] [--verbose] [--junit=<path>] [--jobs=<n>]]
 ##
 ## Discovers res://tests/**/test_*.gd, instantiates each (must extend TestCase) once per
 ## test_* method, runs before_each / test / after_each with a per-test timeout, and
@@ -11,6 +11,13 @@ extends SceneTree
 ## (the "inner" run) and reads its combined stdout/stderr. Any ERROR / SCRIPT ERROR
 ## printed while a test is running is attributed to that test and fails it, unless the
 ## test sets `allow_errors = true`. This is why "RESULT: PASS" can be trusted.
+##
+## `--jobs=N` (N > 1) splits the test files over N inner processes running at once (whole files per
+## process, so a file's tests keep their order and process). Each inner writes its log with Godot's
+## `--log-file`, which keeps prints, markers and engine errors in one ordered stream; the outer drains
+## the pipes and parses the logs. Files are balanced by the durations of the last run (kept in
+## `user://test_durations.json`), else by size. Tests sleep on wall-clock time far more than they use
+## the CPU, so two or three jobs roughly halve or third the stage. Needs Godot 4.4+ (older: one process).
 
 const TEST_ROOT := "res://tests"
 
@@ -18,6 +25,8 @@ var _inner := false
 var _filter := ""
 var _verbose := false
 var _junit_path := ""
+var _jobs := 1
+var _files: PackedStringArray = []
 var _results: Array[Dictionary] = []
 var _orphan_errors: Array[String] = []
 
@@ -38,10 +47,18 @@ func _parse_args() -> void:
 			_verbose = true
 		elif arg.begins_with("--junit="):
 			_junit_path = arg.trim_prefix("--junit=")
+		elif arg.begins_with("--jobs="):
+			_jobs = maxi(1, int(arg.trim_prefix("--jobs=")))
+		elif arg.begins_with("--files="):
+			_files = arg.trim_prefix("--files=").split(",", false)
 
 # --- outer process: spawn inner, parse its output, report ---------------------------
 
 func _run_outer() -> void:
+	# Non-blocking pipes and exit codes of spawned processes need Godot 4.4.
+	if _jobs > 1 and Engine.get_version_info().hex >= 0x040400:
+		_run_outer_parallel()
+		return
 	var project_dir := ProjectSettings.globalize_path("res://")
 	var args := ["--headless", "--path", project_dir, "-s", get_script().resource_path, "--", "--inner"]
 	args.append_array(OS.get_cmdline_user_args())
@@ -51,6 +68,100 @@ func _run_outer() -> void:
 	for chunk in output:
 		text += str(chunk)
 	_parse_inner_output(text)
+	_report(code)
+
+const DURATIONS := "user://test_durations.json"
+
+## `--jobs=N`: the files spread over N inner processes (longest first onto the least loaded one).
+func _run_outer_parallel() -> void:
+	var project_dir := ProjectSettings.globalize_path("res://")
+	var scripts := _find_test_scripts(TEST_ROOT)
+	scripts.sort()
+	var known: Dictionary = {}
+	if FileAccess.file_exists(DURATIONS):
+		var parsed = JSON.parse_string(FileAccess.get_file_as_string(DURATIONS))
+		if parsed is Dictionary:
+			known = parsed
+	var weights := {}
+	for path in scripts:
+		var key := path.trim_prefix("res://")
+		weights[path] = float(known[key]) if known.has(key) else float(FileAccess.get_file_as_bytes(path).size())
+	var order := scripts.duplicate()
+	order.sort_custom(func(a: String, b: String) -> bool: return weights[a] > weights[b])
+	var jobs := mini(_jobs, maxi(1, scripts.size()))
+	var shards: Array[PackedStringArray] = []
+	var loads: Array[float] = []
+	for i in jobs:
+		shards.append(PackedStringArray())
+		loads.append(0.0)
+	for path in order:
+		var best := 0
+		for i in jobs:
+			if loads[i] < loads[best]:
+				best = i
+		shards[best].append(path)
+		loads[best] += weights[path]
+	var user_args: PackedStringArray = []
+	for a in OS.get_cmdline_user_args():
+		if not a.begins_with("--jobs=") and not a.begins_with("--junit="):
+			user_args.append(a)
+	var running: Array[Dictionary] = []
+	for i in jobs:
+		if shards[i].is_empty():
+			continue
+		var log_path := OS.get_cache_dir().path_join("godot_test_shard_%d_%d.log" % [OS.get_process_id(), i])
+		if FileAccess.file_exists(log_path):
+			DirAccess.remove_absolute(log_path)
+		var args := ["--headless", "--path", project_dir, "--log-file", log_path, "-s", get_script().resource_path, "--", "--inner", "--files=" + ",".join(shards[i])]
+		args.append_array(user_args)
+		var p: Dictionary = OS.call("execute_with_pipe", OS.get_executable_path(), args, false)
+		if p.is_empty():
+			_orphan_errors.append("could not start an inner test process")
+			continue
+		running.append({"pid": p["pid"], "stdio": p["stdio"], "stderr": p["stderr"], "log": log_path, "done": false, "code": 0})
+	var left := running.size()
+	while left > 0:
+		for r in running:
+			if r.done:
+				continue
+			# Drain the pipes (the log file holds the same text, in order) so the child never blocks.
+			(r.stdio as FileAccess).get_buffer(1 << 16)
+			(r.stderr as FileAccess).get_buffer(1 << 16)
+			if not OS.is_process_running(r.pid):
+				r.done = true
+				r.code = OS.call("get_process_exit_code", r.pid)
+				left -= 1
+		OS.delay_msec(20)
+	var code := 0
+	for r in running:
+		(r.stdio as FileAccess).close()
+		(r.stderr as FileAccess).close()
+		var text := FileAccess.get_file_as_string(r.log)
+		DirAccess.remove_absolute(r.log)
+		_parse_inner_output(text)
+		if r.code != 0:
+			code = r.code
+	# Report in file order (each file's tests in their own order), and keep the durations.
+	var by_file := {}
+	for res in _results:
+		var file: String = res.id.split("::")[0]
+		if not by_file.has(file):
+			by_file[file] = []
+		by_file[file].append(res)
+	var ordered: Array[Dictionary] = []
+	var durations := known.duplicate()
+	for path in scripts:
+		var key := path.trim_prefix("res://")
+		var total := 0
+		for res in by_file.get(key, []):
+			ordered.append(res)
+			total += int(res.ms)
+		if by_file.has(key) and _filter == "":
+			durations[key] = total
+	_results = ordered
+	var f := FileAccess.open(DURATIONS, FileAccess.WRITE)
+	if f != null:
+		f.store_string(JSON.stringify(durations))
 	_report(code)
 
 var _cur: Dictionary = {}
@@ -79,6 +190,8 @@ func _parse_inner_output(text: String) -> void:
 						_cur.allow_errors = f[3] == "1"
 						_results.append(_cur)
 					_cur = {}
+				"::shard":
+					pass
 				"::load_error":
 					_results.append({"id": rest + "::<load>", "status": "error", "ms": 0, "messages": PackedStringArray(["script failed to load or does not extend TestCase (see errors above)"]), "errors": PackedStringArray(), "output": PackedStringArray(), "allow_errors": false})
 		elif line.begins_with("SCRIPT ERROR:") or line.begins_with("ERROR:") or line.begins_with("USER ERROR:"):
@@ -158,7 +271,10 @@ func _run_inner() -> void:
 	await process_frame  # root is not in the tree until the first frame
 	var scripts := _find_test_scripts(TEST_ROOT)
 	scripts.sort()
+	printerr("::shard")
 	for path in scripts:
+		if not _files.is_empty() and not _files.has(path):
+			continue
 		var script = load(path)
 		if script == null or not (script is GDScript) or not script.can_instantiate():
 			printerr("::load_error %s" % path.trim_prefix("res://"))

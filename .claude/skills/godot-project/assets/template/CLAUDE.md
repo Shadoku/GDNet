@@ -12,6 +12,7 @@ output over your own reasoning about whether code works.
 | Only the unit tests | `python3 tools/check.py --only test` |
 | One test file or method | `python3 tools/check.py --only test --filter=health` |
 | Fastest loop (no new files since last import) | `python3 tools/check.py --only test --no-import` |
+| Test files in one process | `python3 tools/check.py --jobs 1` (default 2 processes at once, Godot 4.4+) |
 | Full engine output | `python3 tools/check.py --verbose` |
 | Run the game (needs a display) | `godot --path .` |
 | Open the editor | `godot --path . --editor` |
@@ -57,7 +58,8 @@ Never say a change works without a passing check. If you cannot run Godot
   `await await_signal(sig, timeout)` for async behaviour.
 - Any `ERROR`/`SCRIPT ERROR` printed while a test runs fails it. Set
   `allow_errors = true` in a test that deliberately triggers one.
-- Run without `check.py`: `godot --headless --path . -s tests/framework/runner.gd -- --filter=name --verbose`.
+- Run without `check.py`: `godot --headless --path . -s tests/framework/runner.gd -- --filter=name --verbose`
+  (`--jobs=N` runs the test files in N processes at once, Godot 4.4+; files must not depend on each other).
   With `--verbose` a passing test's `print()` output is shown too (use it for measurements and benchmarks).
 
 ## Design for testability

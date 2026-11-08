@@ -13,6 +13,7 @@ Usage:
   python3 tools/check.py --only test --no-import   # fastest loop when no files were added
   python3 tools/check.py --filter=player  # pass a test filter to the runner
   python3 tools/check.py --verbose      # show full engine output for every stage
+  python3 tools/check.py --jobs 1       # run the test files in one Godot process (default 2)
 
 Exit code is 0 only when every stage passed. The last line is always
 "CHECK: PASS" or "CHECK: FAIL (<stages>)" so the result is easy to spot.
@@ -111,6 +112,11 @@ def clean(output: str) -> str:
     return "\n".join(l for l in output.splitlines() if not BANNER.match(l)).strip()
 
 
+def default_jobs() -> int:
+    """Two test processes when there are two CPUs to run them: the tests mostly wait on the clock."""
+    return 2 if (os.cpu_count() or 1) >= 2 else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", choices=["import", "validate", "test", "smoke"], help="run a single stage (import always runs first)")
@@ -118,6 +124,7 @@ def main() -> int:
     ap.add_argument("--filter", help="only run tests whose 'file::method' id contains this substring")
     ap.add_argument("--verbose", action="store_true", help="print full engine output for every stage")
     ap.add_argument("--junit", help="write JUnit XML for the test stage to this path")
+    ap.add_argument("--jobs", type=int, default=default_jobs(), help="test files run in this many Godot processes at once (default: 2 with 2+ CPUs; 1 = one process, the old way)")
     ap.add_argument("--smoke-frames", type=int, default=SMOKE_FRAMES)
     ap.add_argument("--skip-smoke", action="store_true")
     ap.add_argument("--include-addons", action="store_true", help="also validate scripts under addons/")
@@ -169,6 +176,8 @@ def main() -> int:
         test_args.append(f"--filter={args.filter}")
     if args.junit:
         test_args.append(f"--junit={os.path.abspath(args.junit)}")
+    if args.jobs > 1:
+        test_args.append(f"--jobs={args.jobs}")
     stage("test", test_args, lambda code, out: (code == 0, clean(out)))
 
     # 4. smoke: main scene boots and runs N frames without printing any error.

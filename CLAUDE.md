@@ -21,6 +21,9 @@ Follow the plan's packages in order and update its status table when one lands.
 | Only the unit tests | `python3 tools/check.py --only test` |
 | One test file or method | `python3 tools/check.py --only test --filter=health` |
 | Fastest loop (no new files since last import) | `python3 tools/check.py --only test --no-import` |
+| One package's tests, no Rust change | `python3 tools/check.py --only test --filter=<name> --no-build` (`<name>` matches `file::method`: `test_net_prediction`, `test_ballpit_demo`, `g5_rate`) |
+| The same, quickest (no new files either) | `python3 tools/check.py --only test --filter=<name> --no-build --no-import` |
+| Test files in one process (the old way) | `python3 tools/check.py --jobs 1` (default 2 processes at once: ~73 s instead of ~140 s for the whole stage) |
 | Full engine output | `python3 tools/check.py --verbose` |
 | Run the game (needs a display) | `godot --path .` |
 | Open the editor | `godot --path . --editor` |
@@ -77,6 +80,9 @@ Never say a change works without a passing check. If you cannot run Godot
   `allow_errors = true` in a test that deliberately triggers one.
 - Run without `check.py`: `godot --headless --path . -s tests/framework/runner.gd -- --filter=name --verbose`.
   With `--verbose` a passing test's `print()` output is shown too (use it for measurements and benchmarks).
+  `--jobs=N` splits the test files over N Godot processes (whole files, so a file keeps its order;
+  balanced by the last run's durations in `user://test_durations.json`). Tests in different files must
+  not depend on each other's side effects (process-wide caches such as inference tables are per process).
 - Networked behaviour: `NetFixture.new(self, n_clients)`, `start()`, `await wait_connected()`, then
   `teardown()` in `after_each`; never real sockets except the single ENet test. The per-tick signal
   is `ticked` (`Net.tick()` is the method). Entities: `net.add_managers()` puts a `NetManager` at the
