@@ -1,0 +1,631 @@
+# Plan: a Rust GDExtension for rapid multiplayer development in Godot 4
+
+2026-11-08, revised the same day after the owner's review (the managed layer added, then the two demo end
+goals). Approved 2026-11-08, with every recommendation of section 7 taken.
+
+**What.** A Godot 4 extension, written in Rust with gdext, that makes a single-player scene multiplayer by
+placing it under one node. A `NetManager` enrols everything beneath it: scene instances become networked
+entities, their transforms, physics velocities, animation state, visibility and exported variables replicate
+from inferred per-class profiles, remote copies interpolate, and any public method of a managed node can be
+called across the network without declaring it. A player entity becomes predicted by giving it an owner and
+reading input through `Net.input(self)` instead of `Input`; its ordinary `_physics_process` is the tick.
+Multiplayer-specific code is optional and small: a few verbs (`Net.sync`, `Net.server`), a few hooks
+(`_net_tick`, `_net_spawned`, `_net_allow`), and an explicit `NetEntity` node or Rust derive for the cases
+inference gets wrong. Underneath: server authority, client prediction with rollback of the owner's kinematic
+bodies, most-recent-state deltas with a bandwidth budget, typed RPCs with return values, and the diagnostics
+(meter, emulation, hashes, ownership overlay) that Godot lacks.
+
+**Why.** The research report (`docs/reports/Rust GDExtension multiplayer design.md`, notes under
+`docs/research_notes/`) found that what developers migrate toward is a library that owns the tick (FishNet,
+Fusion, Netcode for Entities, netfox), and that libraries which leave the tick to the engine (Mirror, NGO,
+Godot's stock `MultiplayerSynchronizer`) collect the same issue tracker: spawn-order races, jitter, host
+asymmetry, untyped RPCs. Godot ships the seams to fix this from an extension (`MultiplayerAPIExtension`,
+`MultiplayerPeerExtension`), but no tick loop, prediction or interpolation. Roblox is the existence proof
+that "everything replicates by default, override the rare exception" is what makes multiplayer feel like
+single player; nothing in the Godot ecosystem offers it. The Rust replication crates are fused with Bevy and
+cannot be reused; their designs can.
+
+**What it requires.** Godot 4.3+ (`compatibility_minimum = 4.3`), gdext 0.5.x, stable Rust for native
+targets, nightly Rust and emsdk only for the web export. No new runtime service: the extension composes with
+the peers Godot already has (ENet, WebRTC, WebSocket, GodotSteam, Nakama).
+
+**What it will not do.** No deterministic lockstep or rollback over Godot physics or arbitrary GDScript; no
+RigidBody rollback; no interception of arbitrary property writes or method calls (the engine has no hook,
+so polling and explicit verbs it is); no CRDTs; no learned prediction; no MMO-scale interest management; no
+bundled hosting, matchmaking or relay service; no persistence database; no host migration in v1; no
+Rust-side Steam binding.
+
+---
+
+## 0. Goals, in priority order
+
+1. **Enrol, don't declare.** A scene dropped under `NetManager` replicates with no script changes: spawn,
+   transform, velocity, animation, visibility, exported variables. Declaration is the exception
+   (`NetEntity`), not the entry point.
+2. **The single-player path is the multiplayer path.** The same scripts run offline, as host, as client and
+   as dedicated server; the host is a client of itself (loopback peer); user code never branches on
+   `is_server()`; `_physics_process` stays the place for movement code.
+3. **Behaviour sync without ceremony.** Any public method of a managed node is network-callable through one
+   verb, with sender info and an awaitable return, with no registration on either side.
+4. **One line to predict.** Giving an entity an owner and reading `Net.input(self)` instead of `Input` makes
+   it client-predicted with rollback; the input map is what travels, not a hand-written input struct.
+5. **No ordering traps.** Spawn, parent, initial state and the first call arrive as one message. There is no
+   NodePath on the wire.
+6. **Quality and diagnosability by default.** Prediction, interpolation, quantisation, budgeting and lag
+   compensation have sensible values; a meter, a network emulator, per-tick hashes and an ownership overlay
+   ship in the first release.
+7. **Novel where the evidence supports it.** Input-map replication, adaptive local lag (FDG 2026),
+   notification-based most-recent-state with acked-baseline deltas (Tribes / Fiedler), awaitable RPC returns,
+   one-message atomic entity actions (lightyear).
+8. **Two instructional demos are the end goals** (section 2.11, WP13 and WP14): players travelling between
+   scenes, and a physics scene with hundreds of colliding bodies. Each is a worked example a reader can copy,
+   and each runs headless in the test suite, so the library is not done until they are.
+
+## 1. What the developer writes: the escalation ladder
+
+Each rung adds one idea. Most games stop at rung 2.
+
+### Rung 0: enrol a scene, change nothing
+
+```
+Level (Node2D)
+└── NetManager            # everything beneath is managed
+    ├── Player.tscn       # instance: an entity
+    ├── MovingPlatform.tscn
+    ├── Door.tscn
+    └── Enemies (Node2D)
+        └── Slime.tscn ×3
+```
+
+Every scene instance under the manager is an *entity*. The server (or the single-player loopback host)
+owns them all. Their inferred properties replicate to clients, which interpolate them. Spawning is
+`instantiate()` + `add_child()` on the server, despawning is `queue_free()`, and the replica appears under
+the same parent with the same name and its initial state in one message. Enemy AI, the platform's
+`AnimationPlayer`, the door's `open` export, the slime's `AnimatedSprite2D` frames: all of it syncs with
+zero script changes, because the profiles in section 2.1 know what a `CharacterBody2D`, an
+`AnimationPlayer` and an `@export var open: bool` are.
+
+### Rung 1: a player, predicted
+
+Before (single player):
+
+```gdscript
+extends CharacterBody2D
+const SPEED := 200.0
+
+func _physics_process(delta: float) -> void:
+	velocity = Input.get_vector("left", "right", "up", "down") * SPEED
+	move_and_slide()
+	if velocity.length() > 0.0 and not $Steps.playing:
+		$Steps.play()
+```
+
+After:
+
+```gdscript
+extends CharacterBody2D
+const SPEED := 200.0
+
+func _physics_process(delta: float) -> void:
+	velocity = Net.input(self).get_vector("left", "right", "up", "down") * SPEED
+	move_and_slide()
+	if Net.is_fresh() and velocity.length() > 0.0 and not $Steps.playing:
+		$Steps.play()
+```
+
+plus, wherever the player is spawned: `Net.spawn_for(peer_id, player_scene, $NetManager)` (or
+`add_child()` then `Net.set_owner(player, peer_id)`). That is the whole change. The owner samples its input
+map each tick and sends it; the server runs the same `_physics_process` with the owner's input; the owner
+runs it immediately (prediction) and again on rollback (replay), where `Net.is_fresh()` is false; other
+clients do not run it at all, they interpolate. `Input.` is still legal: it just reads the local keyboard,
+which is wrong on the server, so the manager warns once when a managed script with an owner calls
+`Input.get_vector` and friends inside `_physics_process` (detected by a debug-build hook, decision D14).
+
+### Rung 2: behaviour, called across the network
+
+Single player: `open_door(7)`. Multiplayer: `Net.sync(open_door, 7)`.
+
+```gdscript
+func open_door(id: int) -> void:          # a plain method; nothing declared
+	doors[id].open = true                  # (open is an @export: it would also sync as state)
+	$Sfx.play()
+
+# From anywhere, including a client that owns the player who touched the switch:
+Net.sync(open_door, 7)                     # runs on the authority, then on everyone in scope
+
+# A request with an answer:
+var granted: bool = await Net.server(try_buy, item_id)
+
+# Validation hook, optional:
+func _net_allow(method: StringName, sender: int) -> bool:
+	return method != &"give_gold" or sender == 1
+```
+
+Every method of a managed node (script methods and built-in ones, so `Net.sync($Anim.play, "attack")`
+works) is addressable by entity id, part path and method name hash; nothing is declared on either side.
+Routing verbs: `Net.sync` (authority runs it and broadcasts; a non-authority caller forwards to the
+authority, allowed by default only for the entity's owner), `Net.server` (server only, awaitable),
+`Net.owner`, `Net.others`, `Net.peer(id, ...)`. Reliable and ordered after the entity's spawn, never
+re-sent during rollback replay. Calls carry a trailing `NetCallInfo` (sender, tick) when the method
+declares a parameter of that type.
+
+### Rung 3: correct the inference
+
+```gdscript
+# In code, once, e.g. in _ready of the level:
+Net.configure($NetManager/Boss, {
+	"state": ["+phase", "-scale"],          # add a non-exported var, drop an inferred property
+	"quantize": {"position": "cm"},
+	"priority": 10,
+	"radius": 1200.0,
+	"lag_compensated": true,
+})
+```
+
+or add a `NetEntity` child to the scene and set the same things in the inspector (`state_properties`,
+`input_properties`, options, `owner_peer`, `transfer`, `client_owned`, `simulate`, `priority`, `radius`,
+`visibility_filter`, `lag_compensated`, `predict`). An entity with a `NetEntity` child uses its lists
+*instead of* inference unless `inherit_profile = true`.
+
+### Rung 4: multiplayer-specific code
+
+Optional virtuals on any managed node, all with defaults: `_net_tick(delta, tick, is_fresh)` (replaces
+`_physics_process` as the simulated step when present), `_net_input()` (write custom input values:
+`Net.input(self).set("aim", get_global_mouse_position())`), `_net_spawned(info)` (after initial state,
+before the first tick), `_net_despawning()`, `_net_owner_changed(old, new)`, `_net_allow(method, sender)`.
+Queries: `Net.is_owner(node)`, `Net.is_authority(node)`, `Net.is_fresh()`, `Net.tick()`, `Net.rtt(peer)`.
+
+### Rung 5: Rust
+
+```rust
+#[derive(GodotClass, NetSync)]
+#[class(base = CharacterBody2D)]
+struct Player {
+    base: Base<CharacterBody2D>,
+    #[net(state, quantize = "mm", interpolate)] position: Vector2,
+    #[net(state)] velocity: Vector2,
+    #[net(input)] aim: Vector2,
+}
+#[godot_api]
+impl INetEntity for Player {
+    fn net_tick(&mut self, delta: f32, tick: u32, fresh: bool) { ... }
+}
+```
+
+The derive fills the same property table the manager infers or the node declares, adds `mark_dirty()` so
+the Rust side needs no polling, and lets gameplay logic live in Rust where GDScript is too slow.
+
+### What the developer sees
+
+- **Meter** panel (toggle key): RTT, jitter, tick offset, bytes per second per channel and per entity class,
+  rollbacks per second, entities in scope, budget use, cold-poll cost.
+- **Network emulation**: latency, variance, loss, reorder, duplication, per direction, Unreal's presets, in
+  Project Settings and at runtime.
+- **Ownership overlay** (editor debugger plugin and in-game): entities tinted by owner, Roblox-style; shows
+  which entities are managed and from which profile.
+- **Hash telemetry**: a cheap per-tick hash per entity compared between peers, shown as a divergence count.
+
+## 2. Architecture
+
+Three crates in a Cargo workspace, one addon folder.
+
+```
+rust/
+  netcore/        sans-IO protocol engine. No godot, no sockets, no threads, no_std-capable (alloc).
+                  Tick clock, entity/part table, property tables, dirty masks, acked-baseline deltas,
+                  priority accumulator, input frames, prediction histories, interpolation buffers,
+                  call framing, keyed state, hashes, emulator. Compiles for wasm32-unknown-emscripten.
+  gdnet/          the GDExtension (gdext): NetManager, Net singleton, NetEntity, NetInput, profiles,
+                  inference, the MultiplayerAPIExtension wrapper, polling, _physics_process gating and
+                  replay, interpolation on _process, the editor plugin. Depends on netcore.
+  gdnet-peer/     phase 2, native only, behind a Cargo feature: a MultiplayerPeerExtension over
+                  renet/renetcode (optionally quinn) with a Rust I/O thread exchanging bytes with the
+                  main thread through channels, never touching Gd<T>.
+addons/gdnet/     gdnet.gdextension, compiled libraries, default_profiles.tres, the meter scene, icons.
+```
+
+Working name `gdnet` (decision D1).
+
+### 2.1 The managed layer
+
+**Enrolment.** `NetManager` is a plain `Node`. It connects to `SceneTree.node_added` / `node_removed` and
+keeps every descendant that is a scene instance root (`scene_file_path != ""`) as an *entity*; the nodes
+inside an instance are its *parts*, addressed by their path relative to the instance root, which is
+identical on every peer because they come from the same `PackedScene`. Nested instances are parts of the
+outer entity unless they have their own `NetEntity` child or are listed in the manager's
+`split_scenes`. A node under the manager that is not a scene instance and not inside one (a bare `Sprite2D`
+added by code) is replicated as class name + inferred properties with a one-time warning: scenes are the
+unit of composition and the recommended path. `Net.manage(node)` enrols a node outside any manager;
+`Net.ignore(node)` or the group `net_local` excludes a subtree.
+
+**Identity.** Entities get `u32` net ids allocated from per-peer ranges; a part is (entity id, part index)
+where part indices come from a depth-first walk of the scene file, computed identically on all peers and
+checked by hash at spawn. No NodePath travels.
+
+**Spawn.** On the authority, an entity entering the tree under the manager produces one reliable
+`EntityAction::Create { scene hash, parent entity + part, name, owner, initial state of every part }`;
+clients `load().instantiate()`, set the name, add under the same parent, apply the initial state, then call
+`_net_spawned`. `queue_free` produces `Destroy`; reparenting within managed space produces `Reparent`.
+Late joiners receive the entity table as a burst of `Create`s and one full snapshot. A client adding an
+entity under the manager is refused with a readable error unless the manager's `spawn_policy` is
+`owner_allowed` (then it becomes `client_owned` by that client).
+
+**Profiles (what syncs).** `NetProfiles` is a `Resource` (`addons/gdnet/default_profiles.tres`, overridable
+in Project Settings and per manager) mapping class names to property lists with options. Inference walks a
+part's class hierarchy most-derived first and unions the profiles it finds, then adds **every `@export`
+variable of the part's script** (exports are Godot's public API; private vars are not synced). Defaults:
+
+| class | properties (hot = every tick, quantised, interpolated; cold = polled every `cold_poll_ticks`, reliable on change) |
+|---|---|
+| `Node2D` | hot: `position`, `rotation`, `scale`; cold: `visible`, `modulate`, `z_index` |
+| `Node3D` | hot: `position`, `quaternion`, `scale`; cold: `visible` |
+| `CharacterBody2D/3D` | + hot: `velocity` (state for prediction) |
+| `RigidBody2D/3D` | + hot: `linear_velocity`, `angular_velocity`; replicas get `freeze = true`; never predicted |
+| `AnimatedSprite2D/3D` | cold: `animation`, `frame`, `flip_h`, `flip_v`, `speed_scale`, playing (via `is_playing`) |
+| `AnimationPlayer` | cold: `current_animation`, `speed_scale`; playback position resent on animation change and every second |
+| `Sprite2D/3D`, `TextureRect` | cold: `frame`, `flip_h`, `flip_v`, `texture` (as resource path) |
+| `Label`, `RichTextLabel` | cold: `text` |
+| `CanvasItem`, `Control` | cold: `visible`, `modulate` |
+| `CollisionShape2D/3D`, `CollisionPolygon*` | cold: `disabled` |
+| `Light2D/3D` | cold: `energy`, `color`, `enabled`/`visible` |
+| `GPUParticles*`, `CPUParticles*` | cold: `emitting` |
+| `AudioStreamPlayer*` | nothing (one-shots go through `Net.sync($Sfx.play)`) |
+| `Camera*`, `Timer`, `Tween` | nothing |
+| any script | cold: every `@export` var; `@export` vars of `Vector2/3`, `float`, `int` named like transforms are still cold unless promoted by `configure()` |
+
+Options per property: `quantize` (`mm`, `cm`, `deg`, `smallest3`, `f16`, `raw`), `interpolate`
+(default on for hot transforms, off for cold), `tolerance` (prediction mismatch), `send` (`hot` or `cold`),
+`reliable`. Profiles are data, so a project adds its own classes or removes defaults without code.
+
+**Dirty tracking.** Polling (the engine offers no write hook). Hot properties are read every tick; cold
+properties every `cold_poll_ticks` (default 6, i.e. 10 Hz at 60) and immediately when a `Net.sync` call
+touches the entity; the Rust derive's `mark_dirty()` bypasses polling. Property reads use cached
+`StringName`s and `Object.get_indexed()`. WP3 begins with a benchmark (1,000 entities × 8 properties) and
+the meter shows polling cost, so the cold schedule can be tuned with numbers.
+
+**Who simulates.** Each entity has one `owner_peer` (1 = server by default). The manager calls
+`set_physics_process(false)` on every part of an entity on peers that are neither the server nor the owner,
+so replicas only interpolate; `_process` is left alone everywhere (visual code keeps running). Entities with
+`simulate = everywhere` (cosmetic local simulations) opt out. On the server and the owner,
+`_physics_process` runs normally and is the tick; when a part defines `_net_tick`, that is called instead
+and `_physics_process` is disabled for it. On rollback the manager calls `_physics_process(delta)` (or
+`_net_tick`) directly on the owned entity's parts in tree order for each replayed tick with `Net.is_fresh()`
+false. Known limit, inherited from the engine and shared with netfox: `is_on_floor()` and other
+physics-server queries are stale during replay; the tutorial says to derive such values from state or
+declare them as state.
+
+**Input (`NetInput`).** `Net.input(node)` returns the per-entity `NetInput` for the entity that owns
+`node`. It mirrors `Input`'s query API: `is_action_pressed`, `is_action_just_pressed`,
+`is_action_just_released`, `get_action_strength`, `get_axis`, `get_vector`, plus `get(name)` / `set(name,
+value)` for custom values (aim position, selected slot). On the owner, each tick the manager samples the
+actions in the entity's `input_actions` (default: every action in the project `InputMap`, excluding
+`ui_*`; a bitset of pressed plus a byte per analog strength, typically 2 to 6 bytes) and the custom values,
+stores them as that tick's input frame, and sends the last 3 frames per packet (redundancy). The server
+uses the frame for the matching tick and repeats the last one on loss. The just-pressed / just-released
+edges are computed from consecutive frames on both sides, so they are identical during replay. For an
+entity owned by the server (or when offline), `Net.input(node)` reads the real `Input`, so single-player
+code is unchanged. This is the design's main novelty: the **input map replicates**, so prediction needs no
+input struct.
+
+**Auto-exposed methods.** At enrolment the manager records, per part, the method names of its script
+(`Script.get_script_method_list()`) and class (`ClassDB`); a call names (entity, part, method hash, args).
+The receiver checks the method exists and, for calls from a non-authority, that the sender is the entity's
+owner (default) or that `_net_allow(method, sender)` returns true; `Net.server` calls are accepted from any
+peer and always carry the sender. Methods beginning with `_` are never exposed. Arguments are Variants
+encoded with postcard (Objects, Callables and Signals refused with an error at the call site; `Resource`
+arguments travel by resource path when they have one). Return values travel as `CallReturn` matched by a
+request id; `await Net.server(fn, ...)` resolves to it.
+
+### 2.2 Data flow per frame
+
+```
+_physics_process of NetManager (runs first: process priority -1000), main thread, physics tick:
+  1. drain       SceneMultiplayer.peer_packet -> netcore.receive(peer, bytes)
+  2. inputs      owned entities: sample the input map and custom values -> netcore.local_input(tick)
+  3. reconcile   netcore reports mismatches -> restore hot state at T, replay _physics_process/_net_tick
+                 for T+1..now with is_fresh = false
+  4. (engine)    the parts' own _physics_process / _net_tick run as the fresh tick (server: all;
+                 owner: own; replicas: disabled)
+NetManager's post-tick hook (a Node at process priority +1000):
+  5. record      poll hot props (and due cold props) -> netcore.record(tick) (dirty masks)
+  6. send        netcore.outgoing(budget) -> SceneMultiplayer.send_bytes(peer, bytes, mode, channel)
+_process (every render frame):
+  7. interpolate netcore.sample(render_time) -> write hot props on replicas with decaying error offsets
+```
+
+Only step 7 runs more than once per tick; everything else is tick-locked to physics, which Godot cannot
+step manually (netfox's `physics_factor` workaround is the evidence that any other cadence fights
+`move_and_slide()`).
+
+### 2.3 Transport: wrap, do not replace
+
+`Net` installs a Rust `MultiplayerAPIExtension` around the tree's `SceneMultiplayer` with
+`SceneTree.set_multiplayer()`. Every stock call (`_rpc`, `_object_configuration_add` for
+`MultiplayerSpawner` / `MultiplayerSynchronizer`, `_poll`) is forwarded unchanged, so existing scenes keep
+working and a project migrates one scene at a time. gdnet's protocol travels as raw bytes through
+`SceneMultiplayer.send_bytes()` and the `peer_packet` signal on its own channels, over whatever
+`MultiplayerPeer` the project configured: ENet, WebRTC (browser), WebSocket, GodotSteam, Nakama, without
+binding any SDK. It is also the only path to the web export, where no Rust transport has been shown to run
+under Emscripten.
+
+Channels: `0` reliable ordered (entity actions, calls, keyed state), `1` unreliable (inputs, snapshots), `2`
+unreliable (hashes, pings). Snapshots are filled by priority up to a 1,200-byte MTU, never fragmented.
+
+### 2.4 Protocol (netcore)
+
+Messages, 1-byte kind prefix, `postcard` except snapshots:
+
+| kind | channel | content |
+|---|---|---|
+| `Hello` / `Welcome` | reliable | protocol hash (scene hashes, profiles, part tables), tick rate, id ranges, current tick |
+| `EntityAction` | reliable | create (net id, scene hash, parent entity+part, name, owner, initial state of all parts) / destroy / reparent (also across managers, carrying the destination room) / set owner / travel (to the owning client: load this level scene, then acknowledge). Applied atomically before any later message can target the id |
+| `Input` | unreliable | tick, the last 3 input frames per owned entity, bit-packed |
+| `Snapshot` | unreliable | server tick, baseline tick, per entity: id, part, dirty mask, changed fields bit-packed and quantised. Most-recent-state: never retransmitted; lost fields are dirty again (Tribes) |
+| `Ack` | piggybacked | highest received tick + 32-bit history; drives baselines and the priority accumulator |
+| `Call` / `CallReturn` | reliable or unreliable | entity, part, method hash, verb, args, optional request id |
+| `KeyedState` | reliable | path, value; full map on join |
+| `Hash` | unreliable | tick, sampled per-entity 32-bit hashes |
+| `Time` | unreliable | ping/pong for RTT, jitter, tick offset |
+
+Baselines come from acks; without an ack within ~0.5 s an entity falls back to a full state.
+
+### 2.5 Prediction and reconciliation
+
+The server runs each entity's tick with the inputs it holds for that tick (last known input repeated on
+loss). The owner runs its own entities immediately and keeps a `PredictionHistory` of hot state per tick for
+`max_rollback_ticks` (20). When a snapshot confirms tick T, netcore compares confirmed and predicted values
+with per-property tolerance (position 1 mm default); on mismatch (`predict = check`, the default) gdnet
+restores the hot state at T and replays T+1..now with `is_fresh` false. `always` and `disabled` exist.
+Replicas never simulate; they interpolate on a render timeline one adaptive jitter buffer (2 ticks, 1..6)
+behind the newest snapshot, with decaying error offsets (0.95 per frame small, 0.85 large, teleport above a
+threshold). RigidBodies are state-only and frozen on replicas. `Net.input_delay_ticks` (default 0) and the
+experimental `adaptive_delay` (ramps delay in only during interactions, the FDG 2026 result) are properties
+of `Net`.
+
+### 2.6 Authority
+
+One `owner_peer` per entity, server by default, replicated on change, inherited by nested entities unless
+overridden, with `transfer` rules `fixed` (default), `request`, `take`. Input is accepted only from the
+owner; state only from the server, except `client_owned` entities, whose owner's state is accepted and
+relayed (the Fusion Shared / Roblox mode, off by default, shown in the overlay and labelled as trusting
+clients). A rejected write is rolled back on the writer (Normcore).
+
+### 2.7 Interest management and budget
+
+Scope per client = entities whose manager's `room` is the client's room (the room of the manager holding
+its player, set by travel; `Net.set_room(peer, name)` overrides it for clients without a player, e.g. spectators; `room = "*"` managers are always in scope), within
+`radius` of the client's focus entity (default unlimited), passing an optional `visibility_filter`. A
+per-client byte budget (default 32 KB/s) is spent by a priority accumulator: owned entity 1,000,000,
+interacting 100, others 1, scaled by `priority`; sent entities reset to zero.
+
+### 2.8 Lag compensation
+
+`Net.rewind_query(peer, callable)` runs `callable` with every `lag_compensated` entity's collision shapes
+moved to the pose `peer` saw (RTT/2 + its jitter buffer, capped at 250 ms), then restores them. Used from
+the server's tick for hitscan and melee.
+
+### 2.9 Threading and web
+
+No `experimental-threads`; every `Gd<T>` access is on the main thread. `gdnet-peer` runs renet on a Rust
+thread and passes bytes through `std::sync::mpsc`, native only. `netcore` and `gdnet` build for
+`wasm32-unknown-emscripten` with gdext's nothreads recipe; browser networking is Godot's own
+`WebRTCMultiplayerPeer` / `WebSocketMultiplayerPeer`.
+
+### 2.10 Determinism (opt-in, later)
+
+A `netcore` feature `deterministic` exposes GGRS behind `Net.deterministic = true` for simulations written in
+Rust with `fixed` / `libm` math, never for GDScript or Godot physics. Ships after v1 (WP12) as an explicit
+project-start decision.
+
+### 2.11 Scenes as rooms, and travel between them
+
+A `NetManager` has a `room` (default: the path of the scene it sits in). On the server every level that has
+someone in it is loaded under one `World` node, each with its own manager; a headless server may hold
+several levels at once. A client loads only the level its player is in. Interest is by room: a client
+receives entities whose manager's room equals its player's room (plus entities in managers marked
+`room = "*"`, for global objects), and a late joiner's burst covers its room only. The keyed state is
+global, so chat and scores cross rooms.
+
+`Net.travel(player, "res://levels/cave.tscn", spawn_point := "Entrance")` on the server: loads the target
+level if it is not loaded (the manager inside it registers its room), emits a `Travel` action to the owning
+client naming the scene path, then a `Reparent` of the player entity into the target manager at the spawn
+point's transform. The client, on `Travel`, instantiates the level under its `World`, acknowledges, applies
+the `Reparent`, and frees its previous level once none of its entities remain there. The server unloads a
+level `empty_level_timeout` (default 30 s) after its last player leaves. `Net.travelled(player, from, to)`
+and `_net_travelled(from, to)` fire on both sides after the reparent, where the game resets the camera.
+
+Physics bodies in a busy scene need nothing new in the model, only the defaults to hold: server-owned
+`RigidBody2D/3D` entities replicate `position`, `rotation`, `linear_velocity` and `angular_velocity` as hot
+state; replicas are frozen and interpolated; a sleeping body produces no dirty fields, so a settled pile
+costs nothing; the priority accumulator sends bodies near the client's player (interacting, 100) far more
+often than distant ones (1) and the budget degrades distant bodies gracefully instead of exceeding it.
+Fiedler-style ownership handoff for bodies a client-owned paddle touches is a follow-up (WP15), not v1.
+
+## 3. Contracts
+
+### 3.1 Nodes, singletons, resources (gdnet)
+
+| class | role |
+|---|---|
+| `Net` (singleton) | `host(port)`, `join(address, port)`, `offline()`, `use_peer(MultiplayerPeer)`, `leave()`; `manage(node)`, `ignore(node)`, `configure(node, Dictionary)`, `set_owner(node, peer)`, `spawn_for(peer, PackedScene, parent, name = "")`; `input(node) -> NetInput`; verbs `sync(Callable, ...)`, `server(Callable, ...) -> awaitable`, `owner(...)`, `others(...)`, `peer(id, Callable, ...)`; queries `is_owner(node)`, `is_authority(node)`, `is_fresh()`, `tick()`, `rtt(peer)`, `peers()`; `rewind_query(peer, Callable)`; `set_room(peer, name)`; `travel(player, scene_path, spawn_point = "")`, `load_level(scene_path)`, `unload_level(scene_path)`, `levels()`, signal `travelled(player, from, to)`; property `empty_level_timeout`; properties `send_rate`, `budget_bytes_per_s`, `cold_poll_ticks`, `input_delay_ticks`, `adaptive_delay`, `emulation: NetEmulation`, `profiles: NetProfiles`; signals `peer_joined(id)`, `peer_left(id)`, `connected`, `disconnected(reason)`, `tick(tick)`, `entity_spawned(node)`, `entity_despawning(node)`, `call_refused(node, method, sender)`; `state: NetKeyedState` |
+| `NetManager` (Node) | `room: String` (default the owning scene's path; `"*"` = visible from every room), `profiles` override, `spawn_policy: server_only | owner_allowed`, `split_scenes: Array[String]`, `input_actions: PackedStringArray` (default all non-`ui_` actions), read-only `entities: int` |
+| `NetEntity` (Node child of an instance root) | `inherit_profile: bool`, `state_properties`, `input_properties`, per-property options, `owner_peer`, `transfer`, `client_owned`, `simulate: owner_and_server | everywhere`, `priority`, `radius`, `visibility_filter`, `lag_compensated`, `predict`; read-only `net_id`; signals `owner_changed`, `rolled_back(from, to)` |
+| `NetInput` (RefCounted) | the `Input` query mirror plus `get(name)`, `set(name, value)`, `actions()`, `tick` |
+| `NetProfiles` (Resource) | `classes: Dictionary[String, Array]` of property entries with options; `merge(other)` |
+| `NetKeyedState` | `set`, `get`, `erase`, `view(path, Callable)`, signal `changed(path, value)` |
+| `NetEmulation` (Resource) | latency, variance, loss, reorder, duplicate, per direction; presets |
+| `NetCallInfo` (RefCounted) | `sender`, `tick`, `is_local` |
+| `NetMeter` (CanvasLayer) | the panel |
+| virtuals on managed scripts | `_net_tick`, `_net_input`, `_net_spawned`, `_net_despawning`, `_net_owner_changed`, `_net_travelled(from, to)`, `_net_allow`, registered with `#[func(virtual)]` so GDScript overrides them like `_ready` |
+
+### 3.2 Rust API (gdnet)
+
+`INetEntity` with the same virtuals; `#[derive(NetSync)]` with `#[net(state|input, ...)]` producing the
+property table and `mark_dirty()`; `Net::singleton()`; `NetProfiles` extendable from Rust.
+
+### 3.3 Protocol versioning
+
+`Hello` carries a 64-bit hash of the netcore version, every managed scene's part table, the effective
+profiles and option sets. Mismatch disconnects naming the first differing item.
+
+### 3.4 Project settings
+
+`gdnet/tick/send_rate`, `gdnet/budget/bytes_per_second`, `gdnet/sync/cold_poll_ticks`,
+`gdnet/sync/profiles` (a `.tres` path), `gdnet/sync/export_vars` (bool, D12), `gdnet/input/actions`,
+`gdnet/prediction/max_rollback_ticks`, `gdnet/interpolation/jitter_buffer_ticks`,
+`gdnet/lag_compensation/max_ms`, `gdnet/debug/meter`, `gdnet/debug/emulation_preset`,
+`gdnet/debug/hash_telemetry`, `gdnet/debug/warn_on_global_input`.
+
+## 4. Work packages
+
+One commit series per package, ending with `python3 tools/check.py` green (which from WP0 includes
+`cargo test`). Rust unit tests cover everything in `netcore`; GDScript `TestCase` tests cover everything
+user-visible, headless.
+
+**Headless two-peer testing.** Godot supports one `MultiplayerAPI` per subtree
+(`SceneTree.set_multiplayer(api, root_path)`), so one headless process holds a `/root/Server` branch and
+one or more `/root/ClientN` branches connected by `NetPipePeer`, an in-memory `MultiplayerPeerExtension`
+pair with the emulator between them (WP1). `tests/framework/net_fixture.gd` builds and tears down the
+branches and runs each scenario twice: host-as-player and dedicated server (gate G2). The same pipe is the
+production `offline()` peer.
+
+| WP | scope | files | tests | docs |
+|---|---|---|---|---|
+| **WP0 scaffolding** | Cargo workspace, gdext build, `addons/gdnet/gdnet.gdextension`, a `NetVersion` class; `tools/check.py` gains `build` (`cargo build --release -p gdnet` into `addons/gdnet/bin/<platform>`, skipped by `--no-build` when up to date) and `rust-test` (`cargo test --workspace`) stages; CI installs Rust, caches `target/`, adds a `cargo check --target wasm32-unknown-emscripten` job on nightly (gate G3 from day one) | `rust/Cargo.toml`, `rust/netcore`, `rust/gdnet`, `addons/gdnet/`, `tools/check.py`, `.github/workflows/ci.yml`, `.gitignore` | `tests/unit/test_gdnet_loads.gd`; an empty `cargo test` | CLAUDE.md commands, this file's status |
+| **WP1 tick, session, pipe peer** | `netcore`: clock, peers, `Hello`/`Welcome`, `Time`, emulator; `gdnet`: `Net`, the `MultiplayerAPIExtension` wrapper with full forwarding, `NetPipePeer`, `host`/`join`/`offline`, `net_fixture.gd` | `rust/netcore/src/{clock,peers,emul,wire}.rs`, `rust/gdnet/src/{net,api_ext,pipe_peer}.rs`, `tests/framework/net_fixture.gd` | Rust: drift, emulator, handshake, hash mismatch; GDScript: `offline()` ticks at the physics rate; two branches connect and see `peer_joined`; stock `@rpc` and `MultiplayerSynchronizer` under the wrapper still work (G1); emulation delays by the configured latency | starting a session |
+| **WP2 manager, entities, atomic spawn** | `netcore`: entity/part table, id ranges, `EntityAction`; `gdnet`: `NetManager` enrolment via `node_added/removed`, scene hashes and part tables, create + parent + initial state as one message, destroy, reparent, late-join burst, `spawn_policy`, `Net.manage/ignore`, `_net_spawned/_net_despawning`, the bare-node fallback with its warning | `rust/netcore/src/entity.rs`, `rust/gdnet/src/{manager,entity,parts}.rs` | Rust: ordered application, a create whose parent is unknown is held, ranges never collide, part tables are deterministic; GDScript: a server `add_child` under the manager appears on the client under the same parent and name with initial state before `_net_spawned`; nested instances are parts; a late joiner gets all 50 spawns; `queue_free` frees the replica; a client-side `add_child` is refused readably under `server_only` and becomes `client_owned` under `owner_allowed`; a bare `Sprite2D` replicates with the warning | enrolment and spawning |
+| **WP3 profiles, inference, state replication** | `netcore`: property tables, quantisers, hot/cold schedules, dirty masks, acked-baseline deltas, MTU packing, priority accumulator, budget; `gdnet`: `NetProfiles` + defaults `.tres`, inference over the class hierarchy and `@export` vars, polling with cached `StringName`s, snapshot application, `configure()`, `NetEntity` with `inherit_profile`; the polling benchmark | `rust/netcore/src/{props,quant,delta,snapshot,priority}.rs`, `rust/gdnet/src/{profiles,infer,poll,apply,configure}.rs`, `addons/gdnet/default_profiles.tres` | Rust: quantiser round trips, lost packets re-dirty, baseline fallback, accumulator ratios, MTU never exceeded; GDScript: **gate G7**: a stock test scene (CharacterBody2D with AnimatedSprite2D, a platform with AnimationPlayer, a Label, a script with three `@export`s) under `NetManager` with no script edits replicates to the client within tolerance (positions, animation names and frames, text, exports); `visible = false` propagates; `configure()` adding and removing properties takes effect; 100 idle entities cost under a stated ceiling and 100 moving entities stay within the budget (G4); the benchmark prints polling cost per 1,000 entities and the meter counter matches it | profiles reference, the "what syncs" table |
+| **WP4 input map, `_physics_process` as tick, prediction** | `netcore`: input frames with redundancy, repeat-last-input, `PredictionHistory`, mismatch, rollback requests, `predict` policy; `gdnet`: `NetInput` sampling of the InputMap and custom values, `Net.input()`, `set_physics_process(false)` on replicas, `_net_tick` precedence, replay by direct `_physics_process` calls, `Net.is_fresh()`, `set_owner`/`spawn_for`, the global-`Input` warning | `rust/netcore/src/{input,predict}.rs`, `rust/gdnet/src/{input,tick,replay}.rs` | Rust: frames land on the matching tick, 2-of-3 loss covered, mismatch at T rolls back to T, `disabled` never rolls back, edges identical during replay; GDScript: rung 1's player over a 100 ms emulated link moves immediately on the owner and converges with the server within N ticks; just-pressed fires once across a replay; a server impulse causes exactly one rollback and the `is_fresh` one-shot runs once; the replica's `_physics_process` does not run and its `_process` does; the host's own player never rolls back; passes at physics 30, 60 and 120 Hz (G5); `_net_tick` takes precedence when defined; the warning fires for `Input.get_vector` in an owned entity | the rung 1 tutorial |
+| **WP5 interpolation and smoothing** | `netcore`: render timeline, adaptive jitter buffer, sampling, error offsets, teleport threshold; `gdnet`: `_process` application on replicas, blending on owned entities after rollback | `rust/netcore/src/interp.rs`, `rust/gdnet/src/interp.rs` | Rust: linear sampling, decay rates, snap threshold; GDScript: a remote entity at constant speed renders with per-frame displacement variance below a bound at 60 and 144 Hz render rates and never moves backwards | interpolation |
+| **WP6 auto-exposed methods and verbs** | `netcore`: `Call`/`CallReturn`, request ids, verbs, reliable default, suppression during replay; `gdnet`: method tables from `get_script_method_list()` and `ClassDB`, `Net.sync/server/owner/others/peer`, `NetCallInfo` injection, awaitable returns, Variant argument rules, `_net_allow`, `call_refused` | `rust/netcore/src/call.rs`, `rust/gdnet/src/{methods,call}.rs` | Rust: routing matrix, unknown hash is an error to the caller, returns matched; GDScript: rung 2 end to end (a client's `Net.sync(open_door, 7)` runs on the server then on both clients once); `await Net.server(try_buy, 3)` returns the server's value; a built-in method (`$Anim.play`) syncs; a non-owner's `sync` is refused and `_net_allow` admits it; a call to an entity the receiver has not spawned waits behind its `Create` (never "node not found"); calls made inside a replayed tick are not re-sent; an Object argument errors at the call site; **gate G6**: randomized spawn/reparent/call/destroy under loss and reorder never errors | the rung 2 guide, migration from `@rpc` |
+| **WP7 authority and keyed state** | `netcore`: owner actions, acceptance rules, transfer, `KeyedState` with views; `gdnet`: `owner_peer`, `transfer`, `client_owned`, inheritance to nested entities, `_net_owner_changed`, `NetKeyedState`, rejected-write rollback | `rust/netcore/src/{authority,keyed}.rs`, `rust/gdnet/src/{authority,keyed}.rs` | Rust: non-owner input dropped, `take`/`request` semantics, keyed state deltas and full map on join, views; GDScript: a nested entity inherits its owner; changing the owner mid-game moves prediction; a `client_owned` box moved by its client is seen by another; a late joiner receives the score | authority guide with the trust warning |
+| **WP8 diagnostics** | `NetMeter`, hash telemetry, ownership and profile overlay (editor debugger plugin + in-game tint), emulation presets in Project Settings | `rust/gdnet/src/{meter,hash,overlay,editor}.rs`, `addons/gdnet/meter.tscn` | Rust: hash equality and sensitivity; GDScript: meter counters equal the pipe's byte counts; a deliberate client-side state edit raises the divergence counter; the overlay node exists and tints by owner | diagnostics |
+| **WP9 lag compensation** | pose history, `rewind_query` moving and restoring shapes, the 250 ms cap | `rust/netcore/src/rewind.rs`, `rust/gdnet/src/rewind.rs` | Rust: cap; GDScript: a server raycast inside `rewind_query` hits where the client saw the target over 200 ms and misses without it | lag compensation |
+| **WP10 native peer (phase 2)** | `gdnet-peer`: `MultiplayerPeerExtension` over renet/renetcode, connect tokens, I/O thread + channels; optional quinn | `rust/gdnet-peer/` | Rust: the 16 virtuals over loopback UDP; GDScript: two headless processes driven by a Python test connect over 127.0.0.1 | transports |
+| **WP11 web build** | Emscripten CI job, an exported web demo over `WebRTCMultiplayerPeer` | `.github/workflows/web.yml`, `export_presets.cfg` | the build succeeds (G3); browser smoke recorded as manual | export |
+| **WP12 deterministic mode (optional)** | `netcore` feature `deterministic`: GGRS over the pipe/peers, `SyncTest`, input recording and replay | `rust/netcore/src/det.rs` | Rust: sync-test on a fixed-point sample passes and a scripted divergence is caught | determinism, with the project-start warning |
+
+| **WP13 demo: Doors (players travel between scenes)** | `demos/doors/`: a hub and two levels, each a scene with a `NetManager`; doors are `Area2D`s whose server-side `body_entered` calls `Net.travel()`; a chat box on the keyed state; a camera reset in `_net_travelled`; the `World` node pattern for server and client; headless server launch (`--headless --server`). Library work it drives: `room` on managers, server-side level load/unload with `empty_level_timeout`, the `Travel` action and client acknowledgement, cross-manager `Reparent`, room-scoped interest and late-join bursts, `Net.travelled` | `demos/doors/**`, `rust/netcore/src/rooms.rs`, `rust/gdnet/src/{world,travel}.rs` | Rust: room filtering of snapshots and bursts, a reparent across rooms moves scope, travel ordering (level loaded before the reparent applies); GDScript (two client branches + server): client A walks through a door and is in the cave on both the server and A; B stops receiving A's updates and A stops receiving B's; A and B meet again in the cave and see each other; chat written in one room is read in another; a third client joining late into the cave gets only the cave's entities; the hub unloads on the server after the timeout and reloads on the next travel; the whole demo runs under `net_fixture.gd` in both host modes (G2) | the Doors tutorial (walkthrough of every file, in the demo's README) |
+| **WP14 demo: Ballpit (many colliding bodies)** | `demos/ballpit/`: a box with N `RigidBody2D` balls (N from a slider, default 300), two player paddles (`CharacterBody2D`, predicted), a meter overlay, a body-count and budget slider; a `client_owned` paddle toggle to show the trust trade-off. Library work it drives: the RigidBody profile and freeze-on-replica rule, sleeping-body zero cost, proximity priority (bodies touching or near the player's paddle count as interacting), MTU packing of many small entities, graceful degradation under budget | `demos/ballpit/**`, `rust/netcore/src/priority.rs` (interaction scoring), `rust/gdnet/src/physics.rs` | Rust: 300 entities pack into MTU-sized snapshots, the accumulator sends near bodies at least 10× as often as far ones under a 32 KB/s budget, a body with no dirty fields costs 0 bytes; GDScript: 300 balls settle on the server and the client's interpolated positions converge within tolerance; while settled, bytes per second to a client are under a stated ceiling (near zero plus heartbeats); a paddle push on the owner is predicted and the pushed balls converge on the client within N ticks without double simulation (replica `_physics_process` off, `freeze` on); with the budget halved the demo stays within budget and the meter's degradation counter rises; G4 and G5 scenarios reuse this scene | the Ballpit tutorial (README), the bandwidth chapter |
+| **WP15 follow-up: cooperative physics ownership** | Fiedler-style per-body authority with ownership sequence numbers for bodies a `client_owned` paddle touches; a Ballpit toggle | `rust/netcore/src/handoff.rs` | Rust: sequence-number arbitration; GDScript: a client-pushed ball is smooth on the pusher and converges on others | the Ballpit tutorial's last section |
+
+WP0-WP2 and WP6-WP8 are each a few days; WP3-WP5 are the core and largest; WP9-WP12 and WP15 are
+independent; WP13 and WP14 are the end goals of v1 and should be started as soon as WP7 lands so their
+requirements pull on the earlier packages (the demo scenes are written first, as failing tests, and grow
+with each package).
+
+## 5. Order and gates
+
+Order: WP0 → WP1 → WP2 → WP3 → WP4 → WP5 → WP6 → WP7 → WP8 → WP13 → WP14, then WP9-WP12 and WP15 in any
+order. WP6 may be pulled forward after WP2 for lobby code. v1 = WP0-WP8 plus the two demos (decision D11).
+
+- **G0 Single player untouched.** The extension installed, no `Net` call, no manager: no packets, no polling,
+  no measurable frame cost. The repo's smoke test plus a frame-time assertion.
+- **G1 Stock compatibility.** `@rpc`, `MultiplayerSpawner`, `MultiplayerSynchronizer` work under the wrapper
+  (WP1).
+- **G2 Host parity.** Every integration scenario passes with the host as a player and as a dedicated server
+  (WP2 onward, through `net_fixture.gd`).
+- **G3 Web build.** `netcore` and `gdnet` compile for Emscripten; a forbidden dependency fails CI in the
+  package that adds it (WP0).
+- **G4 Bandwidth bound.** 100 moving entities within budget; 100 idle entities under a stated ceiling (WP3).
+- **G5 Rate independence.** Prediction tests at physics 30/60/120 Hz; interpolation at render 60/144 Hz
+  (WP4, WP5).
+- **G6 No ordering race.** Randomized spawn, reparent, call and destroy under emulated loss and reorder never
+  produce a missing-node error or a dangling replica (WP6).
+- **G7 Zero-change scene.** A stock single-player scene under `NetManager`, with no script edits, replicates
+  transforms, animation, text and exports to a client within tolerance (WP3). This is the gate that stands
+  for the owner's requirement.
+- **G8 Demos run headless.** The Doors and Ballpit scenes pass their scenario tests under `net_fixture.gd`
+  in both host modes, and their READMEs' code listings are the files in the repo (a test diffs them) (WP13,
+  WP14).
+
+## 6. Testing procedure additions for this repo
+
+- `tools/check.py` stages: `build → import → validate → rust-test → test → smoke`; `--no-build` skips the
+  build; the failure table in `CLAUDE.md` gains `cargo` rows.
+- The pipe peer plus emulator makes every network test deterministic and headless: no sockets, no sleeps,
+  `await wait_frames(n)` only.
+- `tests/framework/net_fixture.gd` parametrises scenarios over host-as-player and dedicated server (G2).
+- Gate G7's fixture scene lives in `tests/fixtures/zero_change/` and is deliberately written as a plain
+  single-player scene; a test asserts its scripts contain no `Net.` reference.
+- The skill template is not changed; if the kit grows a native-extension option, the `build` stage is the
+  piece to port.
+
+## 7. Decisions for the owner
+
+Each with a recommendation. The owner took every recommendation on 2026-11-08; they stand as decided.
+
+- **D1 Name and home.** `gdnet`, in this repository (`rust/` + `addons/gdnet/`) with this project as sample
+  and test bed; extract later. *Recommended.*
+- **D2 Transport.** Wrap `SceneMultiplayer` first; own peer over renet as WP10. *Recommended.*
+- **D3 Default model.** State sync with prediction of the owner's kinematic entities, interpolation for the
+  rest; deterministic rollback opt-in, Rust only. *Recommended.*
+- **D4 Behaviour-sync verbs.** `Net.sync(callable, args...)` and friends taking a `Callable`, versus a method
+  on the node (`net_call("open_door", 7)`) versus naming conventions (`server_*`). *Recommended: Callable
+  verbs*; they are typo-checked by the editor, need no registration, and work for built-in methods.
+- **D5 Identity.** Own `u32` net ids with (entity, part index) addressing from the scene file; not NodePath,
+  not 4.6 unique node ids. *Recommended.*
+- **D6 Minimum Godot.** `compatibility_minimum = 4.3`. *Recommended.*
+- **D7 Built artefacts.** Not committed; `check.py` builds locally, CI builds per platform. *Recommended.*
+- **D8 Default rates.** 60 Hz tick (physics), send rate = tick, 32 KB/s per client, `cold_poll_ticks` 6,
+  20-tick rollback window, 2-tick jitter buffer, 250 ms lag-compensation cap. *Recommended* as starting
+  values.
+- **D9 Shared authority exposure.** Ship `client_owned`, `transfer = take` and `spawn_policy =
+  owner_allowed` in WP7 with the trust warning and the overlay. *Recommended: ship.*
+- **D10 Adaptive delay.** Experimental, off by default, in WP4. *Recommended.*
+- **D11 v1 scope.** WP0-WP8 plus the two demos WP13 and WP14; WP9 first follow-up; WP10-WP12 and WP15 by
+  demand. *Recommended; the owner added the demos as end goals.*
+- **D12 Exported variables sync by default.** Yes, as cold properties, because `@export` is the node's
+  public API and the inspector already shows exactly that list; a project can turn it off
+  (`gdnet/sync/export_vars`) or exclude per node. *Recommended: yes.* Alternative: only properties from
+  class profiles.
+- **D13 Replicas stop simulating.** `set_physics_process(false)` on every part of a non-owned, non-server
+  entity, with `simulate = everywhere` as the opt-out. *Recommended: yes*; it is what makes `_physics_process`
+  usable as the tick and prevents the double-simulation jitter that fills the FishNet and Godot trackers.
+  Alternative: leave `_physics_process` running and only overwrite state afterwards (jittery).
+- **D14 Auto-exposure scope and trust.** Every public method of every managed part is callable; a
+  non-authority may `sync` only entities it owns unless `_net_allow` says otherwise; `server` calls are
+  open but carry the sender. *Recommended.* Alternative: expose only methods listed on the manager (safer,
+  more ceremony). The global-`Input` warning is a debug-build check that compares `Input` action state
+  with the sampled `NetInput` inside an owned entity's tick; it is advisory only.
+- **D15 Input map replication default.** All non-`ui_` actions of the project InputMap, filterable per
+  manager and per entity. *Recommended*; typical cost is a few bytes per tick and the meter shows it.
+  Alternative: declare actions per entity.
+- **D16 Non-scene dynamic nodes.** Replicate as class + inferred properties with a one-time warning,
+  recommending scenes. *Recommended.* Alternative: refuse.
+
+## 8. Risks and how the plan handles them
+
+- **Polling cost.** Inference lists more properties than hand declaration would. Hot/cold schedules, cached
+  `StringName`s, `mark_dirty()` for Rust, the WP3 benchmark and the meter's polling counter keep it measured;
+  the stock synchronizer polls too, so parity is the floor.
+- **Scene part tables drifting.** A client with a different version of a scene file gets a different part
+  table; the protocol hash catches it at connect and names the scene.
+- **`_physics_process` replay and engine state.** `is_on_floor()` and similar are stale during replay
+  (netfox's limit). Documented in rung 1; WP4 pins the behaviour with a test; `_net_tick` is the escape for
+  code that must know whether it is replaying.
+- **Input-map replication and `Input` singletons.** Scripts that read `Input` directly inside an owned
+  entity will diverge on the server; the warning (D14) and the tutorial address it.
+- **gdext API churn.** Pin the minor; keep `godot` behind `rust/gdnet/src/engine.rs`.
+- **Emscripten unknowns.** No Rust transport in the web build; G3 from WP0.
+- **Two MultiplayerAPIs in one process for tests.** Supported but little used; WP1 proves it first, with the
+  two-process driver as the fallback.
+- **Scope creep toward services.** The non-goals in the head of this file.
+
+## 9. CLAUDE.md after this plan
+
+Commands table: `build`, `rust-test`, `--no-build`. A "Rust" conventions paragraph (`cargo fmt`, `cargo
+clippy -D warnings`, no `experimental-threads`, all `Gd<T>` on the main thread, `netcore` has no `godot` and
+no `std::net` dependency, enforced by a test). Layout rows for `rust/` and `addons/gdnet/`. A "Writing
+networked scenes" section with the ladder of section 1 in five lines. Pointers to this plan and the report.
+
+## 10. Status
+
+Research done 2026-11-08 (five notes, one report). Plan revised the same day to put the managed layer first
+and to add the Doors and Ballpit demos as end goals. Approved 2026-11-08 with every recommendation.
+Package status (updated as each lands):
+
+| WP | status |
+|---|---|
+| WP0 scaffolding | in progress |
+| WP1-WP15 | not started |
