@@ -4,8 +4,23 @@
 //! never spawns a thread. Packets come in through `poll`-style calls and go out as byte buffers; the
 //! caller (gdnet on the main thread, or a test) does the I/O. It must build for
 //! `wasm32-unknown-emscripten`.
+//!
+//! WP1 modules: [`clock`] (tick clock, offset, RTT/jitter), [`peers`] (the peer table), [`wire`]
+//! (framing and the session messages), [`emul`] (the network emulator), [`session`] (the handshake and
+//! `Time` state machine).
 
 #![forbid(unsafe_code)]
+
+pub mod clock;
+pub mod emul;
+pub mod peers;
+pub mod session;
+pub mod wire;
+
+pub use emul::{EmulSettings, Emulator, Pcg32};
+pub use peers::{PeerId, SERVER};
+pub use session::{Event, Outgoing, Role, Session, SessionConfig};
+pub use wire::{Channel, Reliability};
 
 /// The protocol engine version, kept equal to the gdnet crate version by `tests/unit/test_gdnet_loads.gd`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,12 +61,19 @@ mod tests {
             format!("{} {}", "extern", "crate"),
         ];
         let mut files = Vec::new();
-        rust_sources(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(), &mut files);
+        rust_sources(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(),
+            &mut files,
+        );
         assert!(!files.is_empty());
         for file in files {
             let src = std::fs::read_to_string(&file).expect("read source");
             for needle in &needles {
-                assert!(!src.contains(needle.as_str()), "{} uses {needle}", file.display());
+                assert!(
+                    !src.contains(needle.as_str()),
+                    "{} uses {needle}",
+                    file.display()
+                );
             }
         }
     }

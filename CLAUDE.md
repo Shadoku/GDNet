@@ -76,6 +76,9 @@ Never say a change works without a passing check. If you cannot run Godot
 - Any `ERROR`/`SCRIPT ERROR` printed while a test runs fails it. Set
   `allow_errors = true` in a test that deliberately triggers one.
 - Run without `check.py`: `godot --headless --path . -s tests/framework/runner.gd -- --filter=name --verbose`.
+- Networked behaviour: `NetFixture.new(self, n_clients)`, `start()`, `await wait_connected()`, then
+  `teardown()` in `after_each`; never real sockets except the single ENet test. Connect to the `tick`
+  signal with `connect("tick", f)` (`Net.tick` is the method).
 
 ## Design for testability
 
@@ -94,12 +97,15 @@ project.godot          engine settings; main scene is scenes/main.tscn
 .godot-version         pinned Godot release used by CI and the session hook
 scenes/                .tscn files (one folder per feature as the game grows)
 src/                   GDScript: logic classes and node scripts
-tests/framework/       test runner + TestCase base (no addons required)
+tests/framework/       test runner + TestCase base (no addons required); net_fixture.gd (NetFixture:
+                       /root/Server + /root/ClientA.. branches joined by NetPipePeer, both host modes)
+tests/fixtures/        scripts and scenes that tests load (never named test_*)
 tests/unit/            fast tests of plain classes
 tests/integration/     tests that instantiate scenes
 rust/                  Cargo workspace: netcore (sans-IO protocol engine, no godot dep),
                        gdnet (the GDExtension); rust/target/ is ignored
 addons/gdnet/          gdnet.gdextension + bin/<platform>/ (built, ignored) + addon assets
+docs/guide/            the gdnet user guide, one page per topic (01_sessions.md, ...)
 tools/check.py         the one command to verify the project
 tools/validate_scripts.gd   compiles every script; used by check.py
 tools/install_godot.sh downloads the pinned Godot into ~/.cache/godot
