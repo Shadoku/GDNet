@@ -123,6 +123,8 @@ pub enum Message {
     WriteReject(WriteReject),
     /// WP7: keyed state (keyed.rs).
     Keyed(crate::keyed::KeyMsg),
+    /// WP8: sampled per-entity state hashes (hash.rs; channel 2).
+    Hash(crate::hash::HashMsg),
 }
 
 /// The kind bytes. 0 is never used, so a zeroed buffer is not a message.
@@ -143,12 +145,13 @@ pub mod kind {
     pub const WRITE: u8 = 14;
     pub const WRITE_REJECT: u8 = 15;
     pub const KEYED: u8 = 16;
+    pub const HASH: u8 = 17;
 }
 
 /// The channel a message of kind `k` travels on (for byte counters of received packets).
 pub fn channel_of_kind(k: u8) -> Channel {
     match k {
-        kind::PING | kind::PONG => Channel::Diagnostics,
+        kind::PING | kind::PONG | kind::HASH => Channel::Diagnostics,
         kind::SNAPSHOT | kind::ACK | kind::INPUT | kind::OWNER_STATE => Channel::Unreliable,
         _ => Channel::Reliable,
     }
@@ -191,6 +194,7 @@ impl Message {
             Message::Write(_) => kind::WRITE,
             Message::WriteReject(_) => kind::WRITE_REJECT,
             Message::Keyed(_) => kind::KEYED,
+            Message::Hash(_) => kind::HASH,
         }
     }
 
@@ -211,7 +215,7 @@ impl Message {
             Message::Snapshot(_) | Message::Ack(_) | Message::Input(_) | Message::OwnerState(_) => {
                 Channel::Unreliable
             }
-            Message::Ping(_) | Message::Pong(_) => Channel::Diagnostics,
+            Message::Ping(_) | Message::Pong(_) | Message::Hash(_) => Channel::Diagnostics,
         }
     }
 }
@@ -252,6 +256,7 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         Message::Write(m) => body(kind::WRITE, m),
         Message::WriteReject(m) => body(kind::WRITE_REJECT, m),
         Message::Keyed(m) => body(kind::KEYED, m),
+        Message::Hash(m) => body(kind::HASH, m),
     }
 }
 
@@ -279,6 +284,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         kind::WRITE => Message::Write(parse(k, rest)?),
         kind::WRITE_REJECT => Message::WriteReject(parse(k, rest)?),
         kind::KEYED => Message::Keyed(parse(k, rest)?),
+        kind::HASH => Message::Hash(parse(k, rest)?),
         other => return Err(WireError::UnknownKind(other)),
     })
 }
@@ -567,6 +573,15 @@ mod tests {
         assert_eq!(channel_of_kind(kind::SNAPSHOT), Channel::Unreliable);
         assert_eq!(channel_of_kind(kind::FIELD), Channel::Reliable);
         assert_eq!(channel_of_kind(kind::PONG), Channel::Diagnostics);
+        // WP8: hashes on channel 2.
+        let hm = Message::Hash(crate::hash::HashMsg {
+            tick: 9,
+            settled: std::vec![(3, 0xdead_beef)],
+            carried: std::vec![(4, 1)],
+        });
+        assert_eq!(hm.channel(), Channel::Diagnostics);
+        assert_eq!(channel_of_kind(kind::HASH), Channel::Diagnostics);
+        assert_eq!(decode(&encode(&hm)), Ok(hm));
         let ack = encode(&Message::Ack(Ack {
             tick: 600,
             history: 0,

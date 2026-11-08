@@ -1,0 +1,24 @@
+[gd_scene load_steps=4 format=3]
+
+[ext_resource type="Script" path="res://addons/gdnet/meter.gd" id="1_meter"]
+
+[sub_resource type="SystemFont" id="SystemFont_mono"]
+font_names = PackedStringArray("Monospace", "DejaVu Sans Mono", "Consolas", "Menlo")
+
+[sub_resource type="Theme" id="Theme_mono"]
+default_font = SubResource("SystemFont_mono")
+default_font_size = 12
+
+[node name="NetMeter" type="CanvasLayer"]
+layer = 128
+script = ExtResource("1_meter")
+
+[node name="Panel" type="PanelContainer" parent="."]
+offset_left = 8.0
+offset_top = 8.0
+mouse_filter = 2
+theme = SubResource("Theme_mono")
+
+[node name="Lines" type="VBoxContainer" parent="Panel"]
+layout_mode = 2
+theme_override_constants/separation = 0

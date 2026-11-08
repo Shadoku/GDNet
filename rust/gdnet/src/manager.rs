@@ -131,6 +131,8 @@ struct Entry {
     transfer: netcore::Transfer,
     /// WP7: the owner `owner_changed` last reported (callbacks fire when a change differs from it).
     notified_owner: u32,
+    /// WP8: `Time.get_ticks_msec()` of the last rejected write (0 = none), for the overlay's red.
+    rejected_ms: u64,
 }
 
 impl Entry {
@@ -159,6 +161,7 @@ impl Entry {
             client_owned: false,
             transfer: netcore::Transfer::Fixed,
             notified_owner: owner,
+            rejected_ms: 0,
         }
     }
 }
@@ -949,6 +952,9 @@ impl NetManager {
                 let Ok(node) = Gd::<Node>::try_from_instance_id(iid) else {
                     return;
                 };
+                if let Some(e) = self.entries.get_mut(&iid) {
+                    e.rejected_ms = godot::classes::Time::singleton().get_ticks_msec();
+                }
                 let mut sobj = session.clone().upcast::<Node>();
                 let _guard = self.base_mut();
                 for (n, f, v) in writes {
@@ -2268,6 +2274,57 @@ pub fn entity_root_of(node: &Gd<Node>) -> Option<(Gd<Node>, Gd<NetManager>)> {
         cur = n.get_parent();
     }
     None
+}
+
+/// WP8: one managed entity as the overlay and `overlay_rows()` see it.
+pub struct OverlayEntry {
+    pub node: Gd<Node>,
+    pub id: NetId,
+    pub owner: u32,
+    pub client_owned: bool,
+    pub transfer: netcore::Transfer,
+    pub scene: String,
+    pub parts: u16,
+    pub rejected_ms: u64,
+}
+
+impl NetManager {
+    /// WP8: the spawned entities of this manager, in enrolment order.
+    pub fn overlay_entries(&self) -> Vec<OverlayEntry> {
+        self.order
+            .iter()
+            .filter_map(|iid| {
+                let e = self.entries.get(iid)?;
+                let id = e.id?;
+                let node = Gd::<Node>::try_from_instance_id(*iid).ok()?;
+                Some(OverlayEntry {
+                    node,
+                    id,
+                    owner: e.owner,
+                    client_owned: e.client_owned,
+                    transfer: e.transfer,
+                    scene: e.scene.path.clone(),
+                    parts: e.scene.part_count(),
+                    rejected_ms: e.rejected_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// WP8: the (net id, part index) of the entity rooted at `root` and the part path `part` ("." or
+    /// "" for the root).
+    pub fn part_address(&self, root: &Gd<Node>, part: &str) -> Option<(NetId, u16)> {
+        let e = self.entries.get(&root.instance_id())?;
+        let id = e.id?;
+        let want = if part.is_empty() { "." } else { part };
+        let index = e
+            .scene
+            .table
+            .entries
+            .iter()
+            .position(|(path, _)| path == want)?;
+        Some((id, index as u16))
+    }
 }
 
 /// Every part node of an entity, by part index (None for a part that is missing).

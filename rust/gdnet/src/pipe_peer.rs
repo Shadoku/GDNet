@@ -223,6 +223,8 @@ pub struct NetPipePeer {
     mode: TransferMode,
     refuse: bool,
     emulation: Option<Gd<NetEmulation>>,
+    /// WP8: bytes and packets this end put and got (what the transport carried, headers included).
+    counts: [i64; 4],
 }
 
 #[godot_api]
@@ -281,6 +283,31 @@ impl NetPipePeer {
     #[func]
     fn get_emulation(&self) -> Option<Gd<NetEmulation>> {
         self.emulation.clone()
+    }
+
+    /// WP8: bytes this end handed to the pipe (every packet as `SceneMultiplayer` put it, so raw
+    /// packets carry its one-byte header).
+    #[func]
+    fn bytes_sent(&self) -> i64 {
+        self.counts[0]
+    }
+
+    /// WP8: packets this end handed to the pipe.
+    #[func]
+    fn packets_sent(&self) -> i64 {
+        self.counts[1]
+    }
+
+    /// WP8: bytes this end took out of the pipe.
+    #[func]
+    fn bytes_received(&self) -> i64 {
+        self.counts[2]
+    }
+
+    /// WP8: packets this end took out of the pipe.
+    #[func]
+    fn packets_received(&self) -> i64 {
+        self.counts[3]
     }
 
     /// Packets held by this end's emulators (sent and not yet released, or received and not yet due).
@@ -364,7 +391,11 @@ impl IMultiplayerPeerExtension for NetPipePeer {
         let mut hub = hub.borrow_mut();
         let packet = hub.ends.get_mut(&self.id).and_then(|e| e.inbox.pop_front());
         match packet {
-            Some(p) => PackedByteArray::from(p.data.as_slice()),
+            Some(p) => {
+                self.counts[2] += p.data.len() as i64;
+                self.counts[3] += 1;
+                PackedByteArray::from(p.data.as_slice())
+            }
             None => PackedByteArray::new(),
         }
     }
@@ -378,6 +409,8 @@ impl IMultiplayerPeerExtension for NetPipePeer {
             return Error::ERR_UNCONFIGURED;
         }
         self.sync_emulation(false);
+        self.counts[0] += buffer.len() as i64;
+        self.counts[1] += 1;
         let packet = Packet {
             from: self.id,
             to: self.target,

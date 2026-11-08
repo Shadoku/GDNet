@@ -20,7 +20,7 @@ use crate::call::{self as net_call, NetArg, NetCall};
 use crate::emulation::{settings_of, NetEmulation};
 use crate::interp;
 use crate::keyed::{self as net_keyed, NetKeyedState};
-use crate::manager::{NetManager, TickCtx, MANAGERS_GROUP};
+use crate::manager::{entity_root_of, NetManager, TickCtx, MANAGERS_GROUP};
 use crate::pipe_peer::NetPipePeer;
 use crate::poll::{NetPoller, POLLER_NODE};
 use crate::profiles;
@@ -137,7 +137,17 @@ pub struct NetSession {
     state: Gd<NetKeyedState>,
     /// WP7: `Net.request_owner` calls waiting for their reply, by entity.
     owner_requests: HashMap<u32, Vec<Gd<NetCall>>>,
+    /// WP8: this is `Net`'s session: the meter's toggle key is read here (`_unhandled_input`) and the
+    /// editor's debugger tab is fed from here.
+    pub(crate) net_default: bool,
+    /// WP8: ticks since the editor debugger was last fed.
+    debugger_ticks: u32,
 }
+
+/// WP8: the group every session joins (the overlay and the meter find sessions through it).
+pub const SESSIONS_GROUP: &str = "__gdnet_sessions";
+/// WP8: an overlay row is red this long after a rejected write.
+pub const REJECTED_MS: u64 = 1000;
 
 /// Byte and timing counters behind `stats()` (2.7, the WP8 meter's source).
 #[derive(Default, Clone)]
@@ -166,11 +176,21 @@ struct Counters {
     late_per_s: u64,
     window_start_corrections: u64,
     corrections_per_s: u64,
+    /// WP8.
+    window_start_divergences: u64,
+    divergences_per_s: u64,
+    window_start_snapshot_bytes: u64,
+    snapshot_bytes_per_s: u64,
+    window_start_keyed: u64,
+    keyed_bytes_per_s: u64,
 }
 
 #[godot_api]
 impl INode for NetSession {
     fn ready(&mut self) {
+        self.base_mut().add_to_group(SESSIONS_GROUP);
+        let hotkey = self.net_default;
+        self.base_mut().set_process_unhandled_input(hotkey);
         self.base_mut().set_process_priority(-1000);
         self.base_mut().set_physics_process_priority(-1000);
         // Gate G0: no render-frame work unless a client session runs (start() turns it on).
@@ -192,6 +212,18 @@ impl INode for NetSession {
 
     fn physics_process(&mut self, _delta: f64) {
         self.step();
+    }
+
+    /// WP8: the meter's toggle (the action `gdnet_toggle_meter` when the project defines it, else F9),
+    /// on `Net`'s session only.
+    fn unhandled_input(&mut self, event: Gd<godot::classes::InputEvent>) {
+        if !self.net_default || !crate::meter::is_toggle(&event) {
+            return;
+        }
+        if let Some(mut vp) = self.base().get_viewport() {
+            vp.set_input_as_handled();
+        }
+        crate::meter::toggle_from_session();
     }
 
     /// 2.2 step 7 (WP5): interpolated replicas and owned offsets, once per render frame.
@@ -573,7 +605,104 @@ impl NetSession {
             d.set("keyed_writes_rejected", k.rejected as i64);
             d.set("keyed_entries", core.keyed().len() as i64);
         }
+        // WP8.
+        self.diagnostics_into(&mut d);
         d
+    }
+
+    /// WP8: the divergences hash telemetry counted for the entity `node` belongs to on this client (0
+    /// on the server, for an unmanaged node, or without a session).
+    #[func]
+    pub fn divergences(&self, node: Gd<Node>) -> i64 {
+        let Some(id) = entity_root_of(&node).map(|(root, m)| m.bind().net_id_of(&root)) else {
+            return 0;
+        };
+        if id == 0 {
+            return 0;
+        }
+        self.core
+            .as_ref()
+            .map_or(0, |c| c.divergences_of(id) as i64)
+    }
+
+    /// WP8 test hook: replaces this client's held copy of the replicated property `property`
+    /// (`prop` or `Part:prop`) of the entity `node` belongs to, as if a snapshot had been applied
+    /// wrongly; hash telemetry then counts divergences for it. Returns false when the property is not
+    /// replicated or this is not a client.
+    #[func]
+    fn _debug_corrupt_held(&mut self, node: Gd<Node>, property: GString, value: Variant) -> bool {
+        let Some((root, m)) = entity_root_of(&node) else {
+            return false;
+        };
+        let text = property.to_string();
+        let (part, prop) = match text.rsplit_once(':') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (String::new(), text.clone()),
+        };
+        let Some((id, part)) = m.bind().part_address(&root, &part) else {
+            return false;
+        };
+        let Some(core) = self.core.as_mut() else {
+            return false;
+        };
+        let Some(scene) = core.entities().get(id).map(|r| r.scene) else {
+            return false;
+        };
+        let Some((field, ty)) = core.props(scene).and_then(|t| {
+            t.parts
+                .get(usize::from(part))?
+                .iter()
+                .position(|d| d.name == prop)
+                .map(|f| (f as u16, t.parts[usize::from(part)][f].ty))
+        }) else {
+            return false;
+        };
+        let v = crate::apply::to_value(&value, ty);
+        core.debug_corrupt_held(id, part, field, &v);
+        core.role() == netcore::Role::Client
+    }
+
+    /// WP8: every managed entity of this session's branch as the ownership overlay sees it, one
+    /// Dictionary each: `net_id`, `owner`, `role` (`"rejected"` = a write was rejected in the last
+    /// second, red; `"client_owned"` = the owner's state is trusted, amber; `"server"` = server-owned,
+    /// white; `"own"` = owned by this peer, green; `"other"` = another client's, grey), `color`,
+    /// `client_owned`, `transfer` (0 fixed, 1 request, 2 take), `scene`, `parts`, `hashes_diverged`
+    /// and `node`.
+    #[func]
+    pub fn overlay_rows(&self) -> VarArray {
+        let mut out = VarArray::new();
+        if self.core.is_none() {
+            return out;
+        }
+        let local = self.core.as_ref().map_or(0, |c| c.local_id());
+        let now = Time::singleton().get_ticks_msec();
+        let mut seen = std::collections::HashSet::new();
+        for (_, m) in self.managers() {
+            for e in m.bind().overlay_entries() {
+                if !seen.insert(e.id) {
+                    continue;
+                }
+                let role = crate::overlay::role_of(&e, local, now);
+                let mut d = VarDictionary::new();
+                d.set("net_id", i64::from(e.id));
+                d.set("owner", i64::from(e.owner));
+                d.set("role", role);
+                d.set("color", crate::overlay::color_of(role));
+                d.set("client_owned", e.client_owned);
+                d.set("transfer", e.transfer as i64);
+                d.set("scene", &GString::from(e.scene.as_str()));
+                d.set("parts", i64::from(e.parts));
+                d.set(
+                    "hashes_diverged",
+                    self.core
+                        .as_ref()
+                        .map_or(0, |c| c.divergences_of(e.id) as i64),
+                );
+                d.set("node", &e.node);
+                out.push(&d.to_variant());
+            }
+        }
+        out
     }
 
     /// WP5: the effective jitter buffer in ticks: a client's current (adaptive) value, else the
@@ -716,6 +845,8 @@ impl NetSession {
             interp::adaptive(),
             interp::teleport_distance(),
         );
+        core.set_hash_telemetry(crate::hash::telemetry(), crate::hash::sample());
+        core.set_hash_refresh(crate::hash::refresh_s());
         let now = now_us();
         if hosting {
             for id in inner.get_peers().as_slice() {
@@ -1060,6 +1191,94 @@ impl NetSession {
         };
         self.flush(outgoing);
         self.roll_stats_window();
+        self.feed_debugger();
+    }
+
+    /// WP8: the meter's and the editor tab's figures beyond the counters above.
+    fn diagnostics_into(&self, d: &mut VarDictionary) {
+        let c = &self.stats;
+        let Some(core) = self.core.as_ref() else {
+            d.set("hash_telemetry", crate::hash::telemetry());
+            return;
+        };
+        let h = core.hash_stats();
+        d.set("hash_telemetry", core.hash_telemetry());
+        d.set("hashes_sent", h.sent as i64);
+        d.set("hashes_received", h.received as i64);
+        d.set("hashes_compared", h.compared as i64);
+        d.set("hashes_skipped", h.skipped as i64);
+        d.set("divergences", h.divergences as i64);
+        d.set("divergences_per_s", c.divergences_per_s as i64);
+        let peers = core.joined_peers();
+        let avg = |f: &dyn Fn(u32) -> Option<f64>| {
+            let v: Vec<f64> = peers.iter().filter_map(|p| f(*p)).collect();
+            if v.is_empty() {
+                -1.0
+            } else {
+                v.iter().sum::<f64>() / v.len() as f64
+            }
+        };
+        d.set("rtt_ms", avg(&|p| core.rtt_ms(p)));
+        d.set("jitter_ms", avg(&|p| core.jitter_ms(p)));
+        let tick = core.current_tick();
+        d.set("tick", tick as i64);
+        let offset = if core.role() == netcore::Role::Client {
+            core.clock().server_tick_estimate() - tick as f64
+        } else {
+            0.0
+        };
+        d.set("server_tick_offset", offset);
+        let server = core.role() == netcore::Role::Server;
+        let snap = if server {
+            c.snapshot_bytes_per_s
+        } else {
+            c.received_per_s[1]
+        };
+        d.set("snapshot_bytes_per_s", snap as i64);
+        d.set("keyed_bytes_per_s", c.keyed_bytes_per_s as i64);
+        // WP13 narrows scope to rooms; until then every entity is in scope.
+        d.set("entities_in_scope", core.entities().len() as i64);
+        let budget = f64::from(core.budget()) * peers.len().max(1) as f64;
+        d.set(
+            "budget_use",
+            if server {
+                c.snapshot_bytes_per_s as f64 / budget
+            } else {
+                0.0
+            },
+        );
+    }
+
+    /// WP8: twice a second, `Net`'s session sends `gdnet:stats` (the `stats()` Dictionary) and
+    /// `gdnet:entities` (`overlay_rows()` without the nodes) to the editor's debugger when the game runs
+    /// under it.
+    fn feed_debugger(&mut self) {
+        if !self.net_default {
+            return;
+        }
+        self.debugger_ticks += 1;
+        if self.debugger_ticks < (tick_rate() / 2).max(1) {
+            return;
+        }
+        self.debugger_ticks = 0;
+        let mut dbg = godot::classes::EngineDebugger::singleton();
+        if !dbg.is_active() {
+            return;
+        }
+        let stats = self.stats();
+        let mut rows = self.overlay_rows();
+        for i in 0..rows.len() {
+            if let Ok(mut d) = rows.at(i).try_to::<VarDictionary>() {
+                d.remove("node");
+                rows.set(i, &d.to_variant());
+            }
+        }
+        let mut a = VarArray::new();
+        a.push(&stats.to_variant());
+        dbg.send_message(crate::editor::MSG_STATS, &a);
+        let mut b = VarArray::new();
+        b.push(&rows.to_variant());
+        dbg.send_message(crate::editor::MSG_ENTITIES, &b);
     }
 
     fn flush(&mut self, outgoing: Vec<netcore::Outgoing>) {
@@ -1120,6 +1339,18 @@ impl NetSession {
                     c.calls_per_s[i] = n - c.window_start_calls[i];
                 }
                 c.window_start_calls = now;
+            }
+            if let Some(core) = self.core.as_ref() {
+                let div = core.hash_stats().divergences;
+                c.divergences_per_s = div - c.window_start_divergences;
+                c.window_start_divergences = div;
+                let sb = core.repl_stats().snapshot_bytes;
+                c.snapshot_bytes_per_s = sb - c.window_start_snapshot_bytes;
+                c.window_start_snapshot_bytes = sb;
+                let k = core.keyed().stats;
+                let kb = k.bytes_sent + k.bytes_received;
+                c.keyed_bytes_per_s = kb - c.window_start_keyed;
+                c.window_start_keyed = kb;
             }
             c.poll_ms_avg = c.poll_us_window as f64 / 1000.0 / f64::from(c.window_ticks);
             c.poll_us_window = 0;

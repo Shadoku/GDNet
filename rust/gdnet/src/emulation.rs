@@ -1,6 +1,11 @@
 //! `NetEmulation`: the network emulator's settings as a Resource (docs/PLAN_NETCODE.md 1, 3.1). Latency,
 //! variance, loss, reorder and duplication for what this side sends and what it receives, plus
 //! Unreal's presets. The numbers are read at every poll, so editing a live resource takes effect at once.
+//!
+//! WP8: presets `off`, `lan` (5 ms), `average`, `bad`, `mobile` (120-140 ms, 2 % loss) as data in
+//! netcore, and the project settings `gdnet/debug/emulation_preset` (`off` default, a preset name, or
+//! `custom`) with `gdnet/debug/emulation/<field>` (the exported fields below, read for `custom`), which
+//! `Net` applies when it starts a session and `Net.emulation` is not set.
 
 use godot::prelude::*;
 use netcore::EmulSettings;
@@ -49,9 +54,16 @@ pub struct NetEmulation {
 impl NetEmulation {
     /// Sets both directions to a named preset: `"off"`, `"average"` (30-60 ms, 1 % loss) or `"bad"`
     /// (100-200 ms, 5 % loss), Unreal's profiles. Returns false (and changes nothing) for an unknown name.
+    /// WP8 also `"lan"` (5 ms) and `"mobile"` (120-140 ms, 2 % loss), and `"custom"`: the
+    /// `gdnet/debug/emulation/<field>` project settings.
     #[func]
-    fn preset(&mut self, name: GString) -> bool {
-        let Some(s) = EmulSettings::preset(&name.to_string()) else {
+    pub fn preset(&mut self, name: GString) -> bool {
+        let name = name.to_string();
+        if name.eq_ignore_ascii_case("custom") {
+            self.load_custom();
+            return true;
+        }
+        let Some(s) = EmulSettings::preset(&name) else {
             return false;
         };
         self.apply(s, s);
@@ -92,6 +104,26 @@ impl NetEmulation {
         self.seed as u64
     }
 
+    /// The `gdnet/debug/emulation/<field>` settings (unset fields are 0).
+    fn load_custom(&mut self) {
+        let num = |field: &str| {
+            crate::hash::setting(&format!("{SETTING_CUSTOM_PREFIX}{field}"))
+                .and_then(|v| crate::profiles::number(&v))
+                .unwrap_or(0.0)
+        };
+        self.send_latency_ms = num("send_latency_ms");
+        self.send_variance_ms = num("send_variance_ms");
+        self.send_loss = num("send_loss");
+        self.send_reorder = num("send_reorder");
+        self.send_duplicate = num("send_duplicate");
+        self.receive_latency_ms = num("receive_latency_ms");
+        self.receive_variance_ms = num("receive_variance_ms");
+        self.receive_loss = num("receive_loss");
+        self.receive_reorder = num("receive_reorder");
+        self.receive_duplicate = num("receive_duplicate");
+        self.seed = num("seed") as i64;
+    }
+
     fn apply(&mut self, send: EmulSettings, receive: EmulSettings) {
         self.send_latency_ms = send.latency_ms;
         self.send_variance_ms = send.variance_ms;
@@ -115,4 +147,31 @@ pub fn settings_of(e: &Option<Gd<NetEmulation>>) -> (EmulSettings, EmulSettings,
         }
         None => (EmulSettings::default(), EmulSettings::default(), 0),
     }
+}
+
+pub const SETTING_PRESET: &str = "gdnet/debug/emulation_preset";
+pub const SETTING_CUSTOM_PREFIX: &str = "gdnet/debug/emulation/";
+
+/// A new `NetEmulation` set to `name` (a preset or `custom`); None for an unknown name.
+pub fn from_preset(name: &str) -> Option<Gd<NetEmulation>> {
+    let mut e = NetEmulation::new_gd();
+    let ok = e.bind_mut().preset(GString::from(name));
+    ok.then_some(e)
+}
+
+/// WP8: the emulation `gdnet/debug/emulation_preset` asks for, None when unset or `off` (an unknown
+/// name prints an error).
+pub fn from_settings() -> Option<Gd<NetEmulation>> {
+    let name = crate::hash::setting(SETTING_PRESET)?.to_string();
+    let name = name.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("off") || name.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let e = from_preset(name);
+    if e.is_none() {
+        godot_error!(
+            "gdnet: {SETTING_PRESET} = {name:?} is not a preset (off, lan, average, bad, mobile, custom)"
+        );
+    }
+    e
 }

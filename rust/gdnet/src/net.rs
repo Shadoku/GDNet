@@ -46,6 +46,7 @@ use crate::keyed::NetKeyedState;
 use crate::manager::{
     entity_root_of, net_entity_of, session_of, NetManager, LOCAL_GROUP, META_OWNER, META_PRIORITY,
 };
+use crate::meter;
 use crate::pipe_peer::NetPipePeer;
 use crate::profiles::{self, NetProfiles};
 use crate::session::{tick_rate, NetSession};
@@ -135,6 +136,9 @@ pub struct Net {
     #[allow(dead_code)]
     state: Option<Gd<NetKeyedState>>,
     state_cell: std::cell::OnceCell<Gd<NetKeyedState>>,
+    /// WP8: the meter and the overlay layers while shown.
+    meter: Option<Gd<Node>>,
+    overlay: Option<Gd<Node>>,
 }
 
 #[godot_api]
@@ -653,6 +657,83 @@ impl Net {
         i64::from(tick_rate())
     }
 
+    /// WP8: sets `Net.emulation` to a new `NetEmulation` with the preset `name` (`off`, `lan`,
+    /// `average`, `bad`, `mobile`, or `custom` = the `gdnet/debug/emulation/*` settings), applied to the
+    /// running session at once. False (nothing changed) for an unknown name.
+    #[func]
+    fn emulation_preset(&mut self, name: GString) -> bool {
+        match crate::emulation::from_preset(&name.to_string()) {
+            Some(e) => {
+                self.set_emulation(Some(e));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// WP8: shows (adds under the root as `__NetMeter`) or hides (frees) the network meter,
+    /// `addons/gdnet/meter.tscn`. It shows the default session, else the first session in the tree.
+    /// Also toggled by the action `gdnet_toggle_meter` (or F9) while `Net` has a session.
+    #[func]
+    pub fn show_meter(&mut self, show: bool) {
+        if show == self.meter_visible() {
+            return;
+        }
+        if show {
+            self.meter = meter::new_meter().and_then(|m| meter::add_layer(m, meter::METER_NODE));
+        } else {
+            meter::remove_layer(self.meter.take());
+        }
+    }
+
+    #[func]
+    pub fn meter_visible(&self) -> bool {
+        meter::is_live(&self.meter)
+    }
+
+    /// WP8: shows (adds under the root as `__NetOverlay`) or hides the ownership overlay: a label per
+    /// managed entity at its screen position, coloured by role (see `overlay_rows()`).
+    #[func]
+    fn show_overlay(&mut self, show: bool) {
+        if show == self.overlay_visible() {
+            return;
+        }
+        if show {
+            let layer = crate::overlay::NetOverlay::new_alloc().upcast::<Node>();
+            self.overlay = meter::add_layer(layer, meter::OVERLAY_NODE);
+        } else {
+            meter::remove_layer(self.overlay.take());
+        }
+    }
+
+    #[func]
+    fn overlay_visible(&self) -> bool {
+        meter::is_live(&self.overlay)
+    }
+
+    /// WP8: the default session's `stats()` (empty without a session).
+    #[func]
+    fn stats(&self) -> VarDictionary {
+        self.session
+            .as_ref()
+            .map_or_else(VarDictionary::new, |s| s.bind().stats())
+    }
+
+    /// WP8: the default session's `overlay_rows()` (empty without a session).
+    #[func]
+    fn overlay_rows(&self) -> VarArray {
+        self.session
+            .as_ref()
+            .map_or_else(VarArray::new, |s| s.bind().overlay_rows())
+    }
+
+    /// WP8: the divergences hash telemetry counted for the entity `node` belongs to, in its branch's
+    /// session (0 on the server, unmanaged, or without a session).
+    #[func]
+    fn divergences(&self, node: Gd<Node>) -> i64 {
+        session_of(&node).map_or(0, |s| s.bind().divergences(node))
+    }
+
     #[func]
     fn _on_peer_joined(&mut self, id: i64) {
         self.base_mut()
@@ -937,6 +1018,11 @@ impl Net {
         {
             let mut b = session.bind_mut();
             b.debug_protocol_salt = self.debug_protocol_salt;
+            b.net_default = true;
+            // WP8: `gdnet/debug/emulation_preset` when no emulation was set.
+            if self.emulation.is_none() {
+                self.emulation = crate::emulation::from_settings();
+            }
             b.set_emulation(self.emulation.clone());
         }
         let err = session.bind_mut().start(peer, NodePath::default());
@@ -952,6 +1038,13 @@ impl Net {
         }
         root.call_deferred("add_child", &[session.to_variant()]);
         self.session = Some(session);
+        // WP8: `gdnet/debug/meter` and `gdnet/debug/overlay` show them when a session starts.
+        if crate::hash::bool_setting(meter::SETTING_METER, false) {
+            self.show_meter(true);
+        }
+        if crate::hash::bool_setting(meter::SETTING_OVERLAY, false) {
+            self.show_overlay(true);
+        }
         Error::OK
     }
 

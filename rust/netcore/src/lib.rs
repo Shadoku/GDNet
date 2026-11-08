@@ -14,7 +14,8 @@
 //! (prediction histories, mismatch detection, rollback requests, the tick lead). WP5: [`interp`] (the
 //! render timeline, the adaptive jitter buffer, sample buffers, error offsets). WP6: [`call`] (calls and
 //! returns, the argument encoding, the routing verbs). WP7: [`authority`] (transfer rules, owner state
-//! acceptance, rejected writes), [`keyed`] (the keyed state map, permissions, views).
+//! acceptance, rejected writes), [`keyed`] (the keyed state map, permissions, views). WP8: [`hash`] (hash
+//! telemetry: per-entity hashes, sampling, the client's comparison).
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +25,7 @@ pub mod clock;
 pub mod delta;
 pub mod emul;
 pub mod entity;
+pub mod hash;
 pub mod input;
 pub mod interp;
 pub mod keyed;
@@ -44,6 +46,7 @@ pub use entity::{
     CreateAction, EntityAction, EntityRecord, EntityTable, NetId, ParentRef, PartTable,
     MANAGER_ROOT,
 };
+pub use hash::{HashMsg, HashStats};
 pub use input::{InputFrame, InputMsg, TakenFrame};
 pub use interp::{Interp, InterpStats};
 pub use keyed::{KeyEvent, KeyMsg, KeyedState, Who};

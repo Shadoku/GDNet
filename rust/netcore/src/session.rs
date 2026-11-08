@@ -29,6 +29,7 @@ use crate::emul::{EmulSettings, Emulator};
 use crate::entity::{
     CreateAction, EntityAction, EntityRecord, EntityTable, HeldQueue, IdAllocator, NetId, ParentRef,
 };
+use crate::hash::{HashMsg, HashRx, HashStats, HashTx};
 use crate::input::{self, AdaptiveDelay, InputBuffer, InputFrame, OwnerInputs, TakenFrame};
 use crate::interp::Interp;
 use crate::keyed::{KeyEvent, KeyMsg, KeyedState, Who};
@@ -254,6 +255,38 @@ pub struct Session {
     auth: AuthState,
     /// WP7: the keyed state map.
     keyed: KeyedState,
+    /// WP8: hash telemetry (hash.rs).
+    hash: HashState,
+}
+
+/// WP8: the session's hash telemetry state.
+struct HashState {
+    /// `gdnet/debug/hash_telemetry` (default on).
+    on: bool,
+    /// Entities sampled per tick (server).
+    sample: u32,
+    tx: HashTx,
+    rx: HashRx,
+    sent: u64,
+    /// Server: per (peer, entity) the hash last sent and the tick it was sent; an unchanged hash is
+    /// only sent again after `refresh_ticks` (an idle world costs almost nothing, gate G4).
+    last: BTreeMap<(PeerId, NetId), (u32, u64)>,
+    /// 0 = `REFRESH_S` seconds.
+    refresh_ticks: u64,
+}
+
+impl Default for HashState {
+    fn default() -> Self {
+        Self {
+            on: true,
+            sample: crate::hash::DEFAULT_SAMPLE,
+            tx: HashTx::default(),
+            rx: HashRx::default(),
+            sent: 0,
+            last: BTreeMap::new(),
+            refresh_ticks: 0,
+        }
+    }
 }
 
 /// WP7: the session's authority state (authority.rs).
@@ -396,6 +429,7 @@ impl Session {
             },
             auth: AuthState::default(),
             keyed: KeyedState::default(),
+            hash: HashState::default(),
         }
     }
 
@@ -657,6 +691,9 @@ impl Session {
                 self.route_updates();
                 if let Some(t) = applied {
                     self.prediction.mark_confirmed(t);
+                    if self.hash.on {
+                        self.hash.rx.applied(t);
+                    }
                 }
                 // WP5: every arrival measures the jitter, a stale (overtaken) one too.
                 let tick = applied.or_else(|| crate::quant::BitReader::new(&body).read_varint());
@@ -693,6 +730,11 @@ impl Session {
             }
             Message::CallReturn(r) if self.role == Role::Client && peer == SERVER => {
                 self.on_call_return(r);
+            }
+            Message::Hash(m) if self.role == Role::Client && peer == SERVER => {
+                if self.hash.on {
+                    self.hash.rx.on_msg(m);
+                }
             }
             Message::Pong(p) => {
                 let rtt = now_us.saturating_sub(p.echo_us) as f64;
@@ -2020,6 +2062,7 @@ impl Session {
                         self.send(peer, &Message::Snapshot(body), now_us);
                     }
                 }
+                self.send_hashes(tick, now_us);
             }
         }
     }
@@ -2046,6 +2089,7 @@ impl Session {
                 self.auth.pending_writes.remove(&key);
                 self.auth.rejects.remove(&key);
                 self.auth.received.insert(key, u.value.clone());
+                self.note_hash(u.id, u.part, u.field, &u.value, u.tick);
             }
             if self.prediction.diverts(u.id, u.part, u.field) {
                 self.prediction
@@ -2058,6 +2102,9 @@ impl Session {
             } else {
                 self.pass_updates.push_back(u);
             }
+        }
+        if self.hash.on {
+            self.hash.rx.commit();
         }
     }
 
@@ -2073,6 +2120,7 @@ impl Session {
     }
 
     fn forget_input(&mut self, id: NetId) {
+        self.hash.rx.forget(id, false);
         self.auth.received.retain(|k, _| k.0 != id);
         self.auth.pending_writes.retain(|k| k.0 != id);
         self.auth.rejects.retain(|k, _| k.0 != id);
@@ -2566,6 +2614,10 @@ impl Session {
         }
         for (p, f, v) in values {
             self.auth.received.insert((id, *p, *f), v.clone());
+            self.note_hash(id, *p, *f, v, 0);
+        }
+        if self.hash.on {
+            self.hash.rx.commit();
         }
     }
 
@@ -3028,6 +3080,178 @@ impl Session {
     /// Forgets the samples and offsets of `id` (its authority changed: WP7 calls this too).
     pub fn interp_reset(&mut self, id: NetId) {
         self.interp.reset(id);
+    }
+}
+
+/// Hash telemetry (WP8, docs/PLAN_NETCODE.md 2.4 `Hash`; see hash.rs).
+impl Session {
+    /// `gdnet/debug/hash_telemetry` on or off, and the entities sampled per tick (server).
+    pub fn set_hash_telemetry(&mut self, on: bool, sample: u32) {
+        self.hash.on = on;
+        self.hash.sample = sample;
+    }
+
+    /// Server: an entity whose hash did not change since a peer last got it is sent again after this
+    /// many seconds (default [`crate::hash::REFRESH_S`]; 0 = every time it is sampled).
+    pub fn set_hash_refresh(&mut self, seconds: f64) {
+        let ticks = (seconds.max(0.0) * f64::from(self.tick_rate())).round() as u64;
+        self.hash.refresh_ticks = ticks.max(1);
+    }
+
+    pub fn hash_telemetry(&self) -> bool {
+        self.hash.on
+    }
+
+    pub fn hash_stats(&self) -> HashStats {
+        HashStats {
+            sent: self.hash.sent,
+            ..self.hash.rx.stats
+        }
+    }
+
+    /// Divergences counted for `id` on this client.
+    pub fn divergences_of(&self, id: NetId) -> u64 {
+        self.hash.rx.divergences_of(id)
+    }
+
+    /// The hash of every entity's hot state at server tick `tick`, entities in id order: on the server
+    /// its recorded state, for the current tick only; on a client what it holds as of `tick` (None when
+    /// an entity's state at `tick` is unknown). For the sync-test mode (WP12).
+    pub fn state_hash(&self, tick: u64) -> Option<u32> {
+        match self.role {
+            Role::Server => {
+                if tick != self.clock.tick() {
+                    return None;
+                }
+                Some(
+                    self.repl
+                        .entity_ids()
+                        .into_iter()
+                        .fold(crate::hash::FNV_OFFSET, |h, id| {
+                            match self.repl.entity_hash(id) {
+                                Some(e) => crate::hash::fold_entity(h, id, e),
+                                None => h,
+                            }
+                        }),
+                )
+            }
+            Role::Client => {
+                let mut h = crate::hash::FNV_OFFSET;
+                for id in self.hash.rx.ids() {
+                    h = crate::hash::fold_entity(h, id, self.hash.rx.hash_at(id, tick)?);
+                }
+                Some(h)
+            }
+        }
+    }
+
+    /// Test hook (the integration tests' deliberate client-side state edit): replaces this client's
+    /// held copy of a hot field, as if a value had been applied wrongly. The next comparison of the
+    /// entity counts a divergence.
+    pub fn debug_corrupt_held(&mut self, id: NetId, part: u16, field: u16, value: &Value) {
+        if self.role != Role::Client {
+            return;
+        }
+        let tick = self.hash.rx.last_applied().unwrap_or(0);
+        self.note_hash(id, part, field, value, tick);
+        self.hash.rx.commit();
+    }
+
+    /// Client: a hot field of `id` the server sent, for the hashes.
+    fn note_hash(&mut self, id: NetId, part: u16, field: u16, value: &Value, tick: u64) {
+        if !self.hash.on || self.role != Role::Client {
+            return;
+        }
+        let Some(scene) = self.entities.get(id).map(|r| r.scene) else {
+            return;
+        };
+        let Some(d) = self.repl.table(scene).and_then(|t| t.get(part, field)) else {
+            return;
+        };
+        if d.schedule != crate::props::Schedule::Hot {
+            return;
+        }
+        let mut w = crate::quant::BitWriter::new();
+        crate::quant::encode(&mut w, d.ty, d.quant, value);
+        let enc = crate::quant::Encoded::of(&w);
+        if Replication::hashed(d, &enc) {
+            self.hash.rx.note(id, part, field, enc, tick);
+        }
+    }
+
+    /// Server, after the snapshots of `tick`: each joined peer gets the hashes of the sampled entities
+    /// it can check at this tick, plus every entity it owns when it owns few.
+    fn send_hashes(&mut self, tick: u64, now_us: u64) {
+        if !self.hash.on {
+            return;
+        }
+        let ids = self.repl.entity_ids();
+        let sampled = self.hash.tx.sample(&ids, self.hash.sample as usize);
+        let refresh = if self.hash.refresh_ticks == 0 {
+            crate::hash::REFRESH_S * u64::from(self.tick_rate())
+        } else {
+            self.hash.refresh_ticks
+        };
+        if tick.is_multiple_of(600) {
+            let entities = &self.entities;
+            let joined = self.peers.joined();
+            self.hash
+                .last
+                .retain(|(p, id), _| joined.contains(p) && entities.get(*id).is_some());
+        }
+        for peer in self.peers.joined() {
+            let mut pick: Vec<NetId> = sampled.clone();
+            let owned: Vec<NetId> = self
+                .entities
+                .iter()
+                .filter(|r| r.owner == peer)
+                .map(|r| r.id)
+                .collect();
+            if owned.len() <= crate::hash::OWNED_EVERY_TICK_MAX {
+                pick.extend(owned);
+            }
+            pick.sort_unstable();
+            pick.dedup();
+            let mut msg = HashMsg {
+                tick,
+                ..HashMsg::default()
+            };
+            for id in pick {
+                // A `client_owned` entity's owner never receives its state.
+                if self
+                    .entities
+                    .get(id)
+                    .is_none_or(|r| r.client_owned && r.owner == peer)
+                {
+                    continue;
+                }
+                let (Some(carried), Some(h)) = (
+                    self.repl.hash_eligibility(peer, id, tick),
+                    self.repl.entity_hash(id),
+                ) else {
+                    continue;
+                };
+                // Unchanged since the peer last got it: only after the refresh period.
+                if self
+                    .hash
+                    .last
+                    .get(&(peer, id))
+                    .is_some_and(|(lh, lt)| *lh == h && tick.saturating_sub(*lt) < refresh)
+                {
+                    continue;
+                }
+                self.hash.last.insert((peer, id), (h, tick));
+                if carried {
+                    msg.carried.push((id, h));
+                } else {
+                    msg.settled.push((id, h));
+                }
+            }
+            if !msg.is_empty() {
+                self.hash.sent += msg.len() as u64;
+                self.send(peer, &Message::Hash(msg), now_us);
+            }
+        }
     }
 }
 
@@ -4742,5 +4966,140 @@ mod tests {
         t.server.keyed_set_visible("team/red/", 3, true, t.now);
         t.steps(1);
         assert_eq!(t.b.keyed().get("team/red/plan"), Some(&std::vec![5]));
+    }
+
+    // WP8: hash telemetry.
+
+    /// A connected pair with one entity (hot `position` in mm) known on both sides, the client holding
+    /// its `Create` state as gdnet would.
+    fn hashed_pair() -> (Pair, NetId) {
+        let mut p = connected_pair();
+        p.server.register_scene(SCENE, 42);
+        p.server.register_props(SCENE, props(), names());
+        let id = p
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "A", 1, 3, std::vec![]).with_values(state(5.0)),
+                p.now,
+            )
+            .unwrap();
+        p.step();
+        client_registers(&mut p);
+        let ev = entity_events(&mut p.client);
+        let EntityEvent::Create { create, .. } = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        let init = p
+            .client
+            .decode_state(create.scene_hash, &create.initial_state)
+            .unwrap();
+        p.client.remember_received(id, &init);
+        (p, id)
+    }
+
+    #[test]
+    fn a_one_millimetre_change_changes_the_entity_hash() {
+        let (mut p, id) = hashed_pair();
+        let before = p.server.replication().entity_hash(id).unwrap();
+        assert!(p
+            .server
+            .record_part(id, 0, &[(0, Value::Vector2([5.001, 1.0]))]));
+        let after = p.server.replication().entity_hash(id).unwrap();
+        assert_ne!(before, after);
+        // Back to the same value: the same hash.
+        p.server
+            .record_part(id, 0, &[(0, Value::Vector2([5.0, 1.0]))]);
+        assert_eq!(p.server.replication().entity_hash(id), Some(before));
+        // Cold fields do not count.
+        p.server.record_part(id, 0, &[(1, Value::Bool(false))]);
+        assert_eq!(p.server.replication().entity_hash(id), Some(before));
+    }
+
+    #[test]
+    fn hashes_match_while_moving_and_count_a_held_state_edit() {
+        let (mut p, id) = hashed_pair();
+        for i in 0..30 {
+            p.server
+                .record_part(id, 0, &[(0, Value::Vector2([5.0 + i as f32 * 0.1, 1.0]))]);
+            step_sync(&mut p);
+            let _ = p.client.drain_state_updates();
+        }
+        for _ in 0..10 {
+            step_sync(&mut p);
+        }
+        let s = p.client.hash_stats();
+        assert!(
+            p.server.hash_stats().sent >= 30,
+            "{:?}",
+            p.server.hash_stats()
+        );
+        assert!(s.received >= 30, "{s:?}");
+        assert!(s.compared >= 30, "{s:?}");
+        assert_eq!(s.divergences, 0, "{s:?}");
+        assert_eq!(p.client.divergences_of(id), 0);
+        let tick = p.server.current_tick();
+        let client_state = p.client.state_hash(tick);
+        assert_eq!(client_state, p.server.state_hash(tick));
+        assert_eq!(
+            p.server.state_hash(tick - 1),
+            None,
+            "the server only knows the current tick"
+        );
+        // Idle: the unchanged hash is not resent within the refresh period (gate G4).
+        let sent = p.server.hash_stats().sent;
+        for _ in 0..30 {
+            step_sync(&mut p);
+        }
+        assert_eq!(p.server.hash_stats().sent, sent);
+        // The client's held copy goes wrong: counted at the next comparisons, never fatal.
+        p.server.set_hash_refresh(0.0);
+        p.client
+            .debug_corrupt_held(id, 0, 0, &Value::Vector2([99.0, 1.0]));
+        for _ in 0..3 {
+            step_sync(&mut p);
+        }
+        assert!(p.client.hash_stats().divergences >= 1);
+        assert!(p.client.divergences_of(id) >= 1);
+        assert!(p.client.is_connected());
+    }
+
+    #[test]
+    fn lost_snapshots_are_skipped_not_counted() {
+        let (mut p, id) = hashed_pair();
+        // Every second packet to the client is dropped by hand: snapshots and hashes alike.
+        for i in 0..40 {
+            p.server
+                .record_part(id, 0, &[(0, Value::Vector2([5.0 + i as f32 * 0.1, 1.0]))]);
+            p.step();
+            p.server.send_snapshots(p.now);
+            let out = p.server.outgoing();
+            for (k, o) in out.into_iter().enumerate() {
+                if (k + i) % 2 == 0 {
+                    p.client.receive(SERVER, &o.bytes, p.now);
+                }
+            }
+            p.client.send_snapshots(p.now);
+            for o in p.client.outgoing() {
+                p.server.receive(p.id, &o.bytes, p.now);
+            }
+            let _ = p.client.drain_state_updates();
+        }
+        let s = p.client.hash_stats();
+        assert_eq!(s.divergences, 0, "{s:?}");
+        assert!(s.compared > 0, "{s:?}");
+    }
+
+    #[test]
+    fn hash_telemetry_off_sends_nothing() {
+        let (mut p, id) = hashed_pair();
+        p.server.set_hash_telemetry(false, 16);
+        for i in 0..10 {
+            p.server
+                .record_part(id, 0, &[(0, Value::Vector2([6.0 + i as f32, 1.0]))]);
+            step_sync(&mut p);
+        }
+        assert_eq!(p.server.hash_stats().sent, 0);
+        assert_eq!(p.client.hash_stats().received, 0);
     }
 }

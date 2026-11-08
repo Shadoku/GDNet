@@ -393,6 +393,70 @@ impl Replication {
             .max()
     }
 
+    /// WP8: true when a field takes part in hash telemetry: hot, not reliable, and small enough for a
+    /// snapshot (what a client receives in snapshots every tick it changes).
+    pub fn hashed(d: &crate::props::PropDesc, enc: &Encoded) -> bool {
+        d.schedule == crate::props::Schedule::Hot && !d.reliable && enc.byte_len() <= RELIABLE_BYTES
+    }
+
+    /// WP8: the hash of `id`'s recorded hot fields (their quantised encodings, see crate::hash); None
+    /// when untracked or nothing hot was recorded.
+    pub fn entity_hash(&self, id: NetId) -> Option<u32> {
+        let state = self.entities.get(&id)?;
+        let table = self.tables.get(&state.scene)?;
+        let mut h = crate::hash::FNV_OFFSET;
+        let mut any = false;
+        let mut flat = 0usize;
+        for (p, part) in table.parts.iter().enumerate() {
+            for (f, d) in part.iter().enumerate() {
+                let fs = &state.fields[flat];
+                if fs.version != 0 && Self::hashed(d, &fs.enc) {
+                    h = crate::hash::fold_field(h, p as u16, f as u16, &fs.enc);
+                    any = true;
+                }
+                flat += 1;
+            }
+        }
+        any.then_some(h)
+    }
+
+    /// WP8: whether `peer` can check `id`'s hash of `tick` (call after this tick's `build`): Some(false)
+    /// when every hashed field is acknowledged at its current version (settled), Some(true) when the
+    /// ones that are not were carried by this tick's snapshot to the peer, None otherwise.
+    pub fn hash_eligibility(&self, peer: PeerId, id: NetId, tick: u64) -> Option<bool> {
+        let state = self.entities.get(&id)?;
+        let table = self.tables.get(&state.scene)?;
+        let p = self.peers.get(&peer)?;
+        let pe = p.entities.get(&id)?;
+        let last = p.in_flight.back().filter(|f| f.tick == tick);
+        let mut carried = false;
+        let mut any = false;
+        let mut flat = 0usize;
+        for part in &table.parts {
+            for d in part {
+                let fs = &state.fields[flat];
+                if fs.version != 0 && Self::hashed(d, &fs.enc) {
+                    any = true;
+                    if pe.acked.get(flat) != Some(&fs.version) {
+                        let in_last =
+                            last.is_some_and(|f| f.fields.contains(&(id, flat as u32, fs.version)));
+                        if !in_last {
+                            return None;
+                        }
+                        carried = true;
+                    }
+                }
+                flat += 1;
+            }
+        }
+        any.then_some(carried)
+    }
+
+    /// WP8: the ids of the tracked entities, ascending.
+    pub fn entity_ids(&self) -> Vec<NetId> {
+        self.entities.keys().copied().collect()
+    }
+
     /// Decodes a full state ([`Replication::encode_full`]) with this side's table of `scene`.
     pub fn decode_state(&self, scene: u64, bytes: &[u8]) -> Option<Vec<(u16, u16, Value)>> {
         if bytes.is_empty() {

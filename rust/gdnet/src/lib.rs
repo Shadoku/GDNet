@@ -10,15 +10,19 @@ mod apply;
 mod authority;
 mod call;
 mod configure;
+mod editor;
 mod emulation;
 mod entity_node;
+mod hash;
 mod infer;
 mod input;
 mod interp;
 mod keyed;
 mod manager;
+mod meter;
 mod methods;
 mod net;
+mod overlay;
 mod parts;
 mod pipe_peer;
 mod poll;
@@ -31,7 +35,7 @@ mod version;
 struct GdNetExtension;
 
 /// The singleton's name as GDScript sees it.
-const NET_SINGLETON: &str = "Net";
+pub(crate) const NET_SINGLETON: &str = "Net";
 
 #[gdextension]
 unsafe impl ExtensionLibrary for GdNetExtension {

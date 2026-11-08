@@ -109,7 +109,7 @@ tests/unit/            fast tests of plain classes
 tests/integration/     tests that instantiate scenes
 rust/                  Cargo workspace: netcore (sans-IO protocol engine, no godot dep),
                        gdnet (the GDExtension); rust/target/ is ignored
-addons/gdnet/          gdnet.gdextension + bin/<platform>/ (built, ignored) + addon assets
+addons/gdnet/          gdnet.gdextension + bin/<platform>/ (built, ignored) + addon assets (WP8: meter.tscn/.gd)
 docs/guide/            the gdnet user guide, one page per topic (01_sessions.md, ...)
 tools/check.py         the one command to verify the project
 tools/validate_scripts.gd   compiles every script; used by check.py

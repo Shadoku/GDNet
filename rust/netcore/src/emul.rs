@@ -65,7 +65,11 @@ pub struct EmulSettings {
 
 impl EmulSettings {
     /// Unreal's network emulation profiles: `Average` (30-60 ms, 1 % loss) and `Bad` (100-200 ms, 5 %
-    /// loss); `Off` is no emulation. Names are case-insensitive.
+    /// loss); `Off` is no emulation. WP8 adds `Lan` (5 ms) and `Mobile` (120-140 ms, 2 % loss). Names are
+    /// case-insensitive.
+    /// The preset names.
+    pub const PRESETS: [&'static str; 5] = ["off", "lan", "average", "bad", "mobile"];
+
     pub fn preset(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "off" | "none" => Some(Self::default()),
@@ -73,6 +77,17 @@ impl EmulSettings {
                 latency_ms: 30.0,
                 variance_ms: 30.0,
                 loss: 0.01,
+                reorder: 0.0,
+                duplicate: 0.0,
+            }),
+            "lan" => Some(Self {
+                latency_ms: 5.0,
+                ..Self::default()
+            }),
+            "mobile" => Some(Self {
+                latency_ms: 120.0,
+                variance_ms: 20.0,
+                loss: 0.02,
                 reorder: 0.0,
                 duplicate: 0.0,
             }),
@@ -398,6 +413,14 @@ mod tests {
         );
         assert!(EmulSettings::preset("off").unwrap().is_off());
         assert!(EmulSettings::preset("dialup").is_none());
+        // WP8: lan and mobile as data.
+        let lan = EmulSettings::preset("lan").unwrap();
+        assert_eq!((lan.latency_ms, lan.variance_ms, lan.loss), (5.0, 0.0, 0.0));
+        let m = EmulSettings::preset("Mobile").unwrap();
+        assert_eq!((m.latency_ms, m.variance_ms, m.loss), (120.0, 20.0, 0.02));
+        for name in EmulSettings::PRESETS {
+            assert!(EmulSettings::preset(name).is_some(), "{name}");
+        }
         // The Bad preset over 10,000 packets: 5 % lost, delays within 100-200 ms.
         let out = run(bad, 21, 10_000, None);
         let lost = 10_000 - out.len();
