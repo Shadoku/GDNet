@@ -107,7 +107,7 @@ pub struct State {
     /// A filter was added since the last evaluation.
     fresh_filter: bool,
     /// `set_focus`: per peer, the node whose position is its focus.
-    focus: HashMap<u32, Gd<Node>>,
+    pub(crate) focus: HashMap<u32, Gd<Node>>,
     /// The joined peers at the last filter evaluation.
     last_peers: Vec<u32>,
     /// Radius passes and filter evaluations run, and the cost of the last pass and of the last

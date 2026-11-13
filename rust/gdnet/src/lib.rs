@@ -30,6 +30,7 @@ mod pipe_peer;
 mod poll;
 mod profiles;
 mod replay;
+mod seats;
 mod session;
 mod tick;
 mod travel;

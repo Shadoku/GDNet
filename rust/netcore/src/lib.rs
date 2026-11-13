@@ -17,7 +17,8 @@
 //! acceptance, rejected writes), [`keyed`] (the keyed state map, permissions, views). WP8: [`hash`] (hash
 //! telemetry: per-entity hashes, sampling, the client's comparison). WP13: [`rooms`] (rooms, interest by
 //! room, travel). WP16: [`interest`] (radius with hysteresis, `visible_to`, filter results), [`levelstate`]
-//! (the level state blob kept when a level unloads).
+//! (the level state blob kept when a level unloads). WP17: [`seats`] (seat keys, the rejoin window),
+//! [`savestate`] (the saved session state: keyed state, seats, level states).
 
 #![forbid(unsafe_code)]
 
@@ -39,6 +40,8 @@ pub mod priority;
 pub mod props;
 pub mod quant;
 pub mod rooms;
+pub mod savestate;
+pub mod seats;
 pub mod session;
 pub mod snapshot;
 pub mod wire;

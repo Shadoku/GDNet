@@ -55,6 +55,8 @@ pub struct Hello {
     pub protocol_hash: u64,
     pub items: Vec<ProtocolItem>,
     pub tick_rate: u32,
+    /// WP17: the client's seat key (seats.rs): a returning key takes its seat back.
+    pub key: String,
 }
 
 /// A range of entity ids a peer may allocate from (a placeholder until WP2 allocates entities).
@@ -73,6 +75,9 @@ pub struct Welcome {
     pub id_range: IdRange,
     /// The server's tick when it sent the welcome.
     pub current_tick: u64,
+    /// WP17: the joining peer's seat, and the seat table.
+    pub seat: u32,
+    pub seats: Vec<crate::seats::SeatInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +130,8 @@ pub enum Message {
     Keyed(crate::keyed::KeyMsg),
     /// WP8: sampled per-entity state hashes (hash.rs; channel 2).
     Hash(crate::hash::HashMsg),
+    /// WP17: the seat table changed (a seat taken, away, back or released).
+    Seats(Vec<crate::seats::SeatInfo>),
 }
 
 /// The kind bytes. 0 is never used, so a zeroed buffer is not a message.
@@ -146,6 +153,7 @@ pub mod kind {
     pub const WRITE_REJECT: u8 = 15;
     pub const KEYED: u8 = 16;
     pub const HASH: u8 = 17;
+    pub const SEATS: u8 = 18;
 }
 
 /// The channel a message of kind `k` travels on (for byte counters of received packets).
@@ -195,6 +203,7 @@ impl Message {
             Message::WriteReject(_) => kind::WRITE_REJECT,
             Message::Keyed(_) => kind::KEYED,
             Message::Hash(_) => kind::HASH,
+            Message::Seats(_) => kind::SEATS,
         }
     }
 
@@ -209,7 +218,8 @@ impl Message {
             | Message::CallReturn(_)
             | Message::Write(_)
             | Message::WriteReject(_)
-            | Message::Keyed(_) => Channel::Reliable,
+            | Message::Keyed(_)
+            | Message::Seats(_) => Channel::Reliable,
             Message::Call(c) if c.unreliable => Channel::Unreliable,
             Message::Call(_) => Channel::Reliable,
             Message::Snapshot(_) | Message::Ack(_) | Message::Input(_) | Message::OwnerState(_) => {
@@ -257,6 +267,7 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         Message::WriteReject(m) => body(kind::WRITE_REJECT, m),
         Message::Keyed(m) => body(kind::KEYED, m),
         Message::Hash(m) => body(kind::HASH, m),
+        Message::Seats(m) => body(kind::SEATS, m),
     }
 }
 
@@ -285,6 +296,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         kind::WRITE_REJECT => Message::WriteReject(parse(k, rest)?),
         kind::KEYED => Message::Keyed(parse(k, rest)?),
         kind::HASH => Message::Hash(parse(k, rest)?),
+        kind::SEATS => Message::Seats(parse(k, rest)?),
         other => return Err(WireError::UnknownKind(other)),
     })
 }
@@ -292,8 +304,9 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
 /// The wire format version, an item of [`Protocol`]: raised whenever the bytes of an existing message
 /// change meaning while the crate version stays. 1 = WP0-WP14; 2 = D17 (2D `mm`/`cm` steps of 0.1 px
 /// and 1 px instead of 0.001 px and 0.01 px); 3 = WP16 (`Travel` carries a level origin, `RoomLeft`,
-/// the `audience` property option); 4 = WP16 level state (`Travel` names the level content that is gone).
-pub const WIRE_FORMAT: u32 = 4;
+/// the `audience` property option); 4 = WP16 level state (`Travel` names the level content that is gone);
+/// 5 = WP17 (`Hello` carries the seat key, `Welcome` the seat and the seat table, `Seats`).
+pub const WIRE_FORMAT: u32 = 5;
 
 /// The protocol description both ends must agree on (3.3). WP1 covers the netcore version, the tick
 /// rate and a debug salt; later packages append scene part tables, profiles and option sets.
@@ -443,6 +456,7 @@ mod tests {
             protocol_hash: p.hash(),
             items: p.items.clone(),
             tick_rate: 60,
+            key: "a save slot ✓".into(),
         }));
         roundtrip(Message::Welcome(Welcome {
             protocol_hash: u64::MAX,
@@ -453,7 +467,25 @@ mod tests {
                 len: 65_536,
             },
             current_tick: 1 << 40,
+            seat: 3,
+            seats: std::vec![crate::seats::SeatInfo {
+                seat: 3,
+                peer: 1_234_567_890,
+                away: false
+            }],
         }));
+        roundtrip(Message::Seats(std::vec![
+            crate::seats::SeatInfo {
+                seat: 1,
+                peer: 1,
+                away: false
+            },
+            crate::seats::SeatInfo {
+                seat: 2,
+                peer: 77,
+                away: true
+            },
+        ]));
         roundtrip(Message::Reject(Reject {
             reason: "nope ✗".into(),
         }));
@@ -684,6 +716,7 @@ mod tests {
             protocol_hash: 1,
             items: std::vec![],
             tick_rate: 60,
+            key: String::new(),
         }));
         hello.truncate(hello.len() - 1);
         assert_eq!(decode(&hello), Err(WireError::Malformed(kind::HELLO)));
@@ -695,7 +728,8 @@ mod tests {
             Message::Hello(Hello {
                 protocol_hash: 0,
                 items: std::vec![],
-                tick_rate: 1
+                tick_rate: 1,
+                key: String::new(),
             })
             .channel(),
             Channel::Reliable
@@ -741,7 +775,7 @@ mod tests {
         assert_eq!(
             a.mismatch(&old.items, old.hash(), "server", "client")
                 .as_deref(),
-            Some("protocol mismatch: wire format differs (server 4, client 1)")
+            Some("protocol mismatch: wire format differs (server 5, client 1)")
         );
         // Same items, forged hash.
         assert_eq!(

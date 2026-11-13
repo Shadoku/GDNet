@@ -32,8 +32,14 @@ Net.owner_changed.connect(func(node, old, new): ...)    # (NetSession.owner_chan
 ```
 
 An owner change moves simulation with it: the new owner starts predicting (fresh history), the old one
-becomes a replica that interpolates (its buffers reset), and the server takes the new owner's input. A
-client that leaves gives its entities back to the server; they stay in the world.
+becomes a replica that interpolates (its buffers reset), and the server takes the new owner's input.
+
+A client that disconnects keeps its entities for the rejoin window (WP17, `gdnet/session/rejoin_timeout_s`,
+default 60 s): they stay in the world, owned by its old peer id, and the server simulates them with neutral
+input, so a dropped player stands still. When the same seat key joins again the entities, its player, rooms,
+focus, `visible_to` lists, views and `audience: owner` values move to the new peer id (`owner_changed` fires
+on every peer). When the window ends, or at once with a window of 0, they go back to the server; they stay in
+the world either way. Seats and rejoining have their own page.
 
 ## Nested entities inherit their owner
 
@@ -150,8 +156,12 @@ Only the server writes, until it opens a prefix:
 ```gdscript
 Net.state.allow("chat/", "all")       # every peer may write chat/...
 Net.state.allow("score/", "owner")    # peer 5 may write score/5 (and score/5/...), no other score
+Net.state.allow("hand/", "seat")      # seat 2 may write hand/2 (and hand/2/...), also after a rejoin
 Net.state.allow("admin/", 7)          # one peer
 ```
+
+`"owner"` reads the writer's peer id, which changes when a client reconnects; `"seat"` reads its seat
+(`Net.my_seat()`), which does not, so prefer it for anything a player keeps across a drop.
 
 The rules reach the clients, so a client's `set` on a path it may not write fails at once with an error and
 sends nothing. An allowed client write applies on the writer immediately and reaches everyone through the

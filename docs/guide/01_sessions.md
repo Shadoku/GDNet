@@ -13,7 +13,7 @@ call to it, nothing runs: no node, no polling, no packets.
 # A server on UDP port 7777 (Godot's ENetMultiplayerPeer underneath).
 Net.host(7777)
 
-# A client.
+# A client. An optional third argument is its seat key (below).
 Net.join("192.168.1.20", 7777)
 
 # A single-player session: no network at all. This process hosts and plays as peer 1, so the same
@@ -31,6 +31,24 @@ Net.leave()
 
 `host`, `join`, `offline` and `use_peer` return an `Error` (`OK` on success). A peer whose
 `get_unique_id()` is 1 hosts; any other joins.
+
+### Seats, rejoining and saved sessions (WP17)
+
+Every player has a *seat*: a number that stays the same for the session (1 is the host's player on a
+listen server, else the first client), while its peer id changes with every connection. A client sends a
+seat key when it joins: `Net.key` (a random string kept for the life of the process, or one the game sets,
+such as a save slot or an account name) or `Net.join(address, port, key)`. A key whose seat dropped takes it
+back; a second connection with the key of a connected seat is refused. Keys are identifiers, not
+passwords: nothing checks them. `Net.dedicated = true` before `host`/`use_peer` makes a server that holds no
+seat.
+
+`Net.seat(peer)`, `Net.peer_of(seat)` (0 while the seat is away), `Net.my_seat()` and `Net.seat_table()`
+answer on every peer; the other calls keep taking peer ids. A seated client that drops keeps its seat and
+its entities for `Net.rejoin_timeout_s` seconds (`gdnet/session/rejoin_timeout_s`, default 60; 0 = gone at
+once; -1 = for the whole session), and `peer_dropped(seat)`, `peer_rejoined(seat, peer)` and
+`seat_released(seat)` tell the server and the other clients. `Net.save_state()` returns the session's keyed
+state, seats and level states as bytes; `Net.host(port, state)`, `Net.offline(state)` and
+`Net.use_peer(peer, state)` start from them.
 
 ### Joining is a handshake
 
@@ -53,6 +71,7 @@ Ticks Per Second).
 |---|---|
 | `peer_joined(id)` | a peer finished the handshake (on a client: the server, id 1) |
 | `peer_left(id)` | a joined peer left |
+| `peer_dropped(seat)`, `peer_rejoined(seat, peer)`, `seat_released(seat)` | a seat went away, came back under a new peer id, or was given up (WP17) |
 | `connected` | this side is in the session: a client at `Welcome`, a host at its first tick |
 | `disconnected(reason)` | the session ended on its own (refused, server lost); `leave()` emits nothing |
 | `ticked(tick)` | once per physics tick while online |
@@ -162,6 +181,11 @@ dedicated server.
   `_debug_watch(bytes)` scans every packet this end receives for those bytes at any bit offset;
   `_debug_watch_hits()` and `_debug_watch_scanned()` count the packets that held them and the packets
   scanned (gate G9 uses it to show an `audience: owner` value never reaches another peer).
+- `NetSession` seat surface (WP17): `key` and `dedicated` (set before `start`), `rejoin_timeout_s` (live;
+  reads as the effective value, a value below -1 goes back to `Net.rejoin_timeout_s` and the setting),
+  `seat(peer)`, `peer_of(seat)`, `my_seat()`, `seat_table()` (`{seat, peer, away}` each), `save_state()`,
+  and `start(peer, root_path, state)`. `stats()` has `seats`, `seats_away` and `my_seat`.
+- Project setting for seats: `gdnet/session/rejoin_timeout_s` (default 60).
 - Project settings for rooms and interest (pages 9 and 11): `gdnet/levels/empty_timeout_s` (default 30),
   `gdnet/levels/spacing` (default 0 = levels keep their authored place), `gdnet/levels/keep_state`
   (default true), `gdnet/interest/filter_every_ticks` (default 6).

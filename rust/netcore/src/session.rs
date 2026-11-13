@@ -12,7 +12,8 @@
 //!
 //! Handshake: when the transport connects a client to the server, the client sends `Hello` (protocol
 //! hash and items, tick rate). The server answers `Welcome` (its tick, the client's id and id range) or
-//! `Reject` (a reason naming the first differing protocol item). On `Reject` the client reports
+//! `Reject` (a reason naming the first differing protocol item). WP17: `Hello` carries the client's seat
+//! key and `Welcome` its seat and the seat table (seats.rs). On `Reject` the client reports
 //! `Disconnected(reason)` and the game closes the transport; the server also asks for the peer to be
 //! disconnected one second later, in case the client does not.
 //!
@@ -37,6 +38,8 @@ use crate::peers::{PeerId, PeerTable, Stage, SERVER};
 use crate::predict::{self, Policy, PredictStats, Prediction, Rollback};
 use crate::props::{PropDesc, ScenePropsTable, Value};
 use crate::rooms::{room_hash, Level, Origin, RoomEntry, RoomSet, Rooms};
+use crate::savestate::SessionState;
+use crate::seats::{Claim, Dropped, Hold, Seat, SeatChange, SeatInfo, Seats};
 use crate::wire::{
     self, Hello, IdRange, Message, Ping, Pong, Protocol, Reject, Reliability, Welcome,
 };
@@ -80,6 +83,18 @@ pub enum Event {
     DisconnectPeer { peer: PeerId, reason: String },
     /// A readable entity-layer problem that does not end the session (an action held too long).
     EntityError(String),
+    /// WP17: a seated peer disconnected and its seat is held for the rejoin window (server and every
+    /// remaining client).
+    SeatDropped(Seat),
+    /// WP17: an away seat was taken back by `peer` (`old` held it before).
+    SeatRejoined {
+        seat: Seat,
+        peer: PeerId,
+        old: PeerId,
+    },
+    /// WP17: a seat was released (its window ended, or the window is 0): its entities went back to
+    /// the server.
+    SeatReleased(Seat),
 }
 
 /// What remote entity actions did to this peer's table, in order, for gdnet to apply to nodes.
@@ -277,6 +292,14 @@ pub struct Session {
     scope: ScopeState,
     /// WP16: radius, `visible_to` and filter results (interest.rs).
     interest: crate::interest::Interest,
+    /// WP17, server: the seat table (seats.rs).
+    seats: Seats,
+    /// WP17, client: the seat table as the server last announced it.
+    seat_rows: Vec<SeatInfo>,
+    /// WP17, client: the key sent in `Hello`.
+    key: String,
+    /// WP17, server: the host's seat in the session state this session started from.
+    restored_host_seat: Option<Seat>,
 }
 
 /// WP13: what each peer has been sent, and the room table.
@@ -420,6 +443,9 @@ pub struct InputStats {
     pub refused: u64,
 }
 
+/// WP17 (D22): a dropped peer's seat is held this many seconds by default.
+pub const DEFAULT_REJOIN_TIMEOUT_S: f64 = 60.0;
+
 /// The default snapshot budget per peer (2.7, D8).
 pub const DEFAULT_BUDGET: u32 = 32_768;
 
@@ -504,6 +530,14 @@ impl Session {
             hash: HashState::default(),
             scope: ScopeState::default(),
             interest: crate::interest::Interest::default(),
+            seats: {
+                let mut s = Seats::default();
+                s.set_hold(Hold::from_seconds(DEFAULT_REJOIN_TIMEOUT_S, rate));
+                s
+            },
+            seat_rows: Vec::new(),
+            key: String::new(),
+            restored_host_seat: None,
         }
     }
 
@@ -652,6 +686,7 @@ impl Session {
                     protocol_hash: self.protocol.hash(),
                     items: self.protocol.items.clone(),
                     tick_rate: self.tick_rate(),
+                    key: self.key.clone(),
                 };
                 self.hello_sent_us = Some(now_us);
                 self.send(SERVER, &Message::Hello(hello), now_us);
@@ -661,16 +696,23 @@ impl Session {
 
     /// The transport lost `peer`.
     pub fn peer_disconnected(&mut self, peer: PeerId, now_us: u64) {
+        let mut held = false;
+        let mut seat_event = None;
         if self.role == Role::Server && self.peers.is_joined(peer) {
-            // WP7: a departed client's entities stay, owned by the server again.
-            let owned: Vec<NetId> = self
-                .entities
-                .iter()
-                .filter(|r| r.owner == peer)
-                .map(|r| r.id)
-                .collect();
-            for id in owned {
-                self.set_owner(id, SERVER, now_us);
+            // WP17: a seated peer's seat is held for the rejoin window: its entities, player, rooms,
+            // `visible_to` lists and view decisions stay under its old id until it rejoins or the
+            // window ends.
+            match self.seats.drop_peer(peer, self.clock.tick()) {
+                Some(Dropped::Held(seat)) => {
+                    held = true;
+                    seat_event = Some(Event::SeatDropped(seat));
+                }
+                Some(Dropped::Released(seat)) => seat_event = Some(Event::SeatReleased(seat)),
+                None => {}
+            }
+            if !held {
+                // WP7: a departed client's entities stay, owned by the server again.
+                self.give_back(peer, now_us);
             }
             let stale: Vec<(NetId, PeerId)> = self
                 .auth
@@ -684,7 +726,6 @@ impl Session {
             for (id, r) in stale {
                 self.finish_query(id, r, false, now_us);
             }
-            self.keyed.forget_peer(peer);
             self.auth.reject_tick.retain(|(p, _), _| *p != peer);
         }
         self.scenes_sent.remove(&peer);
@@ -692,7 +733,9 @@ impl Session {
         self.scope.rooms_of.remove(&peer);
         self.scope.levels_of.remove(&peer);
         self.scope.travelling.retain(|(p, _)| *p != peer);
-        self.scope.rooms.forget_peer(peer);
+        if !held {
+            self.scope.rooms.forget_peer(peer);
+        }
         self.interest.forget_peer(peer);
         self.repl.remove_peer(peer);
         self.remote_props.retain(|(p, _), _| *p != peer);
@@ -702,6 +745,11 @@ impl Session {
         };
         if state.stage == Stage::Joined {
             self.events.push_back(Event::PeerLeft(peer));
+        }
+        if let Some(e) = seat_event {
+            self.events.push_back(e);
+            self.sync_keyed_seats();
+            self.announce_seats(None, now_us);
         }
         if self.role == Role::Client && peer == SERVER {
             self.close(String::from("the connection to the server was lost"));
@@ -811,6 +859,9 @@ impl Session {
             Message::CallReturn(r) if self.role == Role::Client && peer == SERVER => {
                 self.on_call_return(r);
             }
+            Message::Seats(rows) if self.role == Role::Client && peer == SERVER => {
+                self.on_seats(rows);
+            }
             Message::Hash(m) if self.role == Role::Client && peer == SERVER => {
                 if self.hash.on {
                     self.hash.rx.on_msg(m);
@@ -849,6 +900,22 @@ impl Session {
             self.send(peer, &Message::Reject(Reject { reason }), now_us);
             return;
         }
+        // WP17: the key's seat. A key whose seat is connected is refused (one seat, one connection).
+        let (seat, rejoin_of) = match self.seats.claim(&hello.key, peer, None) {
+            Claim::Seated(s) => (s, None),
+            Claim::Rejoined { seat, old_peer } => (seat, Some(old_peer)),
+            Claim::Taken { seat, peer: holder } => {
+                let reason = std::format!(
+                    "this seat key is already in use: seat {seat} is held by a connected peer ({holder}); a seat takes one connection at a time"
+                );
+                let tick = self.clock.tick();
+                if let Some(p) = self.peers.get_mut(peer) {
+                    p.stage = Stage::Rejected(tick);
+                }
+                self.send(peer, &Message::Reject(Reject { reason }), now_us);
+                return;
+            }
+        };
         let id_range = IdRange {
             start: self.next_slot.saturating_mul(ID_RANGE_LEN),
             len: ID_RANGE_LEN,
@@ -858,12 +925,15 @@ impl Session {
             p.stage = Stage::Joined;
             p.id_range = id_range;
         }
+        self.sync_keyed_seats();
         let welcome = Welcome {
             protocol_hash: self.protocol.hash(),
             tick_rate: self.tick_rate(),
             peer_id: peer,
             id_range,
             current_tick: self.clock.tick(),
+            seat,
+            seats: self.seats.table(),
         };
         self.send(peer, &Message::Welcome(welcome), now_us);
         self.ping(peer, now_us);
@@ -877,10 +947,20 @@ impl Session {
         // has a player or added rooms, through `refresh_scope`).
         self.scope.known.insert(peer, BTreeSet::new());
         self.scope.rooms_of.insert(peer, RoomSet::new());
-        let rooms = RoomSet::new();
-        for c in self.entities.burst() {
-            if self.wants(peer, c.id, &rooms) {
-                self.send_create_to(peer, c, now_us);
+        match rejoin_of {
+            // WP17: the seat's entities, player, rooms, `visible_to` lists and view decisions move
+            // to the new id first, so its burst (with `Travel`s for its levels) is what it had.
+            Some(old) => {
+                self.take_over(old, peer, now_us);
+                self.refresh_scope(peer, now_us);
+            }
+            None => {
+                let rooms = RoomSet::new();
+                for c in self.entities.burst() {
+                    if self.wants(peer, c.id, &rooms) {
+                        self.send_create_to(peer, c, now_us);
+                    }
+                }
             }
         }
         // WP7: the keyed state it can see (viewed paths follow once gdnet decides) and the rules.
@@ -890,6 +970,11 @@ impl Session {
         };
         self.send_keyed(peer, full, now_us);
         self.events.push_back(Event::PeerJoined(peer));
+        if let Some(old) = rejoin_of {
+            self.events
+                .push_back(Event::SeatRejoined { seat, peer, old });
+        }
+        self.announce_seats(Some(peer), now_us);
     }
 
     fn on_welcome(&mut self, w: Welcome, now_us: u64) {
@@ -916,6 +1001,8 @@ impl Session {
         }
         self.local_id = w.peer_id;
         self.id_range = w.id_range;
+        self.seat_rows = w.seats;
+        self.sync_keyed_seats();
         self.ids = IdAllocator::new(w.id_range);
         if let Some(p) = self.peers.get_mut(SERVER) {
             p.stage = Stage::Joined;
@@ -978,6 +1065,9 @@ impl Session {
                 peer,
                 reason: String::from("handshake rejected"),
             });
+        }
+        if self.role == Role::Server {
+            self.expire_seats(tick, now_us);
         }
         self.input_tick(tick);
         self.expire_queries(tick, now_us);
@@ -1364,6 +1454,12 @@ impl Session {
 
     /// Server only: changes an entity's owner and announces it.
     pub fn set_owner(&mut self, id: NetId, owner: PeerId, now_us: u64) -> bool {
+        self.change_owner(id, owner, true, now_us)
+    }
+
+    /// [`Session::set_owner`]; `refresh` false leaves the scopes of the old and new owner to the
+    /// caller (a rejoin moves many entities, then refreshes once).
+    fn change_owner(&mut self, id: NetId, owner: PeerId, refresh: bool, now_us: u64) -> bool {
         if self.role != Role::Server {
             return false;
         }
@@ -1398,9 +1494,11 @@ impl Session {
             .push_back(EntityEvent::SetOwner { id, manager, owner });
         self.share_known(EntityAction::SetOwner { id, owner }, id, None, now_us);
         // WP13: an entity its owner holds is always in that owner's scope.
-        for p in [old, owner] {
-            if p != SERVER {
-                self.refresh_scope(p, now_us);
+        if refresh {
+            for p in [old, owner] {
+                if p != SERVER {
+                    self.refresh_scope(p, now_us);
+                }
             }
         }
         true
@@ -2359,6 +2457,17 @@ impl Session {
                     .collect();
                 self.input_buffers.retain(|id, _| owned.contains(id));
                 for id in owned {
+                    // WP17: an owner that is not connected (its seat is away) gives neutral input:
+                    // a dropped player stops instead of repeating its last frame.
+                    let absent = self
+                        .entities
+                        .get(id)
+                        .is_some_and(|r| !self.peers.is_joined(r.owner));
+                    if absent {
+                        let taken = self.input_buffers.entry(id).or_default().take_neutral(tick);
+                        self.server_inputs.insert(id, taken);
+                        continue;
+                    }
                     let taken = self.input_buffers.entry(id).or_default().take(tick);
                     if taken.repeated {
                         self.input_stats.repeated += 1;
@@ -3978,6 +4087,219 @@ impl Session {
         }
     }
 }
+
+/// Seats, rejoining and session state (WP17, seats.rs, savestate.rs).
+impl Session {
+    /// Client: the seat key to send in `Hello` (set before the transport connects). Empty: the server
+    /// gives the connection a seat of its own that no later connection can take back.
+    pub fn set_key(&mut self, key: &str) {
+        self.key = String::from(key);
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Server: the host plays (a listen server): it takes a seat for `key` (the saved host seat when
+    /// the session started from a state, else the lowest free one, normally 1).
+    pub fn take_server_seat(&mut self, key: &str) {
+        if self.role != Role::Server {
+            return;
+        }
+        let prefer = self.restored_host_seat;
+        if let Claim::Taken { .. } = self.seats.claim(key, SERVER, prefer) {
+            return;
+        }
+        self.sync_keyed_seats();
+        self.announce_seats(None, 0);
+    }
+
+    /// Server: how long a dropped peer's seat is held (`gdnet/session/rejoin_timeout_s`).
+    pub fn set_rejoin_hold(&mut self, hold: Hold) {
+        self.seats.set_hold(hold);
+    }
+
+    pub fn rejoin_hold(&self) -> Hold {
+        self.seats.hold()
+    }
+
+    /// The seat of `peer` (connected, or the last holder of an away seat); None without one.
+    pub fn seat(&self, peer: PeerId) -> Option<Seat> {
+        match self.role {
+            Role::Server => self.seats.seat_of(peer),
+            Role::Client => crate::seats::seat_in(&self.seat_rows, peer),
+        }
+    }
+
+    /// The peer connected on `seat`; 0 while the seat is away or unknown.
+    pub fn peer_of(&self, seat: Seat) -> PeerId {
+        match self.role {
+            Role::Server => self.seats.peer_of(seat),
+            Role::Client => crate::seats::peer_in(&self.seat_rows, seat),
+        }
+    }
+
+    /// This side's seat (a client's from `Welcome`; the server's when it plays).
+    pub fn my_seat(&self) -> Option<Seat> {
+        match self.role {
+            Role::Server => self.seats.seat_of(SERVER),
+            Role::Client if self.local_id == 0 => None,
+            Role::Client => crate::seats::seat_in(&self.seat_rows, self.local_id),
+        }
+    }
+
+    /// The seat table, ascending by seat.
+    pub fn seat_table(&self) -> Vec<SeatInfo> {
+        match self.role {
+            Role::Server => self.seats.table(),
+            Role::Client => self.seat_rows.clone(),
+        }
+    }
+
+    /// (seats, seats away).
+    pub fn seat_stats(&self) -> (usize, usize) {
+        let t = self.seat_table();
+        (t.len(), t.iter().filter(|r| r.away).count())
+    }
+
+    /// Server: the rooms added to `peer` (`add_room`), by name.
+    pub fn rooms_added(&self, peer: PeerId) -> Vec<String> {
+        self.scope
+            .rooms
+            .added(peer)
+            .into_iter()
+            .map(|r| self.scope.rooms.name(r))
+            .collect()
+    }
+
+    /// Server: `peer`'s primary room override (`set_room`), by name.
+    pub fn room_override(&self, peer: PeerId) -> Option<String> {
+        self.scope
+            .rooms
+            .override_of(peer)
+            .map(|r| self.scope.rooms.name(r))
+    }
+
+    /// Server: the keyed state and the seats with their keys (gdnet adds the levels).
+    pub fn session_state(&self) -> SessionState {
+        SessionState {
+            keyed: self.keyed.entries(),
+            rules: self.keyed.rules().to_vec(),
+            seats: self.seats.keys(),
+            host_seat: self.seats.seat_of(SERVER),
+            levels: Vec::new(),
+        }
+    }
+
+    /// Server, before anyone joins: starts from a saved state: the keyed map and rules, and every
+    /// seat reserved for its key.
+    pub fn restore_state(&mut self, st: &SessionState) {
+        if self.role != Role::Server {
+            return;
+        }
+        for (path, value) in &st.keyed {
+            self.keyed.apply_set(path, value.clone());
+        }
+        for (prefix, who) in &st.rules {
+            self.keyed.allow(prefix, *who);
+        }
+        for (seat, key) in &st.seats {
+            self.seats.reserve(*seat, key);
+        }
+        self.restored_host_seat = st.host_seat;
+    }
+
+    /// The keyed state's peer-to-seat map (for the `"seat"` rule) from the table.
+    fn sync_keyed_seats(&mut self) {
+        let map: BTreeMap<PeerId, u32> = self
+            .seat_table()
+            .into_iter()
+            .filter(|r| !r.away && r.peer != 0)
+            .map(|r| (r.peer, r.seat))
+            .collect();
+        self.keyed.set_seats(map);
+    }
+
+    /// Server: the table to every joined peer but `except` (which got it in its `Welcome`).
+    fn announce_seats(&mut self, except: Option<PeerId>, now_us: u64) {
+        if self.role != Role::Server {
+            return;
+        }
+        let table = self.seats.table();
+        for peer in self.peers.joined() {
+            if Some(peer) != except {
+                self.send(peer, &Message::Seats(table.clone()), now_us);
+            }
+        }
+    }
+
+    /// Client: the server announced the table: report what changed.
+    fn on_seats(&mut self, rows: Vec<SeatInfo>) {
+        for c in crate::seats::changes(&self.seat_rows, &rows) {
+            self.events.push_back(match c {
+                SeatChange::Dropped(s) => Event::SeatDropped(s),
+                SeatChange::Rejoined { seat, peer, old } => Event::SeatRejoined { seat, peer, old },
+                SeatChange::Released(s) => Event::SeatReleased(s),
+            });
+        }
+        self.seat_rows = rows;
+        self.sync_keyed_seats();
+    }
+
+    /// Server: releases the away seats whose window ended.
+    fn expire_seats(&mut self, tick: u64, now_us: u64) {
+        let released = self.seats.expire(tick);
+        if released.is_empty() {
+            return;
+        }
+        for (seat, last) in released {
+            self.give_back(last, now_us);
+            self.events.push_back(Event::SeatReleased(seat));
+        }
+        self.sync_keyed_seats();
+        self.announce_seats(None, now_us);
+    }
+
+    /// Server: a departed peer whose seat is released: its entities go back to the server, its
+    /// player, rooms and view decisions are forgotten.
+    fn give_back(&mut self, peer: PeerId, now_us: u64) {
+        if peer == 0 || peer == SERVER {
+            return;
+        }
+        let owned: Vec<NetId> = self
+            .entities
+            .iter()
+            .filter(|r| r.owner == peer)
+            .map(|r| r.id)
+            .collect();
+        for id in owned {
+            self.set_owner(id, SERVER, now_us);
+        }
+        self.keyed.forget_peer(peer);
+        self.scope.rooms.forget_peer(peer);
+    }
+
+    /// Server: `new` rejoined the seat `old` held: everything attached to `old` moves to `new`.
+    fn take_over(&mut self, old: PeerId, new: PeerId, now_us: u64) {
+        self.scope.rooms.rename_peer(old, new);
+        self.interest.rename_peer(old, new);
+        self.keyed.rename_peer(old, new);
+        let owned: Vec<NetId> = self
+            .entities
+            .iter()
+            .filter(|r| r.owner == old)
+            .map(|r| r.id)
+            .collect();
+        for id in owned {
+            // One scope refresh for the new peer afterwards, not one per entity.
+            self.change_owner(id, new, false, now_us);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "session_seats_tests.rs"]
+mod seats_tests;
 
 #[cfg(test)]
 mod tests {

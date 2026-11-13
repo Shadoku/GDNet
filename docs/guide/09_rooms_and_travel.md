@@ -213,8 +213,10 @@ What is kept, per `NetManager` of the level:
   again from their scene, under the same parent and with the same name, with their properties.
 
 Players are never kept: the entity a peer's player is (and everything below it) leaves with its owner, or
-is destroyed with the level. Other entities a client owned are kept, and come back owned by the server (or
-by the owner their scene gives them), since a peer id means nothing once that client has gone.
+is destroyed with the level. Other entities a client owned are kept with their owner's seat (WP17, page 1)
+and come back owned by the server (or by the owner their scene gives them); once that seat is connected,
+now or when it joins again, they go back to its peer. The same holds for a session started from
+`save_state()`'s bytes.
 
 The state is put back on the server after the level entered the tree (its nodes' `_ready` ran) and before
 anything of it is announced. Clients therefore get the kept values in their `Create`s, and `_net_spawned`

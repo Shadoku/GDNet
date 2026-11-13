@@ -182,6 +182,11 @@ These are the rules that keep it at seconds:
   state; `tests/fixtures/levels/`). project.godot sets `gdnet/levels/spacing` to 4000 for the Doors demo;
   the rooms and level-state tests turn it off in `before_each` and put it back in `after_each`. Gate G9's
   audience test scans packets with `NetPipePeer._debug_watch(bytes)`.
+  Seats and rejoining (WP17): `test_net_seats.gd`; `net.drop_client(i)` ends a client as its process would,
+  `net.rejoin_client(i)` connects a new one with the same seat key (a new peer id), `net.add_manager_to(branch)`
+  gives it its managers, `net.start_server(state)` starts from `save_state()`'s bytes. Use a short
+  `rejoin_timeout_s` (a live property) for the release path, and reset `Net.rejoin_timeout_s = -2.0` (back to
+  the setting) and `Net.key = ""` in `after_each` when a test sets them.
 
 ## Design for testability
 

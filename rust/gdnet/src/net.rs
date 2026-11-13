@@ -77,7 +77,10 @@ fn scene_root_of(node: &Gd<Node>) -> Gd<Node> {
     node.clone()
 }
 
-const RELAYED: [(&str, &str); 13] = [
+const RELAYED: [(&str, &str); 16] = [
+    ("peer_dropped", "_on_peer_dropped"),
+    ("peer_rejoined", "_on_peer_rejoined"),
+    ("seat_released", "_on_seat_released"),
     ("peer_joined", "_on_peer_joined"),
     ("peer_left", "_on_peer_left"),
     ("connected", "_on_connected"),
@@ -150,6 +153,22 @@ pub struct Net {
     #[var(get = get_empty_level_timeout, set = set_empty_level_timeout)]
     #[allow(dead_code)]
     empty_level_timeout: f64,
+    /// WP17: the seat key `Net`'s sessions use: a random string for the life of the process unless
+    /// set ("" picks a new random one). `join`'s `key` argument overrides it for one session.
+    #[var(get = get_key, set = set_key)]
+    #[allow(dead_code)]
+    key: GString,
+    /// WP17: a dropped peer's seat is held this many seconds by sessions whose own
+    /// `rejoin_timeout_s` is not set (0 = released at once; -1 = the whole session). Reads as the
+    /// effective value; a value below -1 goes back to the project setting
+    /// `gdnet/session/rejoin_timeout_s` (60). Live.
+    #[var(get = get_rejoin_timeout_s, set = set_rejoin_timeout_s)]
+    #[allow(dead_code)]
+    rejoin_timeout_s: f64,
+    /// WP17: `host` / `use_peer` start a server that does not play: it holds no seat, and the first
+    /// client is seat 1. `offline` always plays.
+    #[var]
+    dedicated: bool,
     /// WP8: the meter and the overlay layers while shown.
     meter: Option<Gd<Node>>,
     overlay: Option<Gd<Node>>,
@@ -157,6 +176,26 @@ pub struct Net {
 
 #[godot_api]
 impl Net {
+    #[func]
+    fn get_key(&self) -> GString {
+        GString::from(crate::seats::net_key().as_str())
+    }
+
+    #[func]
+    fn set_key(&mut self, key: GString) {
+        crate::seats::set_net_key(&key.to_string());
+    }
+
+    #[func]
+    fn get_rejoin_timeout_s(&self) -> f64 {
+        crate::seats::net_rejoin()
+    }
+
+    #[func]
+    fn set_rejoin_timeout_s(&mut self, v: f64) {
+        crate::seats::set_net_rejoin(v);
+    }
+
     #[func]
     fn get_debug_protocol_salt(&self) -> i64 {
         self.debug_protocol_salt
@@ -446,6 +485,31 @@ impl Net {
     /// WP7: a write was rejected (relayed from the default session; on the writer `sender` is itself).
     #[signal]
     fn write_rejected(node: Gd<Node>, sender: i64);
+    /// WP17: `Net`'s session's `peer_dropped`, `peer_rejoined` and `seat_released`.
+    #[signal]
+    fn peer_dropped(seat: i64);
+    #[signal]
+    fn peer_rejoined(seat: i64, peer: i64);
+    #[signal]
+    fn seat_released(seat: i64);
+
+    #[func]
+    fn _on_peer_dropped(&mut self, seat: i64) {
+        self.base_mut()
+            .emit_signal("peer_dropped", &[seat.to_variant()]);
+    }
+
+    #[func]
+    fn _on_peer_rejoined(&mut self, seat: i64, peer: i64) {
+        self.base_mut()
+            .emit_signal("peer_rejoined", &[seat.to_variant(), peer.to_variant()]);
+    }
+
+    #[func]
+    fn _on_seat_released(&mut self, seat: i64) {
+        self.base_mut()
+            .emit_signal("seat_released", &[seat.to_variant()]);
+    }
 
     /// WP7: the keyed state.
     #[func]
@@ -606,21 +670,33 @@ impl Net {
     }
 
     /// Hosts over ENet on `port`. Returns `OK` or the error `ENetMultiplayerPeer.create_server` gave.
+    /// WP17: `state` (`save_state()`'s bytes) is the session state to start from; a state that does
+    /// not decode is refused (`ERR_INVALID_DATA`, an error names why) and nothing starts.
     #[func]
-    fn host(&mut self, port: i64) -> Error {
+    fn host(
+        &mut self,
+        port: i64,
+        #[opt(default = net_call::NetArg::absent())] state: NetArg,
+    ) -> Error {
         self.ensure_shutdown_hook();
+        let state = crate::seats::state_arg(state);
+        if let Err(e) = crate::seats::decode_state(&state, true) {
+            godot_error!("Net.host: the session state was refused: {e}");
+            return Error::ERR_INVALID_DATA;
+        }
         let mut peer = ENetMultiplayerPeer::new_gd();
         let err = peer.create_server_ex(port as i32).max_channels(3).done();
         if err != Error::OK {
             return err;
         }
-        self.start(peer.upcast())
+        self.start(peer.upcast(), state, GString::new(), self.dedicated)
     }
 
     /// Joins a host over ENet. `connected` fires when the handshake completes, `disconnected(reason)` if
-    /// it fails.
+    /// it fails. WP17: `key` is the seat key to join with (empty: `Net.key`); the same key takes back
+    /// a seat that dropped.
     #[func]
-    fn join(&mut self, address: GString, port: i64) -> Error {
+    fn join(&mut self, address: GString, port: i64, #[opt(default = "")] key: GString) -> Error {
         self.ensure_shutdown_hook();
         let mut peer = ENetMultiplayerPeer::new_gd();
         let err = peer
@@ -630,24 +706,37 @@ impl Net {
         if err != Error::OK {
             return err;
         }
-        self.start(peer.upcast())
+        self.start(peer.upcast(), PackedByteArray::new(), key, false)
     }
 
     /// A session with no network: a `NetPipePeer` server end, so this process hosts and plays as peer 1
-    /// (the host is a client of itself).
+    /// (the host is a client of itself). WP17: `state` as for `host`.
     #[func]
-    fn offline(&mut self) -> Error {
+    fn offline(&mut self, #[opt(default = net_call::NetArg::absent())] state: NetArg) -> Error {
         self.ensure_shutdown_hook();
+        let state = crate::seats::state_arg(state);
         let peer = NetPipePeer::new_gd();
-        self.start(peer.upcast())
+        self.start(peer.upcast(), state, GString::new(), false)
     }
 
     /// A session over any `MultiplayerPeer` (WebRTC, WebSocket, GodotSteam, Nakama, a `NetPipePeer`
-    /// end...). A peer with unique id 1 hosts; any other joins.
+    /// end...). A peer with unique id 1 hosts; any other joins. WP17: a host starts from `state` (as
+    /// for `host`); a client joins with `Net.key`.
     #[func]
-    fn use_peer(&mut self, peer: Gd<MultiplayerPeer>) -> Error {
+    fn use_peer(
+        &mut self,
+        peer: Gd<MultiplayerPeer>,
+        #[opt(default = net_call::NetArg::absent())] state: NetArg,
+    ) -> Error {
         self.ensure_shutdown_hook();
-        self.start(peer)
+        let state = crate::seats::state_arg(state);
+        let dedicated = self.dedicated;
+        self.start(peer, state, GString::new(), dedicated)
+    }
+
+    /// `Net`'s session while online.
+    pub(crate) fn default_session(&self) -> Option<Gd<NetSession>> {
+        self.session.clone()
     }
 
     /// Ends the session and restores the tree's original `MultiplayerAPI`.
@@ -1244,7 +1333,17 @@ impl Net {
         self.shutdown_hooked = true;
     }
 
-    fn start(&mut self, peer: Gd<MultiplayerPeer>) -> Error {
+    fn start(
+        &mut self,
+        peer: Gd<MultiplayerPeer>,
+        state: PackedByteArray,
+        key: GString,
+        dedicated: bool,
+    ) -> Error {
+        if let Err(e) = crate::seats::decode_state(&state, peer.get_unique_id() == 1) {
+            godot_error!("Net: the session state was refused: {e}; nothing started");
+            return Error::ERR_INVALID_DATA;
+        }
         self.leave();
         let Some(tree) = Engine::singleton()
             .get_main_loop()
@@ -1267,8 +1366,18 @@ impl Net {
                 self.emulation = crate::emulation::from_settings();
             }
             b.set_emulation(self.emulation.clone());
+            // WP17: the seat key (`join`'s, else `Net.key`) and whether the host plays.
+            let key = if key.is_empty() {
+                GString::from(crate::seats::net_key().as_str())
+            } else {
+                key
+            };
+            b.set_key(key);
+            b.dedicated = dedicated;
         }
-        let err = session.bind_mut().start(peer, NodePath::default());
+        let err = session
+            .bind_mut()
+            .start(peer, NodePath::default(), NetArg(state.to_variant()));
         if err != Error::OK {
             session.free();
             return err;

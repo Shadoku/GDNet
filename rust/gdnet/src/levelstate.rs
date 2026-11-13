@@ -22,8 +22,10 @@
 //! A blob is refused (with an error; the level loads fresh) when it does not decode, has an unknown
 //! version, belongs to another scene, or names a manager or a level entity the scene does not have (or
 //! one of another scene). Unknown property names are skipped, so a blob outlives a property added to a
-//! scene. Restored entities belong to the server (or to the owner their scene gives them); the owner
-//! in the blob is kept for WP17's seats.
+//! scene. Restored entities belong to the server (or to the owner their scene gives them); WP17: the
+//! blob records each entity's owner as a seat, and a restored entity whose seat is connected (or
+//! connects later in the session: a rejoin, or a session started from a saved state) goes to that
+//! seat's peer (`NetSession::process_seat_claims`).
 
 use super::{part_node_list, KeepState, NetManager, PartNodes};
 use crate::apply;
@@ -34,7 +36,7 @@ use godot::classes::{CanvasItem, Node, Node2D, Node3D};
 use godot::prelude::*;
 use netcore::levelstate::{EntityState, LevelState, ManagerState, PartValues};
 use netcore::{NetId, Origin as Placed};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// The project setting for `keep_state`'s default.
@@ -107,6 +109,7 @@ impl NetManager {
         &mut self,
         session: &Gd<NetSession>,
         players: &[Gd<Node>],
+        seat_of: &HashMap<u32, u32>,
     ) -> ManagerState {
         let root = self.get_managed_root();
         let mut out = ManagerState {
@@ -150,7 +153,7 @@ impl NetManager {
                 address,
                 scene: scene.path.clone(),
                 spawned: home.is_none(),
-                owner,
+                owner_seat: seat_of.get(&owner).copied().unwrap_or(0),
                 parts,
             });
         }
@@ -319,6 +322,19 @@ impl NetSession {
         scene_path: &str,
     ) -> Option<LevelState> {
         let players = self.player_roots();
+        // WP17: owners are recorded as seats (a peer id means nothing in a later session); the server's
+        // own entities are the server's (0) whatever its seat.
+        let seat_of: HashMap<u32, u32> = self
+            .core
+            .as_ref()
+            .map(|c| {
+                c.seat_table()
+                    .into_iter()
+                    .filter(|r| r.peer != netcore::SERVER && r.peer != 0)
+                    .map(|r| (r.peer, r.seat))
+                    .collect()
+            })
+            .unwrap_or_default();
         let me = self.to_gd();
         let mut st = LevelState::new(scene_path);
         st.origin = root_position(level);
@@ -330,7 +346,7 @@ impl NetSession {
             any = true;
             let mut ms = {
                 let _guard = self.base_mut();
-                m.bind_mut().capture(&me, &players)
+                m.bind_mut().capture(&me, &players, &seat_of)
             };
             ms.path = level.get_path_to(&m).to_string();
             st.managers.push(ms);
@@ -478,6 +494,7 @@ impl NetSession {
         let me = self.to_gd();
         let delta = offset(st.origin, root_position(level));
         let mut written = 0;
+        let mut claims = Vec::new();
         for (t, ms) in targets.iter_mut().zip(&st.managers) {
             // The level content that was destroyed is freed again (it was never announced).
             for address in &ms.removed {
@@ -524,9 +541,14 @@ impl NetSession {
                 if let (true, Some(d)) = (moved, delta) {
                     shift_detached(&n, d);
                 }
+                if e.owner_seat != 0 {
+                    claims.push((e.owner_seat, n.clone()));
+                }
                 written += 1;
             }
         }
+        // WP17: entities a seat owned go back to it once it is connected.
+        self.seat_claims.extend(claims);
         Ok(written)
     }
 
