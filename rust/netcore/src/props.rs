@@ -441,7 +441,8 @@ impl ScenePropsTable {
 }
 
 /// A property value as netcore sees it (gdnet converts to and from Godot Variants by [`TypeTag`]).
-#[derive(Clone, Debug, PartialEq, Default)]
+/// Serializable for the level state blobs (levelstate.rs); its wire form in snapshots is the packer's.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub enum Value {
     #[default]
     Nil,

@@ -500,4 +500,6 @@ func _on_changed(path: String, value: Variant) -> void:
   travel is in flight (`rooms` line), and `entities in scope`: a client holds only its room's entities.
 * **The overlay** (`Net.show_overlay(true)`) lists every entity with its room.
 * `Net.levels()` on the server lists every loaded level; a level with nobody in it is unloaded 30 seconds
-  after its last player left (`gdnet/levels/empty_timeout_s`, or `Net.empty_level_timeout`).
+  after its last player left (`gdnet/levels/empty_timeout_s`, or `Net.empty_level_timeout`). The server
+  keeps its state and puts it back when the level loads again (`Net.kept_levels()`; guide page 9, *Level
+  state*).

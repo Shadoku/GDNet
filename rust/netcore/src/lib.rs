@@ -16,7 +16,8 @@
 //! returns, the argument encoding, the routing verbs). WP7: [`authority`] (transfer rules, owner state
 //! acceptance, rejected writes), [`keyed`] (the keyed state map, permissions, views). WP8: [`hash`] (hash
 //! telemetry: per-entity hashes, sampling, the client's comparison). WP13: [`rooms`] (rooms, interest by
-//! room, travel). WP16: [`interest`] (radius with hysteresis, `visible_to`, filter results).
+//! room, travel). WP16: [`interest`] (radius with hysteresis, `visible_to`, filter results), [`levelstate`]
+//! (the level state blob kept when a level unloads).
 
 #![forbid(unsafe_code)]
 
@@ -31,6 +32,7 @@ pub mod input;
 pub mod interest;
 pub mod interp;
 pub mod keyed;
+pub mod levelstate;
 pub mod peers;
 pub mod predict;
 pub mod priority;
@@ -54,6 +56,7 @@ pub use input::{InputFrame, InputMsg, TakenFrame};
 pub use interest::{Interest, Visible};
 pub use interp::{Interp, InterpStats};
 pub use keyed::{KeyEvent, KeyMsg, KeyedState, Who};
+pub use levelstate::{EntityState, LevelState, LevelStateError, ManagerState, PartValues};
 pub use peers::{PeerId, SERVER};
 pub use predict::{Policy, Rollback};
 pub use props::{Audience, PropDesc, Quant, ScenePropsTable, Schedule, TypeTag, Value};

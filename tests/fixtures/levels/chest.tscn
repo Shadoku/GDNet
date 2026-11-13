@@ -1,0 +1,8 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/fixtures/levels/keepable.gd" id="1_keep"]
+
+[node name="Chest" type="Node2D"]
+script = ExtResource("1_keep")
+
+[node name="Items" type="Node2D" parent="."]

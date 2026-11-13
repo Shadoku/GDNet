@@ -51,6 +51,10 @@ use netcore::{NetId, ParentRef, Policy, Spawn, StateUpdate, Value, MANAGER_ROOT}
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// WP16: level state, the manager's side (capture and restore of its entities).
+#[path = "levelstate.rs"]
+pub(crate) mod levelstate;
+
 /// The group every manager joins, so a session can find the managers of its branch.
 pub const MANAGERS_GROUP: &str = "__gdnet_managers";
 /// Nodes in this group (and below them) are never enrolled (`Net.ignore()`).
@@ -84,6 +88,19 @@ pub enum SpawnPolicy {
     ServerOnly = 0,
     /// A client may spawn; the entity is owned by that client and relayed by the server.
     OwnerAllowed = 1,
+}
+
+/// WP16 (D20): whether a manager's entities keep their state when the server unloads its level.
+#[derive(GodotConvert, Var, Export, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[godot(via = i64)]
+pub enum KeepState {
+    /// The project setting `gdnet/levels/keep_state` (default true).
+    #[default]
+    Default = 0,
+    /// Kept.
+    On = 1,
+    /// Fresh at every load.
+    Off = 2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +153,9 @@ struct Entry {
     notified_owner: u32,
     /// WP8: `Time.get_ticks_msec()` of the last rejected write (0 = none), for the overlay's red.
     rejected_ms: u64,
+    /// WP16 (level state): the address (path relative to the managed root) of an entity that is part
+    /// of its level's scene, recorded when the server loaded the level; None for everything else.
+    home: Option<Rc<str>>,
 }
 
 impl Entry {
@@ -165,6 +185,7 @@ impl Entry {
             transfer: netcore::Transfer::Fixed,
             notified_owner: owner,
             rejected_ms: 0,
+            home: None,
         }
     }
 }
@@ -235,6 +256,16 @@ pub struct NetManager {
     /// overrides it per entity.
     #[export]
     radius: f64,
+    /// WP16 (D20): when the server unloads this manager's level, it keeps the state of the entities
+    /// here (scene entities' values, the ones destroyed, the ones spawned at run time) and restores it at
+    /// the level's next load, for the rest of the session. `default`: the project setting
+    /// `gdnet/levels/keep_state` (default true); `on`; `off` (fresh at every load, e.g. an arena).
+    #[export]
+    keep_state: KeepState,
+    /// WP16, server: the addresses of this level's own entities (see `Entry::home`).
+    homes: Vec<Rc<str>>,
+    /// WP16, server: an entity of `homes` went away since the session last asked.
+    homes_changed: bool,
     actions_cache: HashMap<String, Rc<ActionTable>>,
     profiles_cache: Option<(usize, Rc<Profiles>)>,
     runtime: HashMap<usize, Rc<RuntimeProps>>,
@@ -344,6 +375,16 @@ impl NetManager {
     fn entity_despawning(node: Gd<Node>);
     #[signal]
     fn spawn_refused(node: Gd<Node>);
+
+    /// `keep_state`: follow the project setting `gdnet/levels/keep_state`.
+    #[constant]
+    const KEEP_DEFAULT: i64 = 0;
+    /// `keep_state`: keep the level's state when it unloads.
+    #[constant]
+    const KEEP_ON: i64 = 1;
+    /// `keep_state`: a fresh level at every load.
+    #[constant]
+    const KEEP_OFF: i64 = 2;
 
     #[func]
     fn get_profiles(&self) -> Option<Gd<NetProfiles>> {
@@ -529,6 +570,9 @@ impl NetManager {
 
     fn forget(&mut self, iid: InstanceId) {
         if let Some(e) = self.entries.remove(&iid) {
+            if e.home.is_some() {
+                self.homes_changed = true;
+            }
             if let Some(id) = e.id {
                 self.by_id.remove(&id);
                 self.owned_shown.retain(|k, _| k.0 != id);
@@ -2837,10 +2881,14 @@ impl NetManager {
             .collect();
         let mut entries = Vec::new();
         for iid in iids {
-            if let Some(e) = self.entries.remove(&iid) {
+            if let Some(mut e) = self.entries.remove(&iid) {
                 if let Some(id) = e.id {
                     self.by_id.remove(&id);
                     self.owned_shown.retain(|k, _| k.0 != id);
+                }
+                // WP16: level content that leaves its level is gone from it.
+                if e.home.take().is_some() {
+                    self.homes_changed = true;
                 }
                 entries.push((iid, e));
             }

@@ -43,6 +43,9 @@ pub struct Level {
     pub origin: Option<Origin>,
     /// WP16, server: the grid cell it took (`gdnet/levels/spacing`).
     pub cell: Option<u32>,
+    /// WP16, server: `reset_level` was called while it was loaded: its state is dropped when it
+    /// unloads, so the next load is fresh.
+    pub reset: bool,
 }
 
 /// Where a level goes when it is loaded (WP16).
@@ -147,7 +150,7 @@ impl NetSession {
         self.branch().map(|b| world_of(&b))
     }
 
-    fn live_levels(&mut self) {
+    pub(crate) fn live_levels(&mut self) {
         self.levels.retain(|l| {
             l.node.is_instance_valid()
                 && l.node.is_inside_tree()
@@ -191,10 +194,21 @@ impl NetSession {
 
     /// Loads `scene_path` under the World (or returns the loaded level), placed as `place` says. On
     /// the server the session becomes room-strict (2.11) and the level's managers register their rooms
-    /// at once.
-    pub(crate) fn do_load_level(&mut self, scene_path: &str, place: Place) -> Option<Gd<Node>> {
+    /// at once; the level starts from `state` (WP16: the `state` argument of `load_level`, empty for a
+    /// fresh level), else from its kept state (levelstate.rs).
+    pub(crate) fn do_load_level(
+        &mut self,
+        scene_path: &str,
+        place: Place,
+        state: Option<Vec<u8>>,
+    ) -> Option<Gd<Node>> {
         self.live_levels();
         if let Some(i) = self.levels.iter().position(|l| l.path == scene_path) {
+            if state.is_some() {
+                godot_warn!(
+                    "gdnet: load_level({scene_path}): the level is loaded already, so the state given is not used (unload it first)"
+                );
+            }
             // A client told to put a loaded level elsewhere (the server reloaded it) moves it.
             if let Place::At(o) = place {
                 if !self.is_server() && self.levels[i].origin != Some(o) {
@@ -243,8 +257,10 @@ impl NetSession {
             empty_ticks: 0,
             origin,
             cell,
+            reset: false,
         });
         if self.is_server() {
+            self.level_loaded(&node, scene_path, state);
             self.with_core(|c, now| c.set_rooms_strict(true, now));
             self.register_rooms();
         }
@@ -257,8 +273,11 @@ impl NetSession {
         let Some(i) = self.levels.iter().position(|l| l.path == scene_path) else {
             return false;
         };
-        let mut node = self.levels.remove(i).node;
+        let level = self.levels.remove(i);
+        let mut node = level.node;
         if self.is_server() {
+            // WP16: the state is kept (or dropped) before the entities are destroyed.
+            self.level_unloading(&node, scene_path, level.reset);
             let me = self.to_gd();
             let inside: Vec<Gd<NetManager>> = self
                 .managers()
@@ -338,7 +357,7 @@ impl NetSession {
                 continue;
             }
             if ResourceLoader::singleton().exists(name.as_str()) {
-                self.do_load_level(&name, Place::Auto);
+                self.do_load_level(&name, Place::Auto, None);
             } else {
                 godot_warn!(
                     "gdnet: a peer has the room {name} (a neighbour or an added room), but there is no such scene to load"
@@ -371,7 +390,7 @@ impl NetSession {
             }
             let (level, dest) = match req.target {
                 TravelTarget::Scene(path) => {
-                    let Some(level) = self.do_load_level(&path, Place::Auto) else {
+                    let Some(level) = self.do_load_level(&path, Place::Auto, None) else {
                         continue;
                     };
                     let found = self
@@ -604,12 +623,23 @@ impl NetSession {
         self.move_entity(src, dest, &root, parent, (&from, &to), None);
     }
 
-    /// Client: `room`, a level, joined this client's rooms: load it now (at `origin`) and acknowledge.
-    pub(crate) fn on_travel_event(&mut self, scene_path: &str, room: &str, origin: Option<Origin>) {
+    /// Client: `room`, a level, joined this client's rooms: load it now (at `origin`), free its content
+    /// the server says is gone (WP16), and acknowledge.
+    pub(crate) fn on_travel_event(
+        &mut self,
+        scene_path: &str,
+        room: &str,
+        origin: Option<Origin>,
+        gone: &[String],
+    ) {
         self.room_levels
             .insert(room.to_string(), scene_path.to_string());
         let place = origin.map_or(Place::Authored, Place::At);
-        self.do_load_level(scene_path, place);
+        if let Some(level) = self.do_load_level(scene_path, place, None) {
+            if !gone.is_empty() {
+                self.free_gone(&level, gone);
+            }
+        }
         self.with_core(|c, now| c.travel_ack(room, now));
     }
 

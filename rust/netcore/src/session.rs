@@ -130,6 +130,9 @@ pub enum EntityEvent {
         scene_path: String,
         room: String,
         origin: Option<Origin>,
+        /// WP16 (level state): paths, relative to the level root, of the level's own entities that
+        /// are gone on the server: free them (no `Create` will claim them).
+        gone: Vec<String>,
     },
     /// WP16, client: `room` left this client's rooms (its entities left first): free its level once
     /// nothing this client owns is in it.
@@ -288,6 +291,9 @@ struct ScopeState {
     levels_of: BTreeMap<PeerId, BTreeMap<u64, Level>>,
     /// Server: (peer, room) of each `Travel` not acknowledged yet.
     travelling: BTreeSet<(PeerId, u64)>,
+    /// Server (WP16, level state): per level scene path, the paths (relative to the level root) of
+    /// the level's own entities that are gone; each `Travel` to the level names them.
+    level_gone: BTreeMap<String, Vec<String>>,
     stats: ScopeStats,
 }
 
@@ -1622,6 +1628,7 @@ impl Session {
                 scene_path,
                 room,
                 origin,
+                gone,
             } => {
                 if self.role == Role::Client {
                     self.scope.stats.travels_received += 1;
@@ -1629,6 +1636,7 @@ impl Session {
                         scene_path,
                         room,
                         origin,
+                        gone,
                     });
                 }
             }
@@ -3514,6 +3522,25 @@ impl Session {
         changed
     }
 
+    /// Server (WP16, level state): the level `scene_path`'s own entities at these paths (relative to
+    /// the level root) are gone; every later `Travel` to the level names them so the client frees its
+    /// copies. Empty clears the list (the level was unloaded).
+    pub fn set_level_gone(&mut self, scene_path: &str, gone: Vec<String>) {
+        if gone.is_empty() {
+            self.scope.level_gone.remove(scene_path);
+        } else {
+            self.scope.level_gone.insert(String::from(scene_path), gone);
+        }
+    }
+
+    /// Server: the list [`Session::set_level_gone`] last gave for `scene_path`.
+    pub fn level_gone(&self, scene_path: &str) -> &[String] {
+        self.scope
+            .level_gone
+            .get(scene_path)
+            .map_or(&[], |v| v.as_slice())
+    }
+
     /// Server: a strict session (one that uses levels) shows a peer without a room only the `"*"`
     /// managers.
     pub fn set_rooms_strict(&mut self, on: bool, now_us: u64) {
@@ -3761,10 +3788,17 @@ impl Session {
             }
             self.scope.stats.travels_sent += 1;
             self.scope.travelling.insert((peer, room));
+            let gone = self
+                .scope
+                .level_gone
+                .get(&level.path)
+                .cloned()
+                .unwrap_or_default();
             let travel = EntityAction::Travel {
                 scene_path: level.path,
                 room: self.scope.rooms.name(room),
                 origin: level.origin,
+                gone,
             };
             self.send(peer, &Message::Entity(travel), now_us);
         }
@@ -5843,6 +5877,56 @@ mod tests {
         let ups = p.client.drain_state_updates();
         assert!(ups.iter().all(|u| u.id != hub_torch), "{ups:?}");
         assert!(ups.iter().any(|u| u.id == cave_torch), "{ups:?}");
+    }
+
+    /// WP16 (level state): a `Travel` names the level's own content that is gone on the server (a
+    /// picked-up coin), so the client frees its copy, which no `Create` will ever claim.
+    #[test]
+    fn a_travel_names_the_level_content_that_is_gone() {
+        let mut p = connected_pair();
+        p.server.register_scene(SCENE, 42);
+        p.server.register_props(SCENE, props(), names());
+        client_registers(&mut p);
+        p.server.set_rooms(&room_table(), p.now);
+        p.server.set_rooms_strict(true, p.now);
+        p.server.set_level_gone(
+            "res://cave.tscn",
+            std::vec![
+                String::from("NetManager/Coin"),
+                String::from("NetManager/Chest/Items/Gem")
+            ],
+        );
+        let player = spawn_at(&mut p, 1, "Player", 2, PlayerMark::IfNone);
+        p.step();
+        let gone_of = |ev: &[EntityEvent], room: &str| -> Option<Vec<String>> {
+            ev.iter().find_map(|e| match e {
+                EntityEvent::Travel { room: r, gone, .. } if r == room => Some(gone.clone()),
+                _ => None,
+            })
+        };
+        let ev = entity_events(&mut p.client);
+        assert_eq!(gone_of(&ev, "res://hub.tscn"), Some(std::vec![]), "{ev:?}");
+        assert!(p.server.reparent(player, root(2), p.now));
+        p.step();
+        let ev = entity_events(&mut p.client);
+        assert_eq!(
+            gone_of(&ev, "res://cave.tscn"),
+            Some(std::vec![
+                String::from("NetManager/Coin"),
+                String::from("NetManager/Chest/Items/Gem")
+            ]),
+            "{ev:?}"
+        );
+        assert_eq!(p.server.level_gone("res://cave.tscn").len(), 2);
+        // Cleared (the level was unloaded): the next travel there names nothing.
+        p.server.set_level_gone("res://cave.tscn", std::vec![]);
+        assert!(p.server.level_gone("res://cave.tscn").is_empty());
+        assert!(p.server.reparent(player, root(1), p.now));
+        p.step();
+        assert!(p.server.reparent(player, root(2), p.now));
+        p.step();
+        let ev = entity_events(&mut p.client);
+        assert_eq!(gone_of(&ev, "res://cave.tscn"), Some(std::vec![]), "{ev:?}");
     }
 
     #[test]

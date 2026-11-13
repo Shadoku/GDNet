@@ -179,6 +179,9 @@ pub enum EntityAction {
         scene_path: String,
         room: String,
         origin: Option<crate::rooms::Origin>,
+        /// WP16 (level state, wire format 4): paths relative to the level root of the level's own
+        /// entities that are gone on the server; the client frees its copies.
+        gone: Vec<String>,
     },
     /// WP16, server to a client: `room`, a level, left the client's set of rooms (after the `Scope`
     /// leave of its entities): the client frees that level once nothing it owns is in it.

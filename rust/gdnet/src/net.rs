@@ -1067,19 +1067,52 @@ impl Net {
 
     /// WP13/WP16, server: loads a level under the World of `Net`'s session, at `origin` (a `Vector2`
     /// or `Vector3`; null: the next grid cell with `gdnet/levels/spacing`, else where it was
-    /// authored). See `NetSession.load_level`.
+    /// authored), starting from `state` (bytes from `level_state`; empty: fresh; null: the state kept
+    /// when it last unloaded). See `NetSession.load_level`.
     #[func]
     fn load_level(
         &mut self,
         scene_path: GString,
         #[opt(default = net_call::NetArg::absent())] origin: NetArg,
+        #[opt(default = net_call::NetArg::absent())] state: NetArg,
     ) -> Option<Gd<Node>> {
         let Some(mut s) = self.session.clone() else {
             godot_error!("gdnet: Net.load_level needs a session (host, join or offline first)");
             return None;
         };
-        let level = s.bind_mut().load_level(scene_path, origin);
+        let level = s.bind_mut().load_level(scene_path, origin, state);
         level
+    }
+
+    /// WP16, server: the state of a level as bytes for the game's save file (see
+    /// `NetSession.level_state`); empty without a session.
+    #[func]
+    fn level_state(&mut self, scene_path: GString) -> PackedByteArray {
+        let Some(mut s) = self.session.clone() else {
+            return PackedByteArray::new();
+        };
+        let bytes = s.bind_mut().level_state(scene_path);
+        bytes
+    }
+
+    /// WP16, server: drops the kept state of a level, so its next load is fresh (see
+    /// `NetSession.reset_level`).
+    #[func]
+    fn reset_level(&mut self, scene_path: GString) -> bool {
+        let Some(mut s) = self.session.clone() else {
+            return false;
+        };
+        let done = s.bind_mut().reset_level(scene_path);
+        done
+    }
+
+    /// WP16, server: the unloaded levels whose state `Net`'s session keeps (see
+    /// `NetSession.kept_levels`).
+    #[func]
+    fn kept_levels(&self) -> PackedStringArray {
+        self.session
+            .clone()
+            .map_or_else(PackedStringArray::new, |s| s.bind().kept_levels())
     }
 
     /// WP16: the origin `Net`'s session placed a loaded level at (null: authored position).

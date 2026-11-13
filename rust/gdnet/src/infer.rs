@@ -502,6 +502,8 @@ pub struct RuntimeProps {
     pub fields: Vec<Vec<RtField>>,
     pub hot: Vec<Vec<u16>>,
     pub cold: Vec<Vec<u16>>,
+    /// WP16 (level state): each field's property name, by part (blobs store values by name).
+    pub names: Vec<Vec<String>>,
 }
 
 impl RuntimeProps {
@@ -509,6 +511,11 @@ impl RuntimeProps {
         let mut fields = Vec::new();
         let mut hot = Vec::new();
         let mut cold = Vec::new();
+        let names = inferred
+            .specs
+            .iter()
+            .map(|p| p.iter().map(|s| s.name.clone()).collect())
+            .collect();
         for (descs, specs) in inferred.table.parts.iter().zip(&inferred.specs) {
             let mut f = Vec::new();
             let mut h = Vec::new();
@@ -536,6 +543,11 @@ impl RuntimeProps {
             hot.push(h);
             cold.push(c);
         }
-        Self { fields, hot, cold }
+        Self {
+            fields,
+            hot,
+            cold,
+            names,
+        }
     }
 }

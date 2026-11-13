@@ -6,7 +6,8 @@ those levels. gdnet does this with *rooms* (`docs/PLAN_NETCODE.md` 2.11 and 12.2
 example is the Doors demo, `demos/doors/README.md`.
 
 This page covers rooms and the sets of rooms a peer sees, the World node, travel, chunk overworlds with
-`neighbours`, `add_room`, where levels are placed, and `bounds` with `auto_travel`.
+`neighbours`, `add_room`, where levels are placed, `bounds` with `auto_travel`, and the state a level keeps
+when it unloads.
 
 ## Rooms
 
@@ -134,7 +135,8 @@ plain `Node`: the entities under it use global coordinates whichever manager hol
 The server unloads a level `empty_level_timeout` seconds after nobody needs it (no player entity in any of
 its managers, and its room in no peer's set): `NetSession.empty_level_timeout`, else
 `Net.empty_level_timeout`, else the project setting `gdnet/levels/empty_timeout_s` (default 30). Its entities
-are destroyed first. The next `travel` (or `load_level`) loads it again, with fresh entities.
+are destroyed first. The next `travel` (or `load_level`) loads it again, as it was when it unloaded (see
+*Level state*).
 
 **Moving an entity between managers by hand** (`remove_child` + `add_child`) is still a destroy and a
 create; `Net.travel` is the move.
@@ -197,8 +199,78 @@ scripts: give every chunk its bounds and `auto_travel`.
 
 ## Level state
 
-*Placeholder for WP16 slice C (`keep_state`, `level_state`, `reset_level`, the `state` argument of
-`load_level`).*
+A level keeps its state for the session (decision D20). When the server unloads a level, it keeps the
+state of the level's entities in memory; the next time the level loads, by `travel`, `load_level`, a
+neighbour or `add_room`, it comes back as it was. An opened chest stays open, a picked-up coin stays gone,
+a dropped sword is still on the floor.
+
+What is kept, per `NetManager` of the level:
+
+* the replicated properties (hot and cold, everything the `Create` carries) of every entity that is part
+  of the level scene, found again by its path below the manager;
+* which of the level's own entities were destroyed: they are freed again at the next load;
+* the entities spawned at run time under the manager, children of other entities included: instantiated
+  again from their scene, under the same parent and with the same name, with their properties.
+
+Players are never kept: the entity a peer's player is (and everything below it) leaves with its owner, or
+is destroyed with the level. Other entities a client owned are kept, and come back owned by the server (or
+by the owner their scene gives them), since a peer id means nothing once that client has gone.
+
+The state is put back on the server after the level entered the tree (its nodes' `_ready` ran) and before
+anything of it is announced. Clients therefore get the kept values in their `Create`s, and `_net_spawned`
+sees them on the server and on every client. A script that sets up its visuals from a property in
+`_ready` should do it in the property's setter or in `_net_spawned` as well. Positions follow the level:
+a level loaded at another origin (see *Placement*) gets its entities at the same place relative to it.
+
+A client that enters a level later frees its copies of the level's entities the server destroyed (the
+`Travel` names them), whether or not the level keeps its state.
+
+### Turning it off
+
+```gdscript
+$NetManager.keep_state = NetManager.KEEP_OFF      # this manager's entities are fresh at every load
+Net.reset_level("res://levels/dungeon.tscn")      # forget what was kept: the next load is fresh
+```
+
+* `NetManager.keep_state`: `KEEP_DEFAULT` (the project setting), `KEEP_ON`, or `KEEP_OFF` for a level that
+  should reset (an arena). A level whose managers are all off keeps nothing.
+* The project setting `gdnet/levels/keep_state` (default `true`) is what `KEEP_DEFAULT` follows.
+* `Net.reset_level(path)` drops the kept state, for a dungeon that resets when the party wipes. On a loaded
+  level it changes nothing now: the level stays as it is, and its state is dropped when it unloads, so its
+  next load is fresh. It returns false when nothing was kept and the level is not loaded.
+
+### Saving levels in the game's save file
+
+gdnet writes no file. It hands the game the same state as bytes, and takes them back:
+
+```gdscript
+var bytes: PackedByteArray = Net.level_state("res://levels/cave.tscn")   # on the server
+save_file["cave"] = bytes                                                 # store it with your save
+# ... later, in a new session:
+Net.load_level("res://levels/cave.tscn", null, save_file["cave"])
+```
+
+* `level_state(path)` is the level's current state when it is loaded, else the state kept when it last
+  unloaded, else empty. `Net.kept_levels()` lists the unloaded levels with a kept state; together with
+  `Net.levels()` that is every level a save needs.
+* `load_level(path, origin = null, state = null)`: with `state`, the level starts from those bytes instead
+  of the kept state; an empty `PackedByteArray` starts it fresh. On a level that is loaded already the
+  state is not used (unload it first).
+* A state that does not fit is refused with an error, and the level loads fresh: bytes that are not a
+  level state, a format version this build does not read, the state of another scene, or one naming a
+  manager or a level entity the scene no longer has. A property the scene no longer replicates is skipped,
+  so a save survives small changes to a scene.
+* The kept states belong to the session: a new `host()`, `join()` or `offline()` starts with none.
+
+The bytes start with `GDLS` and a format version, then the values themselves (not quantised for the
+network), by part and property name. Expect 100 to 150 bytes per entity with the inferred `Node2D`
+properties (the test vault, five entities and two destroyed ones, is about 750 bytes).
+
+### Single player
+
+All of it works under `Net.offline()`, where the game is its own server. That makes `level_state` and the
+`state` argument of `load_level` the single-player save path for level state as well: the same calls,
+the same bytes. A game that never unloads a level pays nothing for any of this.
 
 ## A headless server
 
@@ -218,5 +290,8 @@ the first; run the scene and press Join in the other two windows.
   networked scene).
 * Only players auto-travel; other entities move between managers with `Net.travel`.
 * A level holding a player owned by the server (the host's own player) is never unloaded.
+* Level state matches the level's own entities by their path below the manager. A level entity moved to
+  another parent inside its level gets its kept values back at its original place, and one that left
+  for another level with `Net.travel` counts as gone from its level.
 * The physics tick of a moved entity runs after the other nodes' in the tick of the move (Godot skips a
   node that leaves the tree during the physics pass, and gdnet runs that tick for it afterwards).

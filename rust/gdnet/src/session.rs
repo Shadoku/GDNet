@@ -172,6 +172,8 @@ pub struct NetSession {
     hash_sample: i64,
     /// WP16, server: radius roots, filters and focus nodes (interest.rs).
     pub(crate) interest: crate::interest::State,
+    /// WP16, server: the kept level state blobs by scene path (levelstate.rs), for this session.
+    pub(crate) kept_levels: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 /// WP8: the group every session joins (the overlay and the meter find sessions through it).
@@ -345,12 +347,15 @@ impl NetSession {
     /// every client; null: on the server the next free cell of the `gdnet/levels/spacing` grid when
     /// that is set (and no manager of the level names `neighbours`), else where it was authored. On
     /// the server the session then uses rooms strictly (a peer without a room sees only `"*"`
-    /// managers).
+    /// managers). WP16: `state` (a `PackedByteArray` from `level_state`) is the state the level starts
+    /// from, instead of the state kept when it last unloaded; an empty one starts it fresh. A state
+    /// that does not fit the scene is refused with an error and the level loads fresh.
     #[func]
     pub fn load_level(
         &mut self,
         scene_path: GString,
         #[opt(default = net_call::NetArg::absent())] origin: NetArg,
+        #[opt(default = net_call::NetArg::absent())] state: NetArg,
     ) -> Option<Gd<Node>> {
         let place = match crate::world::origin_from_variant(&origin.or_nil()) {
             Ok(Some(o)) => crate::travel::Place::At(o),
@@ -360,7 +365,73 @@ impl NetSession {
                 return None;
             }
         };
-        self.do_load_level(&scene_path.to_string(), place)
+        let state = state.or_nil();
+        let state = if state.is_nil() {
+            None
+        } else if let Ok(b) = state.try_to::<PackedByteArray>() {
+            Some(b.to_vec())
+        } else {
+            godot_error!(
+                "gdnet: load_level({scene_path}): a state is a PackedByteArray (from level_state), not {}",
+                state.stringify()
+            );
+            return None;
+        };
+        self.do_load_level(&scene_path.to_string(), place, state)
+    }
+
+    /// WP16, server: the state of level `scene_path` as bytes for the game's own save file: the
+    /// current state of its managers that keep state when it is loaded, else the state kept when it
+    /// last unloaded, else empty (also on a client). `load_level(path, origin, state)` takes it back,
+    /// in this session or a later one.
+    #[func]
+    pub fn level_state(&mut self, scene_path: GString) -> PackedByteArray {
+        let path = scene_path.to_string();
+        if !self.is_server() {
+            return PackedByteArray::new();
+        }
+        self.live_levels();
+        let loaded = self
+            .levels
+            .iter()
+            .find(|l| l.path == path)
+            .map(|l| l.node.clone());
+        let bytes = match loaded {
+            Some(node) => self
+                .capture_level(&node, &path)
+                .map(|st| st.encode())
+                .unwrap_or_default(),
+            None => self.kept_levels.get(&path).cloned().unwrap_or_default(),
+        };
+        PackedByteArray::from(bytes.as_slice())
+    }
+
+    /// WP16, server: drops the state kept for level `scene_path`, so its next load is fresh. On a loaded
+    /// level it changes nothing now: the state is dropped when the level unloads. False when there was
+    /// nothing to drop and the level is not loaded.
+    #[func]
+    pub fn reset_level(&mut self, scene_path: GString) -> bool {
+        let path = scene_path.to_string();
+        let kept = self.kept_levels.remove(&path).is_some();
+        self.live_levels();
+        let mut loaded = false;
+        for l in self.levels.iter_mut().filter(|l| l.path == path) {
+            l.reset = true;
+            loaded = true;
+        }
+        kept || loaded
+    }
+
+    /// WP16, server: the scene paths of the unloaded levels whose state is kept (in path order). WP17
+    /// collects their `level_state`, and that of the loaded levels, for a save.
+    #[func]
+    pub fn kept_levels(&self) -> PackedStringArray {
+        let paths: Vec<GString> = self
+            .kept_levels
+            .keys()
+            .map(|p| GString::from(p.as_str()))
+            .collect();
+        PackedStringArray::from(&paths[..])
     }
 
     /// WP13: frees a loaded level (the server destroys its entities first). False when not loaded.
@@ -1092,6 +1163,8 @@ impl NetSession {
         };
         self.generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
         self.unrouted.clear();
+        // WP16: kept level states belong to the session that kept them.
+        self.kept_levels.clear();
         if root_path.is_empty() {
             tree.set_multiplayer(&api.clone().upcast::<MultiplayerApi>());
         } else {
@@ -1339,6 +1412,8 @@ impl NetSession {
             // WP13: travels queued since the last step (WP16: auto-travel queues its own first),
             // then the empty-level timer.
             self.check_auto_travel();
+            // WP16: what the level content destroyed since the last step means for `Travel`s.
+            self.sync_level_gone();
             self.process_travels();
             self.check_empty_levels();
         }
@@ -2033,8 +2108,9 @@ impl NetSession {
                     scene_path,
                     room,
                     origin,
+                    gone,
                 } => {
-                    self.on_travel_event(&scene_path, &room, origin);
+                    self.on_travel_event(&scene_path, &room, origin, &gone);
                 }
                 EntityEvent::RoomLeft { room } => {
                     self.on_room_left(&room);
