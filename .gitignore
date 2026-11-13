@@ -9,8 +9,8 @@
 /build/
 /export/
 
-# Test output
-junit.xml
+# Test output (the test stages write junit-<stage>.xml)
+junit*.xml
 
 # OS / tooling
 .DS_Store
@@ -20,3 +20,9 @@ __pycache__/
 # gdnet (docs/PLAN_NETCODE.md D7): build outputs are never committed
 rust/target/
 addons/gdnet/bin/
+
+# tools/check.py's per-checkout state (shard times)
+.check/
+
+# Claude Code agent worktrees
+.claude/worktrees/

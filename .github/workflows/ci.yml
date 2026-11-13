@@ -19,35 +19,12 @@ jobs:
       - name: Install Godot
         run: bash tools/install_godot.sh
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-
-      - name: Run checks (build gdnet, import, validate scripts, rust tests, unit tests, smoke test)
-        run: python3 tools/check.py --junit junit.xml
-
-      - name: Upload test report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit
-          path: junit.xml
-          if-no-files-found: ignore
-
-  # Gate G3 (docs/PLAN_NETCODE.md): the sans-IO core and the extension must keep compiling for Godot's
-  # web export target. A dependency that needs wasm-bindgen or sockets fails here, in the package that adds it.
-  wasm-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust (stable, with the Emscripten target)
+      # The Emscripten target lets check.toml's wasm stage (gate G3, docs/PLAN_NETCODE.md) run for
+      # real here: the sans-IO core and the extension must keep compiling for Godot's web export.
+      - name: Install Rust (stable, with clippy, rustfmt and the Emscripten target)
         uses: dtolnay/rust-toolchain@stable
         with:
+          components: clippy, rustfmt
           targets: wasm32-unknown-emscripten
 
       - name: Cache cargo
@@ -55,6 +32,15 @@ jobs:
         with:
           workspaces: rust
 
-      - name: cargo check for wasm32-unknown-emscripten
-        working-directory: rust
-        run: cargo check --workspace --target wasm32-unknown-emscripten
+      # Every stage of check.toml: build gdnet, import, validate, rust tests, unit and integration
+      # tests, lint, smoke, wasm. CI always runs the full tier.
+      - name: Run checks
+        run: python3 tools/check.py
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: junit-*.xml
+          if-no-files-found: ignore
