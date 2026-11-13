@@ -1,0 +1,86 @@
+# check.toml: what `python3 tools/check.py` runs. Stages run in this order.
+# tools/check.py is the tdd-project kit's (language-agnostic); tools/godot.py does the Godot work.
+#
+# Keys of a [[stage]]:
+#   name          what the report calls it
+#   run           the shell command (run from the project root); exit code 0 = pass
+#   tier          "quick" (also part of --tier quick) or "full" (the default)
+#   filter        the command for `--filter NAME`, with {filter} where the name goes;
+#                 stages without it are left out of a filtered run
+#   no_match_exit exit codes of `filter` that mean "no test matches" (not a failure,
+#                 as long as another stage matched)
+#   filter_match  for a runner that exits 0 when nothing matches: a regex its output
+#                 matches only when a test ran
+#   summary       a regex; the runner's line(s) it matches are shown under a pass
+#                 (the last four)
+#   parallel      true: runs side by side with the parallel stages next to it
+#   stop_on_fail  true: when it fails the later stages are skipped (a build, a compile)
+#   files         glob(s) of test files; with {files} in `run` (and `filter`) the stage is
+#                 split over several processes by file, for a runner that has no
+#                 parallelism of its own. max_processes caps how many.
+#   env           environment variables for the command
+#   timeout       seconds (default 600); tail: lines of output shown on failure (60)
+#   needs         executables the stage needs; if_missing = "skip" skips it without them
+#                 (the default fails)
+# {jobs} in a command is the number of parallel jobs.
+#
+# Quick stages are the inner loop: keep their total under [budget].quick seconds, or
+# nobody will run them. Everything that needs a build, a browser, a database, a network
+# or real time belongs in the full tier.
+#
+# --filter runs only the stages with a `filter` (unit, integration): import does not run, so
+# after adding a script, a class_name or a resource run --tier quick (or --only import) once
+# before filtering.
+
+[budget]
+quick = 15
+full = 120
+
+[cache]
+# The toolchain: the Godot version (tools/godot.py version).
+tools = ["python3 tools/godot.py version"]
+env = []
+
+# --- quick tier: the inner loop ---------------------------------------------------------
+# The Godot stages never run side by side: the runner keeps user://test_durations.json and
+# the import cache is shared.
+
+[[stage]]
+name = "import"
+# godot --import: assets and the class_name cache; every later stage needs it.
+run = "python3 tools/godot.py import"
+tier = "quick"
+stop_on_fail = true
+
+[[stage]]
+name = "validate"
+# Every .gd script compiles (parse and static type errors); Godot's error blocks on failure.
+run = "python3 tools/godot.py validate"
+summary = '^SCRIPTS:.*$'
+tier = "quick"
+
+[[stage]]
+name = "unit"
+# tests/unit: plain classes, milliseconds each. The runner prints `TESTS: ... (N total)`.
+run = "python3 tools/godot.py test --dir tests/unit --junit junit-unit.xml"
+filter = "python3 tools/godot.py test --dir tests/unit --filter {filter}"
+filter_match = '^TESTS: .*\([1-9]\d* total\)$'
+summary = '^TESTS:.*$'
+tier = "quick"
+
+# --- full tier ------------------------------------------------------------------------
+
+[[stage]]
+name = "integration"
+# tests/integration: tests that instantiate scenes, split over {jobs} Godot processes by the
+# runner itself (whole files, balanced by user://test_durations.json; Godot 4.4+).
+run = "python3 tools/godot.py test --dir tests/integration --jobs {jobs} --junit junit-integration.xml"
+filter = "python3 tools/godot.py test --dir tests/integration --jobs {jobs} --filter {filter}"
+filter_match = '^TESTS: .*\([1-9]\d* total\)$'
+summary = '^TESTS:.*$'
+timeout = 600
+
+[[stage]]
+name = "smoke"
+# The main scene runs 30 frames headless; any error printed fails it (Godot itself exits 0).
+run = "python3 tools/godot.py smoke"

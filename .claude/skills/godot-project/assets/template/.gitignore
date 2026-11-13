@@ -9,8 +9,11 @@
 /build/
 /export/
 
-# Test output
-junit.xml
+# Test output (the test stages write junit-<stage>.xml)
+junit*.xml
+
+# tools/check.py's per-checkout state (shard times)
+.check/
 
 # OS / tooling
 .DS_Store

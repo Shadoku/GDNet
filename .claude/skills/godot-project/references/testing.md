@@ -9,14 +9,16 @@
 
 ## 1. How the runner works
 
-`tests/framework/runner.gd` is a `SceneTree` script. `check.py` (or you) launches it:
+`tests/framework/runner.gd` is a `SceneTree` script. `tools/godot.py test` (called by
+`check.toml`'s unit and integration stages), or you, launches it:
 
 ```
-godot --headless --path . -s tests/framework/runner.gd -- [--filter=<substr>] [--verbose] [--junit=<abs path>]
+godot --headless --path . -s tests/framework/runner.gd -- [--dir=res://tests/unit] [--filter=<substr>] [--verbose] [--junit=<abs path>] [--jobs=<n>]
 ```
 
 The runner re-launches Godot as a child process and reads its merged
-stdout/stderr. The child discovers `res://tests/**/test_*.gd`, and for each
+stdout/stderr. The child discovers `res://tests/**/test_*.gd` (only those under
+`--dir` when given), and for each
 `test_*` method creates a fresh instance of the script, adds it to the tree, runs
 `before_each`, the test, `after_each`, then frees it. Each phase has a timeout
 (`timeout_sec`, default 10 s) implemented by polling `process_frame`, so
@@ -29,7 +31,9 @@ a red test. Set `allow_errors = true` inside a test that provokes an error on
 purpose.
 
 Exit code 0 only when every test passed and no error was printed outside a test.
-A run with zero tests fails, so an empty test folder is noticed.
+A run with zero tests fails, so an empty test folder is noticed. (`tools/godot.py test`
+turns a filtered run that matched nothing into a pass with `(0 total)`, which the check's
+`filter_match` reports as `[NONE]`; a filter that matches no stage fails the check.)
 
 Filters match against `tests/unit/test_health.gd::test_heal`, so `--filter=health`
 selects a file and `--filter=::test_heal` a method.
@@ -176,5 +180,6 @@ needs doubles/mocks, parameterized tests, or an editor test panel.
 - GUT headless: `godot --headless -s addons/gut/gut_cmdln.gd -gdir=res://tests -gexit`
 - gdUnit4 headless: `godot --headless -s addons/gdUnit4/bin/GdUnitCmdTool.gd --add res://tests`
 
-Keep `tools/check.py` and point its `test` stage at the new command; the
-import, validate, and smoke stages stay useful with any framework.
+Keep `tools/check.py` and point `check.toml`'s unit and integration stages at the
+new command (with a `filter` and a `filter_match` regex that matches only when a
+test ran); the import, validate, and smoke stages stay useful with any framework.

@@ -9,8 +9,8 @@ Two modes:
   Adopt an existing project (target already has project.godot):
     python3 new_project.py ~/games/existing --adopt
 
-Adopt mode only adds files that are missing (tests/framework, tools/, CI, hooks,
-CLAUDE.md, .godot-version, ...). It never rewrites project.godot, scenes, or
+Adopt mode only adds files that are missing (tests/framework, tools/, check.toml, CI,
+hooks, CLAUDE.md, .godot-version, ...). It never rewrites project.godot, scenes, or
 existing scripts. Use --force to overwrite files the template also provides.
 
 Options:
@@ -178,12 +178,13 @@ def main() -> int:
     for rel in skipped:
         print(f"  = {rel} (exists, kept)")
     if args.adopt and "CLAUDE.md" in skipped:
-        print("\nCLAUDE.md already exists: merge the 'Commands', 'The development loop' and 'Writing tests'")
-        print(f"sections from {TEMPLATE / 'CLAUDE.md'} into it.")
+        print("\nCLAUDE.md already exists: merge the 'Commands', 'The development loop', 'How the check stays")
+        print("fast', 'Reading the report' and 'Writing tests' sections")
+        print(f"from {TEMPLATE / 'CLAUDE.md'} into it.")
     print("\nNext steps:")
     print(f"  cd {target}")
     print("  bash tools/install_godot.sh      # once, if godot is not on PATH")
-    print("  python3 tools/check.py           # must end with CHECK: PASS")
+    print("  python3 tools/check.py           # must end with CHECK: PASS (a second run: [CACHED])")
     print("  git add -A && git commit -m 'Scaffold Godot project with headless test tooling'   # includes the *.uid files")
     return 0
 

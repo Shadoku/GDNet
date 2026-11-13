@@ -19,7 +19,8 @@ data/                       .tres resources (stats, levels, dialogue) and their 
 assets/                     art, audio, fonts (imported by Godot; .import files live beside them)
 addons/                     third-party plugins; excluded from validate_scripts by default
 tests/unit/ tests/integration/ tests/framework/
-tools/                      check.py, validate_scripts.gd, install_godot.sh, other headless tools
+check.toml                  the check's stages (tools/check.py reads it)
+tools/                      check.py, godot.py, validate_scripts.gd, install_godot.sh, other headless tools
 ```
 
 Keep a scene and its script in matching folders rather than one giant `scripts/`

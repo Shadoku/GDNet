@@ -19,13 +19,14 @@ jobs:
       - name: Install Godot
         run: bash tools/install_godot.sh
 
-      - name: Run checks (import, validate scripts, unit tests, smoke test)
-        run: python3 tools/check.py --junit junit.xml
+      # Every stage of check.toml (import, validate, unit, integration, smoke): CI runs the full tier.
+      - name: Run checks
+        run: python3 tools/check.py
 
-      - name: Upload test report
+      - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: junit
-          path: junit.xml
+          path: junit-*.xml
           if-no-files-found: ignore

@@ -1,9 +1,9 @@
 extends SceneTree
 ## Headless unit-test runner. No addons required.
 ##
-##   godot --headless --path . -s tests/framework/runner.gd [-- [--filter=<substr>] [--verbose] [--junit=<path>] [--jobs=<n>]]
+##   godot --headless --path . -s tests/framework/runner.gd [-- [--dir=<res path>] [--filter=<substr>] [--verbose] [--junit=<path>] [--jobs=<n>]]
 ##
-## Discovers res://tests/**/test_*.gd, instantiates each (must extend TestCase) once per
+## Discovers res://tests/**/test_*.gd (or only those under `--dir`, e.g. `--dir=res://tests/unit`), instantiates each (must extend TestCase) once per
 ## test_* method, runs before_each / test / after_each with a per-test timeout, and
 ## prints one line per failure plus a summary. Exit code 0 only if every test passed.
 ##
@@ -22,6 +22,7 @@ extends SceneTree
 const TEST_ROOT := "res://tests"
 
 var _inner := false
+var _dir := TEST_ROOT
 var _filter := ""
 var _verbose := false
 var _junit_path := ""
@@ -41,6 +42,10 @@ func _parse_args() -> void:
 	for arg in OS.get_cmdline_user_args():
 		if arg == "--inner":
 			_inner = true
+		elif arg.begins_with("--dir="):
+			_dir = arg.trim_prefix("--dir=").trim_suffix("/")
+			if not _dir.begins_with("res://"):
+				_dir = "res://" + _dir
 		elif arg.begins_with("--filter="):
 			_filter = arg.trim_prefix("--filter=")
 		elif arg == "--verbose":
@@ -75,7 +80,7 @@ const DURATIONS := "user://test_durations.json"
 ## `--jobs=N`: the files spread over N inner processes (longest first onto the least loaded one).
 func _run_outer_parallel() -> void:
 	var project_dir := ProjectSettings.globalize_path("res://")
-	var scripts := _find_test_scripts(TEST_ROOT)
+	var scripts := _find_test_scripts(_dir)
 	scripts.sort()
 	var known: Dictionary = {}
 	if FileAccess.file_exists(DURATIONS):
@@ -248,8 +253,10 @@ func _report(inner_code: int) -> void:
 	if _junit_path != "":
 		_write_junit()
 	var ok: bool = counts.fail == 0 and counts.error == 0 and _orphan_errors.is_empty() and _results.size() > 0
-	if _results.is_empty():
-		print("No tests found. Put test_*.gd files extending TestCase under %s" % TEST_ROOT)
+	if _results.is_empty() and _filter != "":
+		print("No test under %s matches --filter=%s" % [_dir, _filter])
+	elif _results.is_empty():
+		print("No tests found. Put test_*.gd files extending TestCase under %s" % _dir)
 	if inner_code != 0 and ok:
 		print("Inner process exited with code %d" % inner_code)
 		ok = false
@@ -269,7 +276,7 @@ func _strip_runner_frames(block: String) -> String:
 
 func _run_inner() -> void:
 	await process_frame  # root is not in the tree until the first frame
-	var scripts := _find_test_scripts(TEST_ROOT)
+	var scripts := _find_test_scripts(_dir)
 	scripts.sort()
 	printerr("::shard")
 	for path in scripts:
