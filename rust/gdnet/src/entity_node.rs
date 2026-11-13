@@ -17,6 +17,9 @@
 //! entity's owner at creation unless it sets its own) and the signal `owner_changed(old, new)`, emitted on
 //! every peer once per change (parts get `_net_owner_changed(old, new)`).
 //!
+//! WP16: `radius`, `visible_to` with `visible_peers`, and `visibility_filter` (interest.rs; changes on a
+//! spawned entity reach the server's session at the end of the frame).
+//!
 //! Scripts that extend `NetEntity` may override `_net_spawned(info)` and `_net_despawning()`; scripts on
 //! any other part get the same calls when they define those methods.
 
@@ -87,6 +90,19 @@ impl Transfer {
     }
 }
 
+/// WP16 `NetEntity.visible_to`: which peers may have the entity at all.
+#[derive(GodotConvert, Var, Export, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[godot(via = i64)]
+pub enum VisibleTo {
+    /// Every peer whose rooms (and radius, filter) include it.
+    #[default]
+    All = 0,
+    /// Only its owner.
+    Owner = 1,
+    /// Only the peers in `visible_peers` (`Net.show_to`).
+    Peers = 2,
+}
+
 #[derive(GodotClass)]
 #[class(init, base = Node)]
 pub struct NetEntity {
@@ -148,6 +164,25 @@ pub struct NetEntity {
     #[var(pub)]
     #[init(val = true)]
     inherit_owner: bool,
+    /// WP16: a peer has this entity only while it is within this distance of the peer's focus (its
+    /// player, or `Net.set_focus`); it leaves beyond 1.2 times it. Pixels in 2D, metres in 3D. 0: the
+    /// manager's `radius`; negative: unlimited. Topmost entities only.
+    #[export]
+    #[var(get = get_radius, set = set_radius)]
+    radius: f64,
+    /// WP16: who may have this entity: `all` (default), `owner`, or `peers` (`visible_peers`).
+    #[export]
+    #[var(get = get_visible_to, set = set_visible_to)]
+    visible_to: VisibleTo,
+    /// WP16: the peers that may have this entity when `visible_to` is `peers` (`Net.show_to`).
+    #[export]
+    #[var(get = get_visible_peers, set = set_visible_peers)]
+    visible_peers: PackedInt32Array,
+    /// WP16: `Callable(peer: int) -> bool`, evaluated on the server every
+    /// `gdnet/interest/filter_every_ticks`: whether `peer` has this entity.
+    #[var(get = get_visibility_filter, set = set_visibility_filter)]
+    #[init(val = Callable::invalid())]
+    visibility_filter: Callable,
     /// The entity's net id once spawned (0 before). Read only.
     #[var(get = get_net_id, no_set)]
     net_id: i64,
@@ -158,6 +193,58 @@ impl NetEntity {
     #[func]
     pub fn get_net_id(&self) -> i64 {
         self.net_id
+    }
+
+    #[func]
+    pub fn get_radius(&self) -> f64 {
+        self.radius
+    }
+
+    #[func]
+    pub fn set_radius(&mut self, r: f64) {
+        self.set_radius_quiet(r);
+        self.interest_changed();
+    }
+
+    #[func]
+    pub fn get_visible_to(&self) -> VisibleTo {
+        self.visible_to
+    }
+
+    #[func]
+    pub fn set_visible_to(&mut self, v: VisibleTo) {
+        self.set_visible_to_quiet(v);
+        self.interest_changed();
+    }
+
+    #[func]
+    pub fn get_visible_peers(&self) -> PackedInt32Array {
+        self.visible_peers.clone()
+    }
+
+    #[func]
+    pub fn set_visible_peers(&mut self, peers: PackedInt32Array) {
+        self.set_visible_peers_quiet(peers);
+        self.interest_changed();
+    }
+
+    #[func]
+    pub fn get_visibility_filter(&self) -> Callable {
+        self.visibility_filter.clone()
+    }
+
+    #[func]
+    pub fn set_visibility_filter(&mut self, f: Callable) {
+        self.set_visibility_filter_quiet(f);
+        self.interest_changed();
+    }
+
+    /// WP16: pushes this entity's interest settings to a running server (deferred from the setters).
+    #[func]
+    fn _net_apply_interest(&self) {
+        if let Some(root) = self.base().get_parent() {
+            crate::interest::apply_live(&root);
+        }
     }
 
     /// Called on every part of a spawned entity after it entered the tree (on the authority when it is
@@ -188,5 +275,30 @@ impl NetEntity {
 impl NetEntity {
     pub fn set_net_id(&mut self, id: i64) {
         self.net_id = id;
+    }
+
+    /// WP16: the setters without the live push (the caller pushes).
+    pub fn set_radius_quiet(&mut self, r: f64) {
+        self.radius = r;
+    }
+
+    pub fn set_visible_to_quiet(&mut self, v: VisibleTo) {
+        self.visible_to = v;
+    }
+
+    pub fn set_visible_peers_quiet(&mut self, peers: PackedInt32Array) {
+        self.visible_peers = peers;
+    }
+
+    pub fn set_visibility_filter_quiet(&mut self, f: Callable) {
+        self.visibility_filter = f;
+    }
+
+    /// A spawned entity's settings changed: push them once this call returns (the push reads this
+    /// node again).
+    fn interest_changed(&self) {
+        if self.net_id != 0 {
+            self.to_gd().call_deferred("_net_apply_interest", &[]);
+        }
     }
 }

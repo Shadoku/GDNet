@@ -272,6 +272,8 @@ pub struct Session {
     hash: HashState,
     /// WP13: rooms and each peer's scope (rooms.rs).
     scope: ScopeState,
+    /// WP16: radius, `visible_to` and filter results (interest.rs).
+    interest: crate::interest::Interest,
 }
 
 /// WP13: what each peer has been sent, and the room table.
@@ -490,6 +492,7 @@ impl Session {
             keyed: KeyedState::default(),
             hash: HashState::default(),
             scope: ScopeState::default(),
+            interest: crate::interest::Interest::default(),
         }
     }
 
@@ -679,6 +682,7 @@ impl Session {
         self.scope.levels_of.remove(&peer);
         self.scope.travelling.retain(|(p, _)| *p != peer);
         self.scope.rooms.forget_peer(peer);
+        self.interest.forget_peer(peer);
         self.repl.remove_peer(peer);
         self.remote_props.retain(|(p, _), _| *p != peer);
         self.remote_scenes.retain(|(p, _), _| *p != peer);
@@ -1009,6 +1013,8 @@ pub struct Spawn {
     pub inherit_owner: bool,
     /// WP13: whether the entity becomes its owner's player (server).
     pub player: PlayerMark,
+    /// WP16: radius, `visible_to` and filter (server; applied before the entity is shared).
+    pub interest: Option<crate::interest::Spec>,
 }
 
 impl Spawn {
@@ -1030,7 +1036,14 @@ impl Spawn {
             client_owned: false,
             inherit_owner: false,
             player: PlayerMark::No,
+            interest: None,
         }
+    }
+
+    /// WP16: the entity's interest settings (see [`crate::interest`]).
+    pub fn with_interest(mut self, spec: crate::interest::Spec) -> Self {
+        self.interest = (!spec.is_default()).then_some(spec);
+        self
     }
 
     /// WP13: the entity becomes its owner's player (see [`PlayerMark`]).
@@ -1232,6 +1245,7 @@ impl Session {
             mut client_owned,
             inherit_owner,
             player,
+            interest,
         } = spec;
         if self.role == Role::Client {
             client_owned = true;
@@ -1277,6 +1291,9 @@ impl Session {
         if self.role == Role::Client {
             self.share(EntityAction::Create(create), None, now_us);
             return Ok(id);
+        }
+        if let Some(spec) = interest {
+            self.interest.set(id, &spec);
         }
         // WP13: the owner's player sets its room (and may send `Travel` and a scope change first).
         let mark = match player {
@@ -1405,7 +1422,7 @@ impl Session {
         }
         // WP7: the creator's initial state is the server's record of it (relayed, and in bursts).
         self.record_encoded(id, create.scene_hash, &create.initial_state);
-        self.repl.mark_synced(from, id);
+        self.repl.mark_synced(from, id, create.owner == from);
         self.scope.known.entry(from).or_default().insert(id);
         self.share_create(&create, Some(from), now_us);
         self.drain_held(now_us);
@@ -2894,6 +2911,70 @@ impl Session {
     }
 }
 
+/// Interest beyond rooms (WP16, docs/PLAN_NETCODE.md 12.2; see [`crate::interest`]): the server's
+/// radius, `visible_to` and filter results, one more condition in `wants()`.
+impl Session {
+    pub fn interest(&self) -> &crate::interest::Interest {
+        &self.interest
+    }
+
+    /// Server: replaces `id`'s interest settings; every scope follows when anything changed.
+    pub fn set_interest(&mut self, id: NetId, spec: &crate::interest::Spec, now_us: u64) {
+        if self.interest.set(id, spec) && self.entities.contains(id) {
+            self.refresh_all_scopes(now_us);
+        }
+    }
+
+    /// Server: `visible_to` of `id` (`Net.show_to`, `NetEntity.visible_to`).
+    pub fn set_visible(&mut self, id: NetId, v: crate::interest::Visible, now_us: u64) {
+        if self.interest.set_visible(id, v) && self.entities.contains(id) {
+            self.refresh_all_scopes(now_us);
+        }
+    }
+
+    /// Server: the radius of topmost entity `id` (0 = unlimited); a new radius applies at the next
+    /// [`Session::interest_update`].
+    pub fn set_entity_radius(&mut self, id: NetId, radius: f64, now_us: u64) {
+        if self.interest.set_radius(id, radius) && self.entities.contains(id) {
+            self.refresh_all_scopes(now_us);
+        }
+    }
+
+    /// Server: the latest result of `id`'s `visibility_filter`: the peers it admits (None: the entity
+    /// has no filter any more). Peers whose answer changed get their scope refreshed.
+    pub fn set_filter_result(
+        &mut self,
+        id: NetId,
+        admitted: Option<BTreeSet<PeerId>>,
+        now_us: u64,
+    ) {
+        let joined = self.peers.joined();
+        let changed = self.interest.set_filter(id, admitted, &joined);
+        if self.entities.contains(id) {
+            for peer in changed {
+                self.refresh_scope(peer, now_us);
+            }
+        }
+    }
+
+    /// Server, each tick while [`crate::interest::Interest::is_active`]: the positions of the
+    /// radius-limited entity roots and every peer's focus position. Peers whose radius set changed get
+    /// their scope refreshed (`Create` with current state, `Scope` leaves).
+    pub fn interest_update(
+        &mut self,
+        positions: &[(NetId, [f64; 3])],
+        focus: &[(PeerId, [f64; 3])],
+        now_us: u64,
+    ) {
+        if self.role != Role::Server {
+            return;
+        }
+        for peer in self.interest.update(positions, focus) {
+            self.refresh_scope(peer, now_us);
+        }
+    }
+}
+
 /// Keyed state (WP7, docs/PLAN_NETCODE.md 2.4; see [`crate::keyed`]).
 impl Session {
     pub fn keyed(&self) -> &KeyedState {
@@ -3583,20 +3664,24 @@ impl Session {
             return false;
         };
         root.owner == peer
-            || self
+            || (self
                 .scope
                 .rooms
                 .sees(rooms, self.scope.rooms.of_manager(root.parent.manager))
+                // WP16: radius, `visible_to`, filter (interest.rs).
+                && self.interest.allows(peer, id, &self.entities))
     }
 
     /// Server: sends `c` (with the entity's latest full state) to `peer`, which then holds it.
     fn send_create_to(&mut self, peer: PeerId, mut c: CreateAction, now_us: u64) {
         let id = c.id;
+        // WP16: `audience: owner` fields only for the owner.
+        let owner = self.entities.get(id).map_or(c.owner, |r| r.owner) == peer;
         if self.repl.entity(id).is_some() {
-            c.initial_state = self.repl.encode_full(id);
+            c.initial_state = self.repl.encode_full_for(id, owner);
         }
         self.send_entity(peer, EntityAction::Create(c), now_us);
-        self.repl.mark_synced(peer, id);
+        self.repl.mark_synced(peer, id, owner);
         self.scope.known.entry(peer).or_default().insert(id);
     }
 
@@ -3638,6 +3723,9 @@ impl Session {
             for r in removed {
                 k.remove(&r.id);
             }
+        }
+        for r in removed {
+            self.interest.remove(r.id);
         }
         let entities = &self.entities;
         let orphaned = self.scope.rooms.drop_players(&|id| !entities.contains(id));

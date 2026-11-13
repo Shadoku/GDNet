@@ -53,7 +53,7 @@ pub fn every_ticks() -> u64 {
 
 /// The position of an entity root and whether it is 3D; None for a root that is neither a `Node2D`
 /// nor a `Node3D`.
-fn position_of(root: &Gd<Node>) -> Option<([f64; 3], bool)> {
+pub(crate) fn position_of(root: &Gd<Node>) -> Option<([f64; 3], bool)> {
     if let Ok(n) = root.clone().try_cast::<Node2D>() {
         let p = n.get_global_position();
         return Some(([f64::from(p.x), f64::from(p.y), 0.0], false));

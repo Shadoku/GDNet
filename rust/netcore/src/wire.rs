@@ -291,7 +291,8 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
 
 /// The wire format version, an item of [`Protocol`]: raised whenever the bytes of an existing message
 /// change meaning while the crate version stays. 1 = WP0-WP14; 2 = D17 (2D `mm`/`cm` steps of 0.1 px
-/// and 1 px instead of 0.001 px and 0.01 px); 3 = WP16 (`Travel` carries a level origin, `RoomLeft`).
+/// and 1 px instead of 0.001 px and 0.01 px); 3 = WP16 (`Travel` carries a level origin, `RoomLeft`,
+/// the `audience` property option).
 pub const WIRE_FORMAT: u32 = 3;
 
 /// The protocol description both ends must agree on (3.3). WP1 covers the netcore version, the tick

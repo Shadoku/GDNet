@@ -225,6 +225,9 @@ fn make_desc(name: &str, tag: TypeTag, entry: Option<&Entry>, tick_rate: u32) ->
     if let Some(t) = entry.and_then(|e| e.teleport_distance) {
         d.teleport_distance = t.max(0.0);
     }
+    if let Some(a) = entry.and_then(|e| e.audience) {
+        d.audience = a;
+    }
     if let Some(s) = entry.and_then(|e| e.poll_seconds) {
         d.slow_ticks = (s * tick_rate as f32).round().max(1.0) as u32;
     }
@@ -432,6 +435,7 @@ pub fn derive(
                     .flatten()
                     .for_each(|(d, _)| d.teleport_distance = t),
             },
+            Op::Audience(path, a) => with_desc(scene, &mut parts, &path, |d| d.audience = a),
         }
     }
     // Debug hook: perturb one property's quantiser on this side.

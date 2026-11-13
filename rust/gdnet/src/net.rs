@@ -369,6 +369,30 @@ impl Net {
                         m.bind_mut().set_priority(&root, p as f32);
                     }
                 }
+                // WP16 (interest.rs): table changes per property, settings per entity.
+                "audience" => {
+                    let Ok(d) = v.try_to::<VarDictionary>() else {
+                        godot_error!("Net.configure: audience must be a Dictionary of property: \"owner\" | \"all\"");
+                        continue;
+                    };
+                    for (p, a) in d.iter_shared() {
+                        let (p, a) = (p.to_string(), a.to_string());
+                        match netcore::Audience::parse(&a) {
+                            Some(a) => ops.push(Op::Audience(path(&p), a)),
+                            None => {
+                                godot_error!("Net.configure: audience {a:?} for {p} is not known")
+                            }
+                        }
+                    }
+                }
+                "radius" => {
+                    crate::interest::store_radius(&root, profiles::number(&v).unwrap_or(0.0));
+                    crate::interest::apply_live(&root);
+                }
+                "visible_to" => match crate::interest::store_visible_to(&root, &v) {
+                    Ok(()) => crate::interest::apply_live(&root),
+                    Err(e) => godot_error!("Net.configure: {e}"),
+                },
                 _ => {
                     extra.set(k.as_str(), &v);
                 }

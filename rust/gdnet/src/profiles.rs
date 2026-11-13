@@ -4,7 +4,7 @@
 //! A `NetProfiles` resource maps class names to arrays of property entries:
 //! `{name, schedule? ("hot" | "cold"; "send" is accepted too), quantize? ("raw" | "mm" | "cm" | "deg" |
 //! "smallest3" | "f16"), interpolate?, tolerance?, reliable?, poll_seconds?, teleport_distance? (WP5),
-//! remove?}`. A class mapped
+//! audience? ("all" | "owner", WP16), remove?}`. A class mapped
 //! to an empty array syncs nothing and stops the walk up its class hierarchy (cameras, timers, audio
 //! players). `merge(other)` lays `other` over this one: an entry replaces the entry of the same name,
 //! `{name, remove: true}` drops it, an empty array empties the class.
@@ -50,6 +50,8 @@ pub struct Entry {
     pub poll_seconds: Option<f32>,
     /// WP5: a replica snaps instead of blending a correction larger than this (property units).
     pub teleport_distance: Option<f32>,
+    /// WP16: `"all"` or `"owner"` (only the entity's owner receives the value).
+    pub audience: Option<netcore::Audience>,
     pub remove: bool,
 }
 
@@ -74,6 +76,7 @@ impl Entry {
             reliable: b("reliable"),
             poll_seconds: f("poll_seconds"),
             teleport_distance: f("teleport_distance"),
+            audience: s("audience").and_then(|x| netcore::Audience::parse(&x)),
             remove: b("remove").unwrap_or(false),
         })
     }
@@ -102,6 +105,9 @@ impl Entry {
         if let Some(t) = self.teleport_distance {
             d.set("teleport_distance", f64::from(t));
         }
+        if let Some(a) = self.audience {
+            d.set("audience", a.name());
+        }
         if self.remove {
             d.set("remove", true);
         }
@@ -113,8 +119,13 @@ impl Entry {
             .teleport_distance
             .map(|t| format!("|teleport {}", t.to_bits()))
             .unwrap_or_default();
+        // WP16: entries without an audience render (and hash) as before.
+        let audience = self
+            .audience
+            .map(|a| format!("|audience {}", a.name()))
+            .unwrap_or_default();
         format!(
-            "{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}{}",
+            "{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}{}{}",
             self.name,
             self.schedule.map(Schedule::name),
             self.quant.map(Quant::name),
@@ -123,7 +134,8 @@ impl Entry {
             self.reliable,
             self.poll_seconds.map(f32::to_bits),
             self.remove,
-            teleport
+            teleport,
+            audience
         )
     }
 }

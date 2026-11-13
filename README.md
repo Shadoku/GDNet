@@ -49,7 +49,7 @@ minutes the first time), imports, runs the Rust and GDScript tests, lint and a s
 * A headless dedicated server: `godot --headless --path . demos/doors/main.tscn -- --server` (likewise
   `demos/ballpit/main.tscn`).
 
-**Where things are.** The user guide is `docs/guide/` (`01_sessions.md` to `10_physics_and_bandwidth.md`,
+**Where things are.** The user guide is `docs/guide/` (`01_sessions.md` to `11_visibility.md`,
 one page per topic). The design, work packages, decisions and status are `docs/PLAN_NETCODE.md` (its
 section 10 is the status table, section 11 the known limits); the research behind it is
 `docs/reports/Rust GDExtension multiplayer design.md` and `docs/research_notes/`.
