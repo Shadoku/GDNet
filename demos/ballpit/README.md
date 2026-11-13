@@ -18,7 +18,7 @@ The concepts are in `docs/guide/10_physics_and_bandwidth.md`; this page is the w
   Instances*, set the count to 3, and give the first instance the launch argument `-- --server`. Run
   `main.tscn`; press **Join** in the two other windows.
 * **A headless server**: `godot --headless --path . demos/ballpit/main.tscn -- --server`.
-* **The tests**: `python3 tools/check.py --only test --filter=ballpit` runs the demo headless: a server and
+* **The tests**: `python3 tools/check.py --only integration --filter ballpit` runs the demo headless: a server and
   a client in one process, 300 balls.
 
 Move your paddle with the arrow keys or WASD. Push it into the pile and watch the balls scatter.

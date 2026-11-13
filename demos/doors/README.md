@@ -19,7 +19,7 @@ The concepts are in `docs/guide/09_rooms_and_travel.md`; this page is the worked
 * **A headless server**: `godot --headless --path . demos/doors/main.tscn -- --server`. Everything after `--`
   reaches the game through `OS.get_cmdline_user_args()`; `main.gd` sees `--server`, hosts without a
   local player and never shows a window's worth of buttons.
-* **The tests**: `python3 tools/check.py --only test --filter=doors` runs the whole demo headless, a
+* **The tests**: `python3 tools/check.py --only integration --filter doors` runs the whole demo headless, a
   server and two or three clients in one process, as a host-player and as a dedicated server.
 
 Move with the arrow keys or WASD (the project's `left`, `right`, `up`, `down` actions).

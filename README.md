@@ -5,7 +5,9 @@ A Godot 4.6 project.
 ## Develop
 
 ```
-python3 tools/check.py        # build gdnet + import + validate + Rust and GDScript tests + smoke test
+python3 tools/check.py              # everything: build gdnet, import, validate, Rust and GDScript tests, lint, smoke, wasm
+python3 tools/check.py --tier quick # the fast stages (seconds), while implementing
+python3 tools/check.py --filter X   # one test (GDScript `file::method` or Rust test name)
 godot --path .                # run the game
 godot --path . --editor       # open the editor
 ```
@@ -13,6 +15,7 @@ godot --path . --editor       # open the editor
 Godot is located via `$GODOT`, then `godot` on PATH, then `~/.cache/godot/<version>/godot`.
 `bash tools/install_godot.sh` downloads the version pinned in `.godot-version`.
 
+The stages are listed in `check.toml`; `tools/godot.py` runs the Godot and cargo side of each.
 See `CLAUDE.md` for the test-driven workflow and project conventions.
 
 ## gdnet: multiplayer that stays close to single player
@@ -34,7 +37,7 @@ The escalation ladder (`docs/PLAN_NETCODE.md` section 1); most games stop at run
 5. **Rungs 4-5**: optional hooks (`_net_tick`, `_net_spawned`, `_net_allow`, ...), then Rust.
 
 **First run.** `python3 tools/check.py` builds the extension (`cargo build --release -p gdnet`, several
-minutes the first time), imports, runs the Rust and GDScript tests and a smoke test; it ends with
+minutes the first time), imports, runs the Rust and GDScript tests, lint and a smoke test; it ends with
 `CHECK: PASS`. Then try the two demos, each a tutorial whose README is the walkthrough:
 
 * `demos/doors/` (players travelling between levels) and `demos/ballpit/` (300 colliding `RigidBody2D`
