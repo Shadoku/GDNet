@@ -114,6 +114,7 @@ func _ready() -> void:            # in the level, on every peer
 		"tolerance": 0.01,                 # prediction tolerance (WP4), all properties or {prop: x}
 		"interpolate": {"position": true}, # (WP5)
 		"priority": 10,                    # this entity's share of the budget, any time
+		"audience": {"hand": "owner"},     # only the entity's owner receives it (page 11)
 	})
 ```
 
@@ -138,7 +139,8 @@ Add a `NetEntity` child to the scene's root and set, in the inspector:
 
 * `state_properties` (`Array[NodePath]`): `position`, `Sprite:frame`, ... relative to the entity root;
 * `state_options` (Dictionary): per path, `{schedule: "hot" | "cold", quantize, interpolate, tolerance,
-  reliable, poll_seconds}`;
+  reliable, poll_seconds, audience}`; `audience: "owner"` sends the property to the entity's owner only,
+  the other peers keep the scene's value (page 11);
 * `inherit_profile`: **false** (default) means the list **replaces** inference (only the listed
   properties sync, exports included); **true** adds the list to the inferred properties;
 * `priority`, and `input_properties` (used from WP4).
@@ -149,7 +151,7 @@ list properties or turn `inherit_profile` on.
 ### Profiles as data
 
 `NetProfiles` is a resource: `classes` maps a class name to an array of entries
-`{name, schedule?, quantize?, interpolate?, tolerance?, reliable?, poll_seconds?, remove?}`. Layers, each
+`{name, schedule?, quantize?, interpolate?, tolerance?, reliable?, poll_seconds?, audience?, remove?}`. Layers, each
 `merge()`d over the previous: the shipped `default_profiles.tres`, the resource at the project setting
 `gdnet/sync/profiles`, `Net.profiles`, then a `NetManager.profiles` override for that manager. An entry
 replaces the entry of the same name, `remove: true` drops it, an empty array empties a class.

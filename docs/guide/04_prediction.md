@@ -183,7 +183,7 @@ gradually afterwards.
 
 | setting | default | |
 |---|---|---|
-| `gdnet/prediction/max_rollback_ticks` | 20 (a third of a second above 60 Hz) | ticks of history per predicted entity; a confirmation older than that is not compared |
+| `gdnet/prediction/max_rollback_ticks` | 20 (a third of a second above 60 Hz) | ticks of history per predicted entity; a confirmation older than that is not compared, except one from before the owner's first predicted tick (a player the server moved right after spawning it), which is compared at that tick |
 | `gdnet/input/actions` | empty (every action but `ui_*`) | the actions owned entities send |
 | `gdnet/debug/warn_on_global_input` | true | the `Input.` warning (debug builds) |
 | `Net.input_delay_ticks` | 0 | see above |

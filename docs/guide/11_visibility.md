@@ -115,5 +115,12 @@ its radius, its `visible_to` and its filter all allow it.
 each peer's scope with every rule applied; on a client `entities_in_scope` is what it holds.
 `NetSession.in_radius(peer)` lists the radius-limited entities inside a peer's radius.
 
-Measured (headless, release build): 1,000 radius-limited entities spread over 6,000 x 6,000 px with two
-moving clients cost the server about 1.7 ms per tick on average (0.7 ms on a tick without scope changes).
+A change of interest updates only the entities it concerns: when an entity enters or leaves a peer's radius,
+or its `visible_to` or filter result changes, the server checks that entity and those below it for that
+peer. A change of rooms rebuilds the peer's whole scope.
+
+Measured (headless, release build; `test_g9_no_entity_beyond_one_point_two_r` prints it with
+`--verbose`): 1,000 radius-limited entities on a 190 px grid over about 6,000 x 6,000 px, two clients
+walking 8 px per tick, cost the server's interest pass 0.62-0.72 ms per tick on average and 1.1-3.4 ms at
+most over 150 ticks (it reads every radius-limited root's position each tick). Rebuilding the whole scope on
+every change, as before, cost 2.5-2.7 ms on average and 9-13 ms at most on the same scene.

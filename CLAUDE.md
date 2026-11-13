@@ -10,7 +10,8 @@ packages are in `docs/PLAN_NETCODE.md` (approved 2026-11-08; the status table at
 its end says what is built); the research behind it is
 `docs/reports/Rust GDExtension multiplayer design.md` and `docs/research_notes/`.
 Follow the plan's packages in order and update its status table when one lands.
-Section 12 of the plan (v2, added 2026-11-13) holds the packages after v1 and their order. Priorities
+Section 12 of the plan (v2, added 2026-11-13) holds the packages after v1 and their order (WP16 is built;
+WP17 is next). Priorities
 (the owner's, plan goal 9): function, flexibility and keeping game code close to its single-player
 version come first; cheat detection and prevention are not a priority inside the extension.
 Nothing depends on the addon yet (the owner, 2026-11-13): keeping v1's behaviour, API or wire format is not
@@ -175,6 +176,12 @@ These are the rules that keep it at seconds:
   Physics bodies (WP14): `tests/integration/test_ballpit_demo.gd` runs `demos/ballpit/` (a pit per branch;
   the clients' pits shift their collision layers with `layer_shift`, since the branches share one physics
   space; set `timeout_sec` for scenes that need seconds to settle).
+  Interest, rooms and level state (WP16): `test_net_interest.gd` (radius, `visible_to`, `audience`, filters;
+  fixtures in `tests/fixtures/net/`), `test_net_rooms.gd` (neighbours, placement, auto-travel; chunk,
+  interior and 3D cell scenes in `tests/fixtures/rooms/`), `test_net_level_state.gd` (kept and saved level
+  state; `tests/fixtures/levels/`). project.godot sets `gdnet/levels/spacing` to 4000 for the Doors demo;
+  the rooms and level-state tests turn it off in `before_each` and put it back in `after_each`. Gate G9's
+  audience test scans packets with `NetPipePeer._debug_watch(bytes)`.
 
 ## Design for testability
 
@@ -203,7 +210,8 @@ rust/                  Cargo workspace: netcore (sans-IO protocol engine, no god
 addons/gdnet/          gdnet.gdextension + bin/<platform>/ (built, ignored) + addon assets (WP8: meter.tscn/.gd)
 docs/guide/            the gdnet user guide, one page per topic (01_sessions.md, ...)
 demos/                 instructional demos, each a worked example with a README whose code listings a
-                       test diffs against the files (WP13: doors/ = players travelling between levels;
+                       test diffs against the files (WP13/WP16: doors/ = a 2 x 2 chunk overworld,
+                       interiors behind doors, torches with a radius, a chest that keeps its state;
                        WP14: ballpit/ = hundreds of RigidBody2D balls, priority and the byte budget)
 check.toml             the check's stages, tiers, budget and cache settings
 tools/check.py         the one command to verify the project (the tdd-project kit's, language-agnostic;

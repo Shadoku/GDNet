@@ -1052,8 +1052,11 @@ mod session_tests {
                     .collect();
                 let a = t as f64 * 25.0;
                 let b = 800.0 - t as f64 * 20.0;
-                w.server
-                    .interest_update(&positions, &[(2, [a, 0.0, 0.0]), (3, [b, 0.0, 0.0])], w.now);
+                w.server.interest_update(
+                    &positions,
+                    &[(2, [a, 0.0, 0.0]), (3, [b, 0.0, 0.0])],
+                    w.now,
+                );
                 match t {
                     5 => w.server.set_visible(
                         children[1],

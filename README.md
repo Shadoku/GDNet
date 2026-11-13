@@ -25,8 +25,9 @@ single-player Godot scene multiplayer by placing it under one `NetManager` node.
 enrolled: scene instances become networked entities, and their transforms, physics velocities, animation
 state, visibility and exported variables replicate from inferred per-class profiles, with remote copies
 interpolated. Underneath are server authority, client prediction with rollback, most-recent-state deltas
-under a bandwidth budget, typed calls with return values, rooms and travel between levels, and
-diagnostics (a meter, network emulation, per-tick hashes, an ownership overlay).
+under a bandwidth budget, typed calls with return values, rooms and travel between levels (chunk
+overworlds, placed interiors, levels that keep their state), interest by distance and per-peer
+visibility, and diagnostics (a meter, network emulation, per-tick hashes, an ownership overlay).
 
 The escalation ladder (`docs/PLAN_NETCODE.md` section 1); most games stop at rung 2:
 
@@ -40,7 +41,8 @@ The escalation ladder (`docs/PLAN_NETCODE.md` section 1); most games stop at run
 minutes the first time), imports, runs the Rust and GDScript tests, lint and a smoke test; it ends with
 `CHECK: PASS`. Then try the two demos, each a tutorial whose README is the walkthrough:
 
-* `demos/doors/` (players travelling between levels) and `demos/ballpit/` (300 colliding `RigidBody2D`
+* `demos/doors/` (a 2 x 2 chunk overworld walked across without a transition, interiors behind doors,
+  torches with a radius, a chest that stays open) and `demos/ballpit/` (300 colliding `RigidBody2D`
   balls, priority and the byte budget). Open the demo's `main.tscn` and press *Run Current Scene* (F6);
   choose **Offline**, **Host** or **Join**.
 * Host and clients on one machine: *Debug > Customize Run Instances...*, enable *Enable Multiple
@@ -54,9 +56,11 @@ one page per topic). The design, work packages, decisions and status are `docs/P
 section 10 is the status table, section 11 the known limits); the research behind it is
 `docs/reports/Rust GDExtension multiplayer design.md` and `docs/research_notes/`.
 
-**Status.** v1 is built (WP0-WP8, WP13, WP14, and the review of 2026-11-08). Not started: WP9 (lag
-compensation), WP10 (a native renet peer), WP11 (the web build and demo), WP12 (an optional deterministic
-mode) and WP15 (cooperative physics ownership).
+**Status.** v1 is built (WP0-WP8, WP13, WP14, and the review of 2026-11-08), and of v2 (the plan's
+section 12) WP16: interest by radius, `visible_to`, `audience` and `visibility_filter`; several rooms per
+peer, level placement and level state. Next is WP17 (seats and rejoining). Not started: WP9 (lag
+compensation), WP10 (a native renet peer), WP11 (the web build and demo, scheduled with WP17), WP12 (an
+optional deterministic mode), WP17-WP22; WP15 became WP19's `handoff` mode.
 
 **Versions.** Godot 4.6 (pinned in `.godot-version`; the extension declares `compatibility_minimum = 4.3`
 and is built against gdext 0.5.5's `api-4-3`), Rust stable (developed on 1.97), gdext (`godot` crate)

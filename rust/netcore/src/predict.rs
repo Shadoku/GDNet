@@ -304,7 +304,10 @@ impl Prediction {
         // compared at that first tick when no entity has a record at the confirmed tick: an idle
         // server sends no newer snapshot, and the mirror holds its latest values.
         let max = self.max_ticks as usize;
-        let checked = self.tracked.values().filter(|t| t.policy != Policy::Disabled);
+        let checked = self
+            .tracked
+            .values()
+            .filter(|t| t.policy != Policy::Disabled);
         if checked.clone().all(|t| t.at(tick).is_none()) {
             if let Some(start) = checked
                 .filter(|t| t.history.len() < max)

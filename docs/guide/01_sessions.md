@@ -158,7 +158,13 @@ dedicated server.
   it unchanged).
 - `NetPipePeer`: `set_emulation(e)` / `get_emulation()` (applied at this end: `send_*` to what it sends,
   `receive_*` to what it receives), `in_flight()` (packets its emulators hold), and the counters
-  `bytes_sent()`, `packets_sent()`, `bytes_received()`, `packets_received()`.
+  `bytes_sent()`, `packets_sent()`, `bytes_received()`, `packets_received()`. The test hook
+  `_debug_watch(bytes)` scans every packet this end receives for those bytes at any bit offset;
+  `_debug_watch_hits()` and `_debug_watch_scanned()` count the packets that held them and the packets
+  scanned (gate G9 uses it to show an `audience: owner` value never reaches another peer).
+- Project settings for rooms and interest (pages 9 and 11): `gdnet/levels/empty_timeout_s` (default 30),
+  `gdnet/levels/spacing` (default 0 = levels keep their authored place), `gdnet/levels/keep_state`
+  (default true), `gdnet/interest/filter_every_ticks` (default 6).
 - `NetManager.get_managed_root()`: the node whose subtree it manages (itself, or the node given to
   `Net.manage()`).
 - `NetVersion`: `version()` (the gdnet crate) and `core_version()` (netcore; equal in a consistent build).

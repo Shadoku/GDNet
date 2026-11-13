@@ -598,10 +598,7 @@ pub fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
     }
     (0..=total - n).any(|offset| {
         let mut r = BitReader::new(hay);
-        r.skip(offset).is_some()
-            && needle
-                .iter()
-                .all(|b| r.read_bits(8) == Some(u64::from(*b)))
+        r.skip(offset).is_some() && needle.iter().all(|b| r.read_bits(8) == Some(u64::from(*b)))
     })
 }
 

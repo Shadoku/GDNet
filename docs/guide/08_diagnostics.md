@@ -35,7 +35,10 @@ first session in the tree (set `meter.session` to choose one, e.g. a test branch
 | poll | `poll_ms`, `poll_ms_avg`: what reading the hot and cold properties cost (page 3, "Dirty tracking") |
 | hashes | `hashes_sent`, `hashes_received`, `divergences`, `divergences_per_s` |
 | authority | `owner_changes`, `writes_rejected` (page 7) |
-| rooms | `room` (a client's), `rooms` (entities per room), `travelling` (page 9) |
+| rooms | `room` (this peer's primary room; on the server the host player's) and `+N` for the other rooms in `my_rooms`, `rooms` (entities per room), `levels`, `travelling` (page 9): `room chunk_0_0 +3  [chunk_0_0 7, ...]  levels 4  travelling 0` |
+
+Interest has no line of its own; its keys are in `stats()` (page 11): `interest_passes`, `interest_ms`,
+`interest_ms_avg`, `filter_evaluations`, `radius_entities`, `radius_changes`.
 
 Byte counts are what gdnet handed to the transport: `SceneMultiplayer` adds one byte per raw packet,
 which a `NetPipePeer`'s `bytes_sent()` / `bytes_received()` include (`packets_sent()` /
