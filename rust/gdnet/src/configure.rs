@@ -9,9 +9,9 @@
 //!
 //! Keys: `state: ["+prop", "-prop", "+Part:prop"]`, `quantize: {prop: "cm"}`, `send: {prop: "hot"}`,
 //! `tolerance: float | {prop: float}`, `interpolate: bool | {prop: bool}`, WP5 `teleport_distance: float |
-//! {prop: float}` (table changes); `priority`
-//! (per entity, any time); anything else (`radius`, `lag_compensated`, ...) is kept for later packages
-//! in the root's `_net_config` meta.
+//! {prop: float}`, WP16 `audience: {prop: "owner" | "all"}` (table changes); `priority`, WP16 `radius`
+//! and `visible_to` (per entity, any time: interest.rs); anything else (`lag_compensated`, ...) is
+//! kept for later packages in the root's `_net_config` meta.
 
 use netcore::{Quant, Schedule};
 use std::cell::RefCell;
@@ -32,6 +32,8 @@ pub enum Op {
     Interpolate(Option<PropPath>, bool),
     /// WP5: the teleport distance (None = every property).
     Teleport(Option<PropPath>, f32),
+    /// WP16: who receives the property (`audience: {prop: "owner"}`).
+    Audience(PropPath, netcore::Audience),
 }
 
 thread_local! {

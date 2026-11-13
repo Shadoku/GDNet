@@ -149,6 +149,33 @@ impl Schedule {
     }
 }
 
+/// WP16: who receives a property's value (docs/PLAN_NETCODE.md 12.2 "Visibility").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Audience {
+    /// Every peer that has the entity.
+    #[default]
+    All,
+    /// Only the entity's owner (and the server); other peers keep the scene's value.
+    Owner,
+}
+
+impl Audience {
+    pub fn parse(s: &str) -> Option<Audience> {
+        match s {
+            "all" => Some(Audience::All),
+            "owner" => Some(Audience::Owner),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Audience::All => "all",
+            Audience::Owner => "owner",
+        }
+    }
+}
+
 /// One replicated property.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PropDesc {
@@ -168,6 +195,9 @@ pub struct PropDesc {
     /// `gdnet/interpolation/teleport_distance`, else automatic: see `interp::Params`).
     #[serde(default)]
     pub teleport_distance: f32,
+    /// WP16: `Owner` sends the value to the entity's owner only.
+    #[serde(default)]
+    pub audience: Audience,
 }
 
 // Tolerances are compared bit for bit: a table is equal only when both sides wrote the same numbers.
@@ -186,7 +216,13 @@ impl PropDesc {
             reliable: false,
             slow_ticks: 0,
             teleport_distance: 0.0,
+            audience: Audience::All,
         }
+    }
+
+    /// WP16: only the entity's owner receives this property.
+    pub fn owner_only(&self) -> bool {
+        self.audience == Audience::Owner
     }
 
     pub fn hot(mut self, quant: Quant) -> Self {
@@ -198,7 +234,7 @@ impl PropDesc {
     /// A readable description (mismatch reasons).
     pub fn describe(&self) -> String {
         std::format!(
-            "{}: {} {} {}{}{} tolerance {}{}{}",
+            "{}: {} {} {}{}{} tolerance {}{}{}{}",
             self.name,
             self.ty.name(),
             self.schedule.name(),
@@ -219,6 +255,11 @@ impl PropDesc {
                 std::format!(" teleport {}", self.teleport_distance)
             } else {
                 String::new()
+            },
+            if self.owner_only() {
+                " audience owner"
+            } else {
+                ""
             }
         )
     }
@@ -239,6 +280,10 @@ impl PropDesc {
         if self.teleport_distance > 0.0 {
             out.extend_from_slice(b"teleport");
             out.extend_from_slice(&self.teleport_distance.to_bits().to_le_bytes());
+        }
+        // WP16: tables without an `audience: owner` property hash as before.
+        if self.owner_only() {
+            out.extend_from_slice(b"audience owner");
         }
     }
 }

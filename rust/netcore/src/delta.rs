@@ -349,6 +349,12 @@ impl Replication {
 
     /// The entity's every recorded field as a header-less entry (decoded by [`Replication::decode_state`]).
     pub fn encode_full(&self, id: NetId) -> Vec<u8> {
+        self.encode_full_for(id, true)
+    }
+
+    /// WP16: [`Replication::encode_full`] for one receiver: without the `audience: owner` fields
+    /// unless `owner` (the receiver owns the entity).
+    pub fn encode_full_for(&self, id: NetId, owner: bool) -> Vec<u8> {
         let Some(state) = self.entities.get(&id) else {
             return Vec::new();
         };
@@ -358,9 +364,9 @@ impl Replication {
         let mut fields = Vec::new();
         let mut flat = 0usize;
         for (p, part) in table.parts.iter().enumerate() {
-            for f in 0..part.len() {
+            for (f, d) in part.iter().enumerate() {
                 let fs = &state.fields[flat];
-                if fs.version != 0 {
+                if fs.version != 0 && (owner || !d.owner_only()) {
                     fields.push((p as u16, f as u16, &fs.enc));
                 }
                 flat += 1;
@@ -414,9 +420,13 @@ impl Replication {
     }
 
     /// WP8: true when a field takes part in hash telemetry: hot, not reliable, and small enough for a
-    /// snapshot (what a client receives in snapshots every tick it changes).
+    /// snapshot (what a client receives in snapshots every tick it changes). WP16: never an
+    /// `audience: owner` field (only some peers hold its value).
     pub fn hashed(d: &crate::props::PropDesc, enc: &Encoded) -> bool {
-        d.schedule == crate::props::Schedule::Hot && !d.reliable && enc.byte_len() <= RELIABLE_BYTES
+        d.schedule == crate::props::Schedule::Hot
+            && !d.reliable
+            && !d.owner_only()
+            && enc.byte_len() <= RELIABLE_BYTES
     }
 
     /// WP8: the hash of `id`'s recorded hot fields (their quantised encodings, see crate::hash); None
@@ -505,13 +515,23 @@ impl Replication {
         self.peers.remove(&peer);
     }
 
-    /// The peer received `id`'s full state reliably (a `Create`): it holds every current version.
-    pub fn mark_synced(&mut self, peer: PeerId, id: NetId) {
+    /// The peer received `id`'s full state reliably (a `Create`): it holds every current version. WP16:
+    /// unless `owner`, the `audience: owner` fields were left out ([`Replication::encode_full_for`]):
+    /// the peer holds none of them, so they become pending the moment it owns the entity.
+    pub fn mark_synced(&mut self, peer: PeerId, id: NetId, owner: bool) {
         let Some(state) = self.entities.get(&id) else {
             return;
         };
         let Some(p) = self.peers.get_mut(&peer) else {
             return;
+        };
+        let masked = if owner {
+            Vec::new()
+        } else {
+            self.tables
+                .get(&state.scene)
+                .map(|t| t.parts.iter().flatten().map(|d| d.owner_only()).collect())
+                .unwrap_or_default()
         };
         let pe = p
             .entities
@@ -519,8 +539,13 @@ impl Replication {
             .or_insert_with(|| PeerEntity::new(state.fields.len()));
         pe.fit(state.fields.len());
         for (i, fs) in state.fields.iter().enumerate() {
-            pe.acked[i] = fs.version;
-            pe.sent[i] = fs.version;
+            let v = if masked.get(i).copied().unwrap_or(false) {
+                0
+            } else {
+                fs.version
+            };
+            pe.acked[i] = v;
+            pe.sent[i] = v;
         }
     }
 
@@ -656,12 +681,15 @@ impl Replication {
                 .entry(id)
                 .or_insert_with(|| PeerEntity::new(state.fields.len()));
             pe.fit(state.fields.len());
+            let owned = owner_of(id) == Some(peer);
             let mut any = 0usize;
             let mut flat = 0usize;
             for (pi, part) in table.parts.iter().enumerate() {
                 for (fi, d) in part.iter().enumerate() {
                     let fs = &state.fields[flat];
+                    // WP16: an `audience: owner` field never goes to another peer.
                     let pending = fs.version != 0
+                        && (owned || !d.owner_only())
                         && fs.version != pe.acked[flat]
                         && fs.version != pe.sent[flat];
                     if pending {
@@ -685,7 +713,6 @@ impl Replication {
                 }
             }
             if any > 0 {
-                let owned = owner_of(id) == Some(peer);
                 pe.accum += priority::weight(owned, pe.interacting, state.priority);
                 cands.push((id, pe.accum, any));
             }
@@ -727,13 +754,15 @@ impl Replication {
                 continue;
             };
             // The pending fields, in order, as many as fit.
+            let owned = owner_of(id) == Some(peer);
             let mut chosen: Vec<(u16, u16, u32)> = Vec::new();
             let mut flats: Vec<usize> = Vec::new();
             let mut flat = 0usize;
             'parts: for (pi, part) in table.parts.iter().enumerate() {
-                for fi in 0..part.len() {
+                for (fi, d) in part.iter().enumerate() {
                     let fs = &state.fields[flat];
                     let pending = fs.version != 0
+                        && (owned || !d.owner_only())
                         && fs.version != pe.acked[flat]
                         && fs.version != pe.sent[flat];
                     if pending {
@@ -1035,7 +1064,7 @@ mod tests {
         ];
         for id in 1..=n {
             r.add_entity(id, BODY, &init, 0);
-            r.mark_synced(2, id);
+            r.mark_synced(2, id, false);
         }
         r
     }
@@ -1408,7 +1437,7 @@ mod tests {
         assert_eq!(decoded[0], (0, 0, Value::Vector2([12.5, 0.0])));
         assert_eq!(decoded[3], (1, 0, Value::Str("a".into())));
         assert_eq!(r.pending_count(2, 5), 4);
-        r.mark_synced(2, 5);
+        r.mark_synced(2, 5, false);
         assert_eq!(r.pending_count(2, 5), 0);
         assert!(build(&mut r, 1, 32_768).snapshot.is_none());
         // A burst later reproduces the current state.

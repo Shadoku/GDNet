@@ -82,7 +82,7 @@ const HOOKS: [(&str, &str); 6] = [
 #[class(init, base = Node)]
 pub struct NetSession {
     base: Base<Node>,
-    core: Option<Session>,
+    pub(crate) core: Option<Session>,
     api: Option<Gd<NetMultiplayerApi>>,
     inner: Option<Gd<SceneMultiplayer>>,
     peer: Option<Gd<MultiplayerPeer>>,
@@ -169,6 +169,8 @@ pub struct NetSession {
     #[var(get = get_hash_sample, set = set_hash_sample)]
     #[init(val = -1)]
     hash_sample: i64,
+    /// WP16, server: radius roots, filters and focus nodes (interest.rs).
+    pub(crate) interest: crate::interest::State,
 }
 
 /// WP8: the group every session joins (the overlay and the meter find sessions through it).
@@ -804,6 +806,8 @@ impl NetSession {
         }
         // WP8.
         self.diagnostics_into(&mut d);
+        // WP16.
+        crate::interest::stats_into(self, &mut d);
         d
     }
 
@@ -1346,6 +1350,8 @@ impl NetSession {
             self.stats.poll_us_window += us;
             self.stats.record_calls += 1;
             self.interaction_pass();
+            // WP16: filters and radius interest, before this tick's snapshots.
+            crate::interest::pass(self);
         }
         if !self.is_server() && self.is_connected() {
             // WP4: the owner records its predicted entities' hot state and queues its sampled frames.

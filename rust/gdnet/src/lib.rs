@@ -16,6 +16,7 @@ mod entity_node;
 mod hash;
 mod infer;
 mod input;
+mod interest;
 mod interp;
 mod keyed;
 mod manager;

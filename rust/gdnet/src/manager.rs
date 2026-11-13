@@ -212,6 +212,12 @@ pub struct NetManager {
     /// `input_actions` narrows it per entity.
     #[export]
     input_actions: PackedStringArray,
+    /// WP16 (12.2): the default radius of this manager's topmost entities: a peer has such an entity
+    /// only while it is within this distance of the peer's focus (its player, or `Net.set_focus`), and
+    /// loses it beyond 1.2 times it. Pixels in 2D, metres in 3D. 0: unlimited. A `NetEntity.radius`
+    /// overrides it per entity.
+    #[export]
+    radius: f64,
     actions_cache: HashMap<String, Rc<ActionTable>>,
     profiles_cache: Option<(usize, Rc<Profiles>)>,
     runtime: HashMap<usize, Rc<RuntimeProps>>,
@@ -855,8 +861,16 @@ impl NetManager {
                 }
                 if proposal {
                     let mut s = session.clone();
-                    s.bind_mut()
-                        .with_core(|c, now| c.accept_create(create.id, now));
+                    // WP16: the server's interest rules for a client's spawn, before it is shared.
+                    let top = create.parent.entity == MANAGER_ROOT;
+                    let (interest, filter) = crate::interest::spawn_spec(&node, top, self);
+                    let tracked = interest.radius > 0.0;
+                    let mut b = s.bind_mut();
+                    b.with_core(|c, now| {
+                        c.set_interest(create.id, &interest, now);
+                        c.accept_create(create.id, now)
+                    });
+                    b.interest.track(create.id, &node, tracked, filter);
                 }
                 let info = self.info(create.id, create.owner);
                 self.spawned_callbacks(&node, &scene, info, session);
@@ -1224,9 +1238,14 @@ impl NetManager {
                 2 => netcore::PlayerMark::Always,
                 _ => netcore::PlayerMark::No,
             };
+            // WP16: radius, visible_to and the filter, before anyone is sent the entity.
+            let (interest, filter) =
+                crate::interest::spawn_spec(&node, parent.entity == MANAGER_ROOT, self);
+            let tracked = interest.radius > 0.0;
             let result = s.bind_mut().with_core(|c, now| {
                 let spec = Spawn::new(parent, &name, owner, scene.part_count(), Vec::new())
-                    .with_authority(transfer, client_owned);
+                    .with_authority(transfer, client_owned)
+                    .with_interest(interest);
                 let spec = if inherit {
                     spec.inheriting_owner()
                 } else {
@@ -1258,6 +1277,9 @@ impl NetManager {
                         e.transfer = transfer;
                     }
                     self.by_id.insert(id, iid);
+                    if self.is_server {
+                        s.bind_mut().interest.track(id, &node, tracked, filter);
+                    }
                     set_net_entity(&node, Some(owner), Some(id));
                     set_net_entity_authority(&node, transfer, client_owned);
                     let info = self.info(id, owner);
@@ -2817,6 +2839,11 @@ impl NetManager {
     /// WP14: the `interaction_radius` property (0 = the project setting).
     pub fn interaction_radius_setting(&self) -> f64 {
         self.interaction_radius
+    }
+
+    /// WP16: the `radius` property (0 = unlimited).
+    pub fn radius_setting(&self) -> f64 {
+        self.radius
     }
 
     /// WP14: every spawned entity's id and root node, in enrolment order.
