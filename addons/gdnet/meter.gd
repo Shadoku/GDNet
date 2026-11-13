@@ -83,15 +83,23 @@ func refresh() -> void:
 	_put("rooms", _rooms_text(d))
 
 
-## WP13: the local room (a client's), the entities per room, and a travel in flight.
+## WP13/WP16: this peer's room and how many more it has (neighbours, added rooms), the entities per
+## room, and the travels in flight.
 func _rooms_text(d: Dictionary) -> String:
 	var parts: PackedStringArray = []
 	var rooms: Dictionary = d.get("rooms", {})
 	for room: String in rooms:
-		parts.append("%s %d" % [room.get_file().get_basename() if room.begins_with("res://") else room, rooms[room]])
+		parts.append("%s %d" % [_short(room), rooms[room]])
 	var here: String = d.get("room", "")
-	var head := "room %s" % (here.get_file().get_basename() if not here.is_empty() else "-")
-	return "%s  [%s]  travelling %d" % [head, ", ".join(parts), d.get("travelling", 0)]
+	var head := "room %s" % (_short(here) if not here.is_empty() else "-")
+	var more: int = (d.get("my_rooms", PackedStringArray()) as PackedStringArray).size() - (0 if here.is_empty() else 1)
+	if more > 0:
+		head += " +%d" % more
+	return "%s  [%s]  levels %d  travelling %d" % [head, ", ".join(parts), d.get("levels", 0), d.get("travelling", 0)]
+
+
+func _short(room: String) -> String:
+	return room.get_file().get_basename() if room.begins_with("res://") else room
 
 
 ## Every label's text, one per line (for tests and tools).

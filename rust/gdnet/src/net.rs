@@ -1022,7 +1022,7 @@ impl Net {
     }
 
     /// WP13 (2.11), server: sends the entity `player` belongs to into the level `scene_path`, at the
-    /// node named `spawn_point` inside it (else the level's origin). The level is loaded under the World
+    /// node named `spawn_point` inside it (WP16: without one it keeps its global position). The level is loaded under the World
     /// if needed; the player's client loads it too and frees its previous level. Applied at the next
     /// tick, so it is safe from a physics callback (a door's `body_entered`). Works in any branch.
     #[func]
@@ -1041,15 +1041,68 @@ impl Net {
         }
     }
 
-    /// WP13, server: loads a level under the World of `Net`'s session (see `NetSession.load_level`).
+    /// WP13/WP16, server: loads a level under the World of `Net`'s session, at `origin` (a `Vector2`
+    /// or `Vector3`; null: the next grid cell with `gdnet/levels/spacing`, else where it was
+    /// authored). See `NetSession.load_level`.
     #[func]
-    fn load_level(&mut self, scene_path: GString) -> Option<Gd<Node>> {
+    fn load_level(
+        &mut self,
+        scene_path: GString,
+        #[opt(default = net_call::NetArg::absent())] origin: NetArg,
+    ) -> Option<Gd<Node>> {
         let Some(mut s) = self.session.clone() else {
             godot_error!("gdnet: Net.load_level needs a session (host, join or offline first)");
             return None;
         };
-        let level = s.bind_mut().load_level(scene_path);
+        let level = s.bind_mut().load_level(scene_path, origin);
         level
+    }
+
+    /// WP16: the origin `Net`'s session placed a loaded level at (null: authored position).
+    #[func]
+    fn level_origin(&mut self, scene_path: GString) -> Variant {
+        let Some(mut s) = self.session.clone() else {
+            return Variant::nil();
+        };
+        let o = s.bind_mut().level_origin(scene_path);
+        o
+    }
+
+    /// WP16, server: peer `peer` also sees room `name`; its client loads the room's level (see
+    /// `NetSession.add_room`).
+    #[func]
+    fn add_room(&mut self, peer: i64, name: GString) -> bool {
+        let Some(mut s) = self.session.clone() else {
+            return false;
+        };
+        let done = s.bind_mut().add_room(peer, name);
+        done
+    }
+
+    /// WP16, server: undoes `add_room`.
+    #[func]
+    fn remove_room(&mut self, peer: i64, name: GString) -> bool {
+        let Some(mut s) = self.session.clone() else {
+            return false;
+        };
+        let done = s.bind_mut().remove_room(peer, name);
+        done
+    }
+
+    /// WP16: every room of `peer` (see `NetSession.rooms`).
+    #[func]
+    fn rooms(&self, peer: i64) -> PackedStringArray {
+        self.session
+            .clone()
+            .map_or_else(PackedStringArray::new, |s| s.bind().rooms(peer))
+    }
+
+    /// WP13: the primary room of `peer` (see `NetSession.room_of`).
+    #[func]
+    fn room_of(&self, peer: i64) -> GString {
+        self.session
+            .clone()
+            .map_or_else(GString::new, |s| s.bind().room_of(peer))
     }
 
     /// WP13: frees a level `Net`'s session loaded.

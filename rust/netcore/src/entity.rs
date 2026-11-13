@@ -172,10 +172,17 @@ pub enum EntityAction {
         id: NetId,
         granted: bool,
     },
-    /// WP13, server to a client: the client's room becomes `room`, a level: load `scene_path` (under
-    /// the game's World node) before the actions that follow, then answer `TravelAck`.
+    /// WP13/WP16, server to a client: `room`, a level, joined the client's set of rooms: load
+    /// `scene_path` (under the game's World node, its root at `origin`, else where it was authored)
+    /// before the actions that follow, then answer `TravelAck`.
     Travel {
         scene_path: String,
+        room: String,
+        origin: Option<crate::rooms::Origin>,
+    },
+    /// WP16, server to a client: `room`, a level, left the client's set of rooms (after the `Scope`
+    /// leave of its entities): the client frees that level once nothing it owns is in it.
+    RoomLeft {
         room: String,
     },
     /// WP13, client to server: the level of `room` (its hash) is loaded.
@@ -200,6 +207,7 @@ impl EntityAction {
             EntityAction::Scene { .. }
             | EntityAction::Travel { .. }
             | EntityAction::TravelAck { .. }
+            | EntityAction::RoomLeft { .. }
             | EntityAction::Scope { .. } => None,
             EntityAction::Create(c) => Some(c.id),
             EntityAction::Destroy { id }
@@ -221,6 +229,7 @@ impl EntityAction {
             EntityAction::Scene { .. }
             | EntityAction::Travel { .. }
             | EntityAction::TravelAck { .. }
+            | EntityAction::RoomLeft { .. }
             | EntityAction::Scope { .. } => (None, None),
             EntityAction::Create(c) => (None, parent(&c.parent)),
             EntityAction::Destroy { id }

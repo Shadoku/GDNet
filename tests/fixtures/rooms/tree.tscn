@@ -1,0 +1,7 @@
+[gd_scene format=3]
+
+[node name="Tree" type="Node2D"]
+
+[node name="Crown" type="Polygon2D" parent="."]
+color = Color(0.2, 0.6, 0.25, 1)
+polygon = PackedVector2Array(0, -16, 12, 8, -12, 8)

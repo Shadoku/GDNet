@@ -1,0 +1,27 @@
+[gd_scene format=3]
+
+[ext_resource type="PackedScene" path="res://tests/fixtures/rooms/tree.tscn" id="1_tree"]
+[ext_resource type="PackedScene" path="res://tests/fixtures/rooms/crate.tscn" id="2_crate"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_floor"]
+size = Vector2(400, 20)
+
+[node name="InteriorB" type="Node2D"]
+
+[node name="Floor" type="StaticBody2D" parent="."]
+position = Vector2(0, 100)
+collision_layer = 1
+collision_mask = 0
+
+[node name="Shape" type="CollisionShape2D" parent="Floor"]
+shape = SubResource("RectangleShape2D_floor")
+
+[node name="NetManager" type="NetManager" parent="."]
+
+[node name="Lamp" parent="NetManager" instance=ExtResource("1_tree")]
+position = Vector2(-100, -50)
+
+[node name="Crate" parent="NetManager" instance=ExtResource("2_crate")]
+
+[node name="Entrance" type="Marker2D" parent="."]
+position = Vector2(50, 20)

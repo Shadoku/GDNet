@@ -1,0 +1,15 @@
+[gd_scene format=3]
+
+[ext_resource type="PackedScene" path="res://tests/fixtures/rooms/tree.tscn" id="1_tree"]
+
+[node name="ChunkA" type="Node2D"]
+
+[node name="NetManager" type="NetManager" parent="."]
+neighbours = PackedStringArray("res://tests/fixtures/rooms/chunk_b.tscn")
+auto_travel = true
+bounds = Rect2(-500, -300, 1000, 600)
+
+[node name="TreeA" parent="NetManager" instance=ExtResource("1_tree")]
+position = Vector2(0, -200)
+
+[node name="Entrance" type="Marker2D" parent="."]

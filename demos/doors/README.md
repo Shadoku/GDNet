@@ -340,11 +340,13 @@ spawn_point)` sends that player to the other level. The call is queued and appli
 tick, so it is safe inside `body_entered` (moving a physics body inside a physics callback is refused by
 the engine). On the server gdnet loads the target level if it is not loaded, moves the player under its
 `NetManager` at the marker named `spawn_point`, and tells the player's client to load that level; the
-client acknowledges, applies the move once the level is there, and frees its previous level once none of
-its entities remain in it. Other peers stop or start seeing the player as it leaves or enters their room.
+client acknowledges, applies the move once the level is there, and frees its previous level when the
+server says the player left that room (and none of its entities remain in it). Other peers stop or start
+seeing the player as it leaves or enters their room.
 
 The level check matters on a server that holds several levels: they all share one physics space (they
-overlap at the origin), so a door ignores players of other levels. `multiplayer.is_server()` is Godot's own
+overlap at the origin unless the project setting `gdnet/levels/spacing` places them apart, see
+`docs/guide/09_rooms_and_travel.md`), so a door ignores players of other levels. `multiplayer.is_server()` is Godot's own
 query; it is false on every client.
 
 ```gdscript file=demos/doors/door.gd

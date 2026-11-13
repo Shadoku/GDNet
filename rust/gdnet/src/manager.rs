@@ -197,6 +197,23 @@ pub struct NetManager {
     /// (its owner's `scene_file_path`), else its path relative to the session's branch.
     #[export]
     room: GString,
+    /// WP16 (12.2): rooms a peer whose player is in this manager's room also sees (and whose levels
+    /// its client keeps loaded): the chunks next to this one. Room names; a level's room is its scene
+    /// path, and the server loads a named level that is not loaded yet. A level whose manager names
+    /// neighbours keeps the position it was authored at (`gdnet/levels/spacing` does not move it).
+    #[export]
+    neighbours: PackedStringArray,
+    /// WP16: on the server, a player entity that walks into this manager's `bounds` (and out of its
+    /// own manager's) travels here by itself, keeping its position.
+    #[export]
+    auto_travel: bool,
+    /// WP16: the area of this manager's room in 2D, in the coordinates of its level's root (so it moves
+    /// with the level's origin). Empty: none.
+    #[export]
+    bounds: Rect2,
+    /// WP16: the same for a 3D level. Empty: none.
+    #[export]
+    bounds_3d: Aabb,
     /// WP14 (2.11): the entities of this manager within this distance of a peer's player count as
     /// interacting with that peer (priority weight 100 instead of 1), in the entities' units (pixels in
     /// 2D, metres in 3D). 0: the project setting `gdnet/budget/interaction_radius` (300 px, 3 m in 3D);
@@ -701,8 +718,8 @@ impl NetManager {
 
     fn apply_event(&mut self, session: &Gd<NetSession>, key: u64, salt: u64, ev: EntityEvent) {
         match ev {
-            // WP13: handled by the session (travel.rs) before routing.
-            EntityEvent::Travel { .. } => {}
+            // WP13/WP16: handled by the session (travel.rs) before routing.
+            EntityEvent::Travel { .. } | EntityEvent::RoomLeft { .. } => {}
             EntityEvent::Call(ci) => self.on_call(session, ci),
             EntityEvent::Create {
                 create,
@@ -2741,6 +2758,46 @@ impl NetManager {
             .filter(|p| !p.is_empty())
     }
 
+    /// WP16: the `neighbours` property.
+    pub fn neighbours_setting(&self) -> Vec<String> {
+        self.neighbours
+            .as_slice()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// WP16: whether a player inside `bounds` / `bounds_3d` travels here by itself.
+    pub fn auto_travel_setting(&self) -> bool {
+        self.auto_travel
+    }
+
+    /// WP16: whether the global point `p` (a `Vector2` or `Vector3`) is inside this manager's bounds
+    /// (in its level's coordinates). None when the manager has no bounds of that kind.
+    pub fn bounds_contain(&self, p: &Variant) -> Option<bool> {
+        let me: Gd<Node> = self.to_gd().upcast();
+        if let Ok(p) = p.try_to::<Vector2>() {
+            if self.bounds.size.x <= 0.0 || self.bounds.size.y <= 0.0 {
+                return None;
+            }
+            return Some(
+                self.bounds
+                    .contains_point(crate::world::to_level_local_2d(&me, p)),
+            );
+        }
+        if let Ok(p) = p.try_to::<Vector3>() {
+            let s = self.bounds_3d.size;
+            if s.x <= 0.0 || s.y <= 0.0 || s.z <= 0.0 {
+                return None;
+            }
+            return Some(
+                self.bounds_3d
+                    .contains_point(crate::world::to_level_local_3d(&me, p)),
+            );
+        }
+        None
+    }
+
     /// Takes the entries of the entity rooted at `root` and of the entities below it out of this
     /// manager (nothing is announced). None when `root` is not a spawned entity here.
     pub fn take_entries(&mut self, root: &Gd<Node>) -> Option<MovedEntries> {
@@ -2774,10 +2831,16 @@ impl NetManager {
     }
 
     /// Adopts entries another manager gave up: the root hangs under `parent` now, the entities below
-    /// it follow to this manager. Prediction restarts (the owner re-tracks at the next tick).
+    /// it follow to this manager. With `restart`, prediction restarts (the owner re-tracks at the next
+    /// tick); without it (WP16: a move whose position is continuous) prediction keeps running.
     /// `generation` is the session's: a manager loaded this tick has not synced yet and would otherwise
     /// treat the moved ids as a previous session's.
-    pub fn put_entries(&mut self, moved: MovedEntries, generation: u64) -> Vec<NetId> {
+    pub fn put_entries(
+        &mut self,
+        moved: MovedEntries,
+        generation: u64,
+        restart: bool,
+    ) -> Vec<NetId> {
         self.generation = generation;
         let me = self.to_gd().instance_id().to_i64();
         let mut ids = Vec::new();
@@ -2785,7 +2848,9 @@ impl NetManager {
             if iid == moved.root {
                 e.parent = None;
             }
-            e.predicted = None;
+            if restart {
+                e.predicted = None;
+            }
             e.dirty = false;
             if let Some(id) = e.id {
                 self.by_id.insert(id, iid);

@@ -55,7 +55,7 @@ pub use keyed::{KeyEvent, KeyMsg, KeyedState, Who};
 pub use peers::{PeerId, SERVER};
 pub use predict::{Policy, Rollback};
 pub use props::{PropDesc, Quant, ScenePropsTable, Schedule, TypeTag, Value};
-pub use rooms::{room_hash, Rooms, GLOBAL};
+pub use rooms::{room_hash, Origin, RoomEntry, Rooms, GLOBAL};
 pub use session::{
     EntityEvent, Event, Outgoing, PlayerMark, Role, ScopeStats, Session, SessionConfig, Spawn,
 };

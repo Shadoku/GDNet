@@ -36,7 +36,7 @@ use crate::keyed::{KeyEvent, KeyMsg, KeyedState, Who};
 use crate::peers::{PeerId, PeerTable, Stage, SERVER};
 use crate::predict::{self, Policy, PredictStats, Prediction, Rollback};
 use crate::props::{PropDesc, ScenePropsTable, Value};
-use crate::rooms::{room_hash, Rooms};
+use crate::rooms::{room_hash, Level, Origin, RoomEntry, RoomSet, Rooms};
 use crate::wire::{
     self, Hello, IdRange, Message, Ping, Pong, Protocol, Reject, Reliability, Welcome,
 };
@@ -123,9 +123,17 @@ pub enum EntityEvent {
         manager: u64,
         granted: bool,
     },
-    /// WP13, client: the server moved this client to `room`, a level: load `scene_path` now (before
-    /// the events that follow), then call [`Session::travel_ack`].
-    Travel { scene_path: String, room: String },
+    /// WP13/WP16, client: `room`, a level, joined this client's rooms: load `scene_path` now (before
+    /// the events that follow; its root at `origin`, else where it was authored), then call
+    /// [`Session::travel_ack`].
+    Travel {
+        scene_path: String,
+        room: String,
+        origin: Option<Origin>,
+    },
+    /// WP16, client: `room` left this client's rooms (its entities left first): free its level once
+    /// nothing this client owns is in it.
+    RoomLeft { room: String },
     /// WP7: a rejected write. On the server: `peer` wrote fields it may not write. On the writer
     /// (`peer` = itself): restore `restore` (the server's last values).
     WriteRejected {
@@ -148,7 +156,7 @@ impl EntityEvent {
             | EntityEvent::OwnerReply { manager, .. }
             | EntityEvent::WriteRejected { manager, .. } => *manager,
             EntityEvent::Call(c) => c.manager,
-            EntityEvent::Travel { .. } => 0,
+            EntityEvent::Travel { .. } | EntityEvent::RoomLeft { .. } => 0,
         }
     }
 }
@@ -272,10 +280,12 @@ struct ScopeState {
     rooms: Rooms,
     /// Server: per peer, the entities it has been sent (its scope).
     known: BTreeMap<PeerId, BTreeSet<NetId>>,
-    /// Server: per peer, the room its scope was last computed for.
-    room_of: BTreeMap<PeerId, Option<u64>>,
-    /// Server: peers sent a `Travel` that have not acknowledged it.
-    travelling: BTreeSet<PeerId>,
+    /// Server: per peer, the rooms its scope was last computed for (WP16: a set).
+    rooms_of: BTreeMap<PeerId, RoomSet>,
+    /// Server: per peer, the level rooms it was sent a `Travel` for (and no `RoomLeft` since).
+    levels_of: BTreeMap<PeerId, BTreeMap<u64, Level>>,
+    /// Server: (peer, room) of each `Travel` not acknowledged yet.
+    travelling: BTreeSet<(PeerId, u64)>,
     stats: ScopeStats,
 }
 
@@ -291,6 +301,9 @@ pub struct ScopeStats {
     /// Client: entities freed because they left this client's scope; `Travel`s received.
     pub freed: u64,
     pub travels_received: u64,
+    /// WP16: `RoomLeft` actions sent (server) and received (client).
+    pub rooms_left: u64,
+    pub rooms_left_received: u64,
 }
 
 /// WP13: which entity [`Spawn`] makes its owner's player (the entity whose manager's room is the
@@ -662,8 +675,9 @@ impl Session {
         }
         self.scenes_sent.remove(&peer);
         self.scope.known.remove(&peer);
-        self.scope.room_of.remove(&peer);
-        self.scope.travelling.remove(&peer);
+        self.scope.rooms_of.remove(&peer);
+        self.scope.levels_of.remove(&peer);
+        self.scope.travelling.retain(|(p, _)| *p != peer);
         self.scope.rooms.forget_peer(peer);
         self.repl.remove_peer(peer);
         self.remote_props.retain(|(p, _), _| *p != peer);
@@ -844,13 +858,13 @@ impl Session {
         self.repl.add_peer(peer, tick);
         // WP3: each create carries the entity's latest full state, and the peer is then known to hold
         // it (netcore keeps the latest values, so the burst reproduces current state). WP13: only the
-        // entities in the peer's scope (all of them unless rooms are strict; its room follows once it
-        // has a player).
+        // entities in the peer's scope (all of them unless rooms are strict; its rooms follow once it
+        // has a player or added rooms, through `refresh_scope`).
         self.scope.known.insert(peer, BTreeSet::new());
-        let room = self.effective_room(peer);
-        self.scope.room_of.insert(peer, room);
+        self.scope.rooms_of.insert(peer, RoomSet::new());
+        let rooms = RoomSet::new();
         for c in self.entities.burst() {
-            if self.wants(peer, c.id, room) {
+            if self.wants(peer, c.id, &rooms) {
                 self.send_create_to(peer, c, now_us);
             }
         }
@@ -1076,6 +1090,7 @@ fn held_description(a: &EntityAction, paths: &BTreeMap<u64, String>) -> String {
         EntityAction::Scene { path, .. } => std::format!("the scene {path}"),
         EntityAction::Travel { room, .. } => std::format!("the travel to room {room}"),
         EntityAction::TravelAck { .. } => String::from("a travel acknowledgement"),
+        EntityAction::RoomLeft { room } => std::format!("leaving room {room}"),
         EntityAction::Scope { leave } => std::format!("a scope change of {} entities", leave.len()),
         EntityAction::Call(c) => std::format!("a call on entity {}", c.entity),
     }
@@ -1499,6 +1514,7 @@ impl Session {
                     | EntityAction::OwnerQuery { .. }
                     | EntityAction::OwnerReply { .. }
                     | EntityAction::Travel { .. }
+                    | EntityAction::RoomLeft { .. }
                     | EntityAction::Scope { .. } => false,
                     // WP13: a client's level is loaded.
                     EntityAction::TravelAck { .. } => true,
@@ -1585,15 +1601,28 @@ impl Session {
                     }
                 }
             }
-            EntityAction::Travel { scene_path, room } => {
+            EntityAction::Travel {
+                scene_path,
+                room,
+                origin,
+            } => {
                 if self.role == Role::Client {
                     self.scope.stats.travels_received += 1;
-                    self.entity_events
-                        .push_back(EntityEvent::Travel { scene_path, room });
+                    self.entity_events.push_back(EntityEvent::Travel {
+                        scene_path,
+                        room,
+                        origin,
+                    });
                 }
             }
-            EntityAction::TravelAck { .. } => {
-                if self.role == Role::Server && self.scope.travelling.remove(&from) {
+            EntityAction::RoomLeft { room } => {
+                if self.role == Role::Client {
+                    self.scope.stats.rooms_left_received += 1;
+                    self.entity_events.push_back(EntityEvent::RoomLeft { room });
+                }
+            }
+            EntityAction::TravelAck { room } => {
+                if self.role == Role::Server && self.scope.travelling.remove(&(from, room)) {
                     self.scope.stats.travel_acks += 1;
                 }
             }
@@ -3390,12 +3419,13 @@ impl Session {
     }
 }
 
-/// Rooms and interest (WP13, rooms.rs): each peer's scope on the server, `Travel`, `Scope` leaves.
+/// Rooms and interest (WP13, WP16, rooms.rs): each peer's scope on the server, `Travel`, `Scope`
+/// leaves, `RoomLeft`.
 impl Session {
-    /// Server: replaces the room table with `rooms` = (manager key, room name, level scene path for a
-    /// manager inside a level). When anything changed every peer's scope is recomputed. A client keeps
-    /// the table for names only.
-    pub fn set_rooms(&mut self, rooms: &[(u64, String, Option<String>)], now_us: u64) -> bool {
+    /// Server: replaces the room table with `rooms` (one entry per manager: its room, the level it
+    /// sits in and that level's origin, its neighbours). When anything changed every peer's scope is
+    /// recomputed. A client keeps the table for names only.
+    pub fn set_rooms(&mut self, rooms: &[RoomEntry], now_us: u64) -> bool {
         let changed = self.scope.rooms.set_managers(rooms);
         if changed {
             self.refresh_all_scopes(now_us);
@@ -3416,7 +3446,7 @@ impl Session {
         self.scope.rooms.strict
     }
 
-    /// Server: `id` is `peer`'s player: the peer's room is the room of the manager holding it.
+    /// Server: `id` is `peer`'s player: the peer's primary room is the room of the manager holding it.
     pub fn set_player(&mut self, peer: PeerId, id: NetId, now_us: u64) -> bool {
         if self.role != Role::Server || !self.entities.contains(id) {
             return false;
@@ -3426,16 +3456,65 @@ impl Session {
         true
     }
 
-    /// Server: `Net.set_room(peer, name)`: the peer's room whatever its player's (`None` removes the
-    /// override).
+    /// Server: `Net.set_room(peer, name)`: the peer's primary room whatever its player's (`None`
+    /// removes the override).
     pub fn set_room(&mut self, peer: PeerId, name: Option<&str>, now_us: u64) {
         self.scope.rooms.set_override(peer, name);
         self.refresh_scope(peer, now_us);
     }
 
-    /// The name of `peer`'s room (server), None without one.
+    /// Server: `Net.add_room(peer, name)`: the peer also sees room `name` (and its client loads the
+    /// room's level). False when it had been added already.
+    pub fn add_room(&mut self, peer: PeerId, name: &str, now_us: u64) -> bool {
+        let added = self.scope.rooms.add_room(peer, name);
+        if added {
+            self.refresh_scope(peer, now_us);
+        }
+        added
+    }
+
+    /// Server: `Net.remove_room(peer, name)` undoes `add_room`. False when it was not added.
+    pub fn remove_room(&mut self, peer: PeerId, name: &str, now_us: u64) -> bool {
+        let removed = self.scope.rooms.remove_room(peer, name);
+        if removed {
+            self.refresh_scope(peer, now_us);
+        }
+        removed
+    }
+
+    /// The name of `peer`'s primary room (server), None without one.
     pub fn peer_room(&self, peer: PeerId) -> Option<String> {
         self.effective_room(peer).map(|r| self.scope.rooms.name(r))
+    }
+
+    /// Server: the names of every room in `peer`'s set, its primary room first.
+    pub fn peer_rooms(&self, peer: PeerId) -> Vec<String> {
+        let primary = self.effective_room(peer);
+        let mut out: Vec<String> = primary
+            .map(|r| self.scope.rooms.name(r))
+            .into_iter()
+            .collect();
+        for r in self.scope_rooms(peer) {
+            if Some(r) != primary {
+                out.push(self.scope.rooms.name(r));
+            }
+        }
+        out
+    }
+
+    /// Server: the names of the rooms in any peer's set (the server's own player included), so gdnet
+    /// keeps their levels loaded and loads the ones no manager registered yet.
+    pub fn wanted_rooms(&self) -> Vec<String> {
+        let mut all = RoomSet::new();
+        for peer in self.scope.rooms.peers() {
+            all.extend(self.scope_rooms(peer));
+        }
+        all.into_iter().map(|r| self.scope.rooms.name(r)).collect()
+    }
+
+    /// Whether a manager registered the room `name`.
+    pub fn room_registered(&self, name: &str) -> bool {
+        self.scope.rooms.is_registered(room_hash(name))
     }
 
     /// The room name of a manager key, None when unregistered.
@@ -3459,7 +3538,7 @@ impl Session {
         }
     }
 
-    /// Server: peers sent a `Travel` that have not acknowledged it yet.
+    /// Server: `Travel`s (one per peer and level) not acknowledged yet.
     pub fn travelling(&self) -> usize {
         self.scope.travelling.len()
     }
@@ -3482,6 +3561,7 @@ impl Session {
         self.role == Role::Client || self.scope.known.get(&peer).is_some_and(|k| k.contains(&id))
     }
 
+    /// A peer's primary room: its override, else its player's manager's room.
     fn effective_room(&self, peer: PeerId) -> Option<u64> {
         if let Some(r) = self.scope.rooms.override_of(peer) {
             return Some(r);
@@ -3491,9 +3571,14 @@ impl Session {
         self.scope.rooms.of_manager(manager)
     }
 
-    /// Whether `peer` (in `room`) should see `id`: its topmost entity is the peer's own, or that
-    /// entity's manager is in a room the peer sees.
-    fn wants(&self, peer: PeerId, id: NetId, room: Option<u64>) -> bool {
+    /// A peer's set of rooms (rooms.rs: the primary room, its neighbours, the added rooms).
+    fn scope_rooms(&self, peer: PeerId) -> RoomSet {
+        self.scope.rooms.scope(peer, self.effective_room(peer))
+    }
+
+    /// Whether `peer` (with the rooms `rooms`) should see `id`: its topmost entity is the peer's own,
+    /// or that entity's manager is in a room the peer sees.
+    fn wants(&self, peer: PeerId, id: NetId, rooms: &RoomSet) -> bool {
         let Some(root) = self.entities.root_of(id) else {
             return false;
         };
@@ -3501,7 +3586,7 @@ impl Session {
             || self
                 .scope
                 .rooms
-                .sees(room, self.scope.rooms.of_manager(root.parent.manager))
+                .sees(rooms, self.scope.rooms.of_manager(root.parent.manager))
     }
 
     /// Server: sends `c` (with the entity's latest full state) to `peer`, which then holds it.
@@ -3521,8 +3606,8 @@ impl Session {
             if Some(peer) == except || self.knows(peer, c.id) {
                 continue;
             }
-            let room = self.scope.room_of.get(&peer).copied().flatten();
-            if self.wants(peer, c.id, room) {
+            let rooms = self.scope.rooms_of.get(&peer).cloned().unwrap_or_default();
+            if self.wants(peer, c.id, &rooms) {
                 self.send_create_to(peer, c.clone(), now_us);
             }
         }
@@ -3570,38 +3655,36 @@ impl Session {
         }
     }
 
-    /// Server: brings `peer`'s scope up to date with its room: a `Travel` when its room changed to a
-    /// level, a `Scope` leave for entities it should no longer see, `Create`s (parents first, with
-    /// current state) for entities it should now see.
+    /// Server: brings `peer`'s scope up to date with its rooms: a `Travel` for each level room it
+    /// gained, a `Scope` leave for entities it should no longer see, a `RoomLeft` for each level room
+    /// it lost, then `Create`s (parents first, with current state) for entities it should now see.
     fn refresh_scope(&mut self, peer: PeerId, now_us: u64) {
         if self.role != Role::Server || !self.peers.is_joined(peer) {
             return;
         }
-        let room = self.effective_room(peer);
-        let last = self.scope.room_of.get(&peer).copied();
-        if last != Some(room) {
-            self.scope.room_of.insert(peer, room);
-            let level = room.and_then(|r| {
-                self.scope
-                    .rooms
-                    .info(r)
-                    .and_then(|i| i.level.clone().map(|l| (l, i.name.clone())))
-            });
-            if let Some((scene_path, name)) = level {
-                self.scope.stats.travels_sent += 1;
-                self.scope.travelling.insert(peer);
-                let travel = EntityAction::Travel {
-                    scene_path,
-                    room: name,
-                };
-                self.send(peer, &Message::Entity(travel), now_us);
+        let rooms = self.scope_rooms(peer);
+        self.scope.rooms_of.insert(peer, rooms.clone());
+        let (gained, mut lost) = self.level_changes(peer, &rooms);
+        for (room, level) in gained {
+            // A level that moved (or changed scene): the client drops the old one first.
+            if let Some(i) = lost.iter().position(|r| *r == room) {
+                lost.remove(i);
+                self.send_room_left(peer, room, now_us);
             }
+            self.scope.stats.travels_sent += 1;
+            self.scope.travelling.insert((peer, room));
+            let travel = EntityAction::Travel {
+                scene_path: level.path,
+                room: self.scope.rooms.name(room),
+                origin: level.origin,
+            };
+            self.send(peer, &Message::Entity(travel), now_us);
         }
         let desired: BTreeSet<NetId> = self
             .entities
             .iter()
             .map(|r| r.id)
-            .filter(|id| self.wants(peer, *id, room))
+            .filter(|id| self.wants(peer, *id, &rooms))
             .collect();
         let known = self.scope.known.get(&peer).cloned().unwrap_or_default();
         let leave: Vec<NetId> = known.difference(&desired).copied().collect();
@@ -3622,6 +3705,9 @@ impl Session {
                 now_us,
             );
         }
+        for room in lost {
+            self.send_room_left(peer, room, now_us);
+        }
         for c in self.entities.burst() {
             if desired.contains(&c.id) && !known.contains(&c.id) {
                 self.scope.stats.entered += 1;
@@ -3630,8 +3716,39 @@ impl Session {
         }
     }
 
+    fn send_room_left(&mut self, peer: PeerId, room: u64, now_us: u64) {
+        self.scope.stats.rooms_left += 1;
+        self.scope.travelling.remove(&(peer, room));
+        let left = EntityAction::RoomLeft {
+            room: self.scope.rooms.name(room),
+        };
+        self.send(peer, &Message::Entity(left), now_us);
+    }
+
+    /// Server: the level rooms `peer` gains (its primary room first) and loses with the set `rooms`,
+    /// and records the new levels as sent. A level whose scene or origin changed is lost and gained.
+    fn level_changes(&mut self, peer: PeerId, rooms: &RoomSet) -> (Vec<(u64, Level)>, Vec<u64>) {
+        let now = self.scope.rooms.levels_of(rooms);
+        let before = self.scope.levels_of.remove(&peer).unwrap_or_default();
+        let lost: Vec<u64> = before
+            .iter()
+            .filter(|(r, l)| now.get(r) != Some(l))
+            .map(|(r, _)| *r)
+            .collect();
+        let primary = self.effective_room(peer);
+        let mut gained: Vec<(u64, Level)> = now
+            .iter()
+            .filter(|(r, l)| before.get(r) != Some(l))
+            .map(|(r, l)| (*r, l.clone()))
+            .collect();
+        gained.sort_by_key(|(r, _)| Some(*r) != primary);
+        self.scope.levels_of.insert(peer, now);
+        (gained, lost)
+    }
+
     /// Server: after `id` moved under `parent` (from `old_manager`): scopes follow a change of manager
-    /// (rooms), then peers that saw it before and still do get the `Reparent`.
+    /// (rooms), then peers that saw it before and still do get the `Reparent`. A peer that has both
+    /// rooms therefore gets only the `Reparent` (WP16): its replica moves instead of being freed.
     fn after_reparent(
         &mut self,
         id: NetId,
@@ -5526,19 +5643,11 @@ mod tests {
 
     // WP13: rooms.
 
-    fn room_table() -> Vec<(u64, String, Option<String>)> {
+    fn room_table() -> Vec<RoomEntry> {
         std::vec![
-            (
-                1,
-                String::from("res://hub.tscn"),
-                Some(String::from("res://hub.tscn"))
-            ),
-            (
-                2,
-                String::from("res://cave.tscn"),
-                Some(String::from("res://cave.tscn"))
-            ),
-            (3, String::from(crate::rooms::GLOBAL), None),
+            RoomEntry::new(1, "res://hub.tscn").in_level("res://hub.tscn", None),
+            RoomEntry::new(2, "res://cave.tscn").in_level("res://cave.tscn", None),
+            RoomEntry::new(3, crate::rooms::GLOBAL),
         ]
     }
 
@@ -5558,7 +5667,12 @@ mod tests {
     fn describe(ev: &[EntityEvent]) -> Vec<String> {
         ev.iter()
             .map(|e| match e {
-                EntityEvent::Travel { room, .. } => std::format!("travel {room}"),
+                EntityEvent::Travel { room, origin, .. } => match origin {
+                    Some(Origin::Flat([x, y])) => std::format!("travel {room} at {x},{y}"),
+                    Some(Origin::Deep([x, y, z])) => std::format!("travel {room} at {x},{y},{z}"),
+                    None => std::format!("travel {room}"),
+                },
+                EntityEvent::RoomLeft { room } => std::format!("left {room}"),
                 EntityEvent::Create { create, .. } => std::format!("create {}", create.name),
                 EntityEvent::Destroy { record, .. } => std::format!("destroy {}", record.name),
                 EntityEvent::Reparent { id, parent, .. } => {
@@ -5606,7 +5720,8 @@ mod tests {
         let ups = p.client.drain_state_updates();
         assert!(ups.iter().all(|u| u.id != cave_torch), "{ups:?}");
         assert!(ups.iter().any(|u| u.id == hub_torch), "{ups:?}");
-        // The player moves to the cave: travel first, then the scope change, then the move.
+        // The player moves to the cave: travel first, then the scope change (WP16: the hub's room is
+        // left after its entities), then the move.
         assert!(p.server.reparent(player, root(2), p.now));
         p.step();
         assert_eq!(
@@ -5614,6 +5729,7 @@ mod tests {
             [
                 String::from("travel res://cave.tscn"),
                 String::from("destroy HubTorch"),
+                String::from("left res://hub.tscn"),
                 String::from("create CaveTorch"),
                 std::format!("reparent {player} to 2"),
             ]
@@ -5676,5 +5792,149 @@ mod tests {
             ["travel res://cave.tscn", "create CaveTorch"]
         );
         assert_eq!(p.server.scope_stats().left, 2);
+    }
+
+    // WP16: room sets, neighbours, added rooms, level origins, reparent-only travel.
+
+    const CHUNK_A: &str = "res://chunk_a.tscn";
+    const CHUNK_B: &str = "res://chunk_b.tscn";
+    const INTERIOR: &str = "res://interior.tscn";
+
+    /// Two chunks naming each other (managers 4 and 5, authored positions), an interior placed at
+    /// (2000, 0) (manager 6), and the hub, cave and `"*"` managers of [`room_table`].
+    fn chunk_table() -> Vec<RoomEntry> {
+        let mut t = room_table();
+        t.push(
+            RoomEntry::new(4, CHUNK_A)
+                .in_level(CHUNK_A, None)
+                .with_neighbours(&[CHUNK_B]),
+        );
+        t.push(
+            RoomEntry::new(5, CHUNK_B)
+                .in_level(CHUNK_B, None)
+                .with_neighbours(&[CHUNK_A]),
+        );
+        t.push(RoomEntry::new(6, INTERIOR).in_level(INTERIOR, Some(Origin::Flat([2000.0, 0.0]))));
+        t
+    }
+
+    fn chunk_pair() -> Pair {
+        let mut p = connected_pair();
+        p.server.register_scene(SCENE, 42);
+        p.server.register_props(SCENE, props(), names());
+        client_registers(&mut p);
+        p.server.set_rooms(&chunk_table(), p.now);
+        p.server.set_rooms_strict(true, p.now);
+        p
+    }
+
+    #[test]
+    fn a_neighbour_room_is_loaded_and_seen_and_added_rooms_come_and_go() {
+        let mut p = chunk_pair();
+        spawn_at(&mut p, 4, "TreeA", SERVER, PlayerMark::No);
+        spawn_at(&mut p, 5, "TreeB", SERVER, PlayerMark::No);
+        spawn_at(&mut p, 6, "Chest", SERVER, PlayerMark::No);
+        spawn_at(&mut p, 1, "HubTorch", SERVER, PlayerMark::No);
+        spawn_at(&mut p, 4, "Player", 2, PlayerMark::IfNone);
+        p.step();
+        // Its own chunk's level first, then the neighbour's; the entities of both, not the hub's.
+        assert_eq!(
+            describe(&entity_events(&mut p.client)),
+            [
+                "travel res://chunk_a.tscn",
+                "travel res://chunk_b.tscn",
+                "create TreeA",
+                "create TreeB",
+                "create Player"
+            ]
+        );
+        assert_eq!(p.server.peer_room(2).as_deref(), Some(CHUNK_A));
+        assert_eq!(p.server.peer_rooms(2), [CHUNK_A, CHUNK_B]);
+        assert_eq!(p.server.travelling(), 2);
+        p.client.travel_ack(CHUNK_A, p.now);
+        p.client.travel_ack(CHUNK_B, p.now);
+        p.step();
+        assert_eq!(p.server.travelling(), 0);
+        // An added room: its level travels with its origin, then its entities.
+        assert!(p.server.add_room(2, INTERIOR, p.now));
+        assert!(!p.server.add_room(2, INTERIOR, p.now));
+        p.step();
+        assert_eq!(
+            describe(&entity_events(&mut p.client)),
+            ["travel res://interior.tscn at 2000,0", "create Chest"]
+        );
+        let mut wanted = p.server.wanted_rooms();
+        wanted.sort();
+        assert_eq!(wanted, [CHUNK_A, CHUNK_B, INTERIOR]);
+        // Removed again: its entities leave first, then the room.
+        assert!(p.server.remove_room(2, INTERIOR, p.now));
+        p.step();
+        assert_eq!(
+            describe(&entity_events(&mut p.client)),
+            ["destroy Chest", "left res://interior.tscn"]
+        );
+        assert_eq!(p.server.scope_stats().rooms_left, 1);
+        assert_eq!(p.client.scope_stats().rooms_left_received, 1);
+        // A new origin for a level the peer has: it leaves and travels again.
+        let mut t = chunk_table();
+        t[3].origin = Some(Origin::Flat([0.0, 500.0]));
+        p.server.set_rooms(&t, p.now);
+        p.step();
+        assert_eq!(
+            describe(&entity_events(&mut p.client)),
+            [
+                "left res://chunk_a.tscn",
+                "travel res://chunk_a.tscn at 0,500"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_move_between_two_rooms_a_peer_has_is_only_a_reparent() {
+        let mut p = chunk_pair();
+        let npc = spawn_at(&mut p, 4, "Npc", SERVER, PlayerMark::No);
+        let player = spawn_at(&mut p, 4, "Player", 2, PlayerMark::IfNone);
+        p.step();
+        let _ = entity_events(&mut p.client);
+        let stats = p.server.scope_stats();
+        // A server entity crosses from A to B: the client has both rooms, so only the move.
+        assert!(p.server.reparent(npc, root(5), p.now));
+        // The player crosses too: its rooms stay {A, B}, so nothing but the move either.
+        assert!(p.server.reparent(player, root(5), p.now));
+        p.step();
+        assert_eq!(
+            describe(&entity_events(&mut p.client)),
+            [
+                std::format!("reparent {npc} to 5"),
+                std::format!("reparent {player} to 5"),
+            ]
+        );
+        assert_eq!(p.server.peer_room(2).as_deref(), Some(CHUNK_B));
+        let after = p.server.scope_stats();
+        assert_eq!(after.left, stats.left, "no scope leave");
+        assert_eq!(after.entered, stats.entered, "no create");
+        assert_eq!(after.travels_sent, stats.travels_sent, "no travel");
+        assert_eq!(p.client.scope_stats().freed, 0);
+    }
+
+    #[test]
+    fn a_peer_with_only_one_of_the_two_rooms_gets_leave_and_create() {
+        let mut p = chunk_pair();
+        let npc = spawn_at(&mut p, 1, "Npc", SERVER, PlayerMark::No);
+        spawn_at(&mut p, 1, "Player", 2, PlayerMark::IfNone);
+        p.step();
+        let _ = entity_events(&mut p.client);
+        // The client sees the hub only: the npc leaving for the cave leaves its scope, no move.
+        assert!(p.server.reparent(npc, root(2), p.now));
+        p.step();
+        assert_eq!(describe(&entity_events(&mut p.client)), ["destroy Npc"]);
+        // And coming back is a create (with its current state), not a move.
+        assert!(p.server.reparent(npc, root(1), p.now));
+        p.step();
+        assert_eq!(describe(&entity_events(&mut p.client)), ["create Npc"]);
+        assert_eq!(
+            p.client.entities().get(npc).map(|r| r.parent.manager),
+            Some(1)
+        );
     }
 }

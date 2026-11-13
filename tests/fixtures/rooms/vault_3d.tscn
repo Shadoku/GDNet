@@ -1,0 +1,13 @@
+[gd_scene format=3]
+
+[node name="Vault" type="Node3D"]
+
+[node name="NetManager" type="NetManager" parent="."]
+auto_travel = true
+bounds_3d = AABB(-5, -5, -5, 10, 10, 10)
+
+[node name="Box" type="Node3D" parent="NetManager"]
+position = Vector3(1, 2, 3)
+
+[node name="Entrance" type="Marker3D" parent="."]
+position = Vector3(0, 1, 0)
