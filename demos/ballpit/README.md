@@ -14,6 +14,9 @@ The concepts are in `docs/guide/10_physics_and_bandwidth.md`; this page is the w
 * **In the editor**: open `demos/ballpit/main.tscn` and press *Run Current Scene* (F6). Choose **Offline**
   to play alone (the host is a client of itself), **Host** to host on port 7351, **Join** to join the
   address in the box.
+* **Over the internet, through Steam**: with GodotSteam installed (`tools/install_godotsteam.sh`) and the
+  Steam client running, **Host on Steam** shows a join code; the other player types it into the same box
+  and presses **Join**. `docs/guide/12_playing_online.md` explains it.
 * **Two clients on one machine**: *Debug > Customize Run Instances...*, enable *Enable Multiple
   Instances*, set the count to 3, and give the first instance the launch argument `-- --server`. Run
   `main.tscn`; press **Join** in the two other windows.
@@ -26,7 +29,8 @@ Move your paddle with the arrow keys or WASD. Push it into the pile and watch th
 ## The title screen: `main.tscn` and `main.gd`
 
 `main.tscn` holds the menu, the pit and the controls. Nothing in it is networked; the pit's `NetManager`
-is what makes the balls and paddles entities.
+is what makes the balls and paddles entities. The menu is gdnet's shared title screen
+(`addons/gdnet/connect/connect_menu.tscn`, guide page 12) with this demo's title and port.
 
 ```text file=demos/ballpit/main.tscn
 [gd_scene format=3]
@@ -34,6 +38,7 @@ is what makes the balls and paddles entities.
 [ext_resource type="Script" path="res://demos/ballpit/main.gd" id="1_main"]
 [ext_resource type="PackedScene" path="res://demos/ballpit/pit.tscn" id="2_pit"]
 [ext_resource type="PackedScene" path="res://demos/ballpit/hud.tscn" id="3_hud"]
+[ext_resource type="PackedScene" path="res://addons/gdnet/connect/connect_menu.tscn" id="4_menu"]
 
 [node name="Main" type="Control"]
 layout_mode = 3
@@ -45,73 +50,37 @@ script = ExtResource("1_main")
 [node name="Pit" parent="." instance=ExtResource("2_pit")]
 position = Vector2(400, 160)
 
-[node name="Menu" type="VBoxContainer" parent="."]
-layout_mode = 1
-anchors_preset = 8
-anchor_left = 0.5
-anchor_top = 0.5
-anchor_right = 0.5
-anchor_bottom = 0.5
-offset_left = -100.0
-offset_top = -90.0
-offset_right = 100.0
-offset_bottom = 90.0
-
-[node name="Title" type="Label" parent="Menu"]
-layout_mode = 2
-text = "Ballpit"
-horizontal_alignment = 1
-
-[node name="Host" type="Button" parent="Menu"]
-layout_mode = 2
-text = "Host"
-
-[node name="Address" type="LineEdit" parent="Menu"]
-layout_mode = 2
-text = "127.0.0.1"
-
-[node name="Join" type="Button" parent="Menu"]
-layout_mode = 2
-text = "Join"
-
-[node name="Offline" type="Button" parent="Menu"]
-layout_mode = 2
-text = "Offline"
+[node name="Menu" parent="." instance=ExtResource("4_menu")]
+title = "Ballpit"
+port = 7351
 
 [node name="Hud" parent="." node_paths=PackedStringArray("pit") instance=ExtResource("3_hud")]
 visible = false
 pit = NodePath("../Pit")
 ```
 
-`main.gd` is the Doors demo's title screen with another port: start a session, then tell the pit and the
-controls that it runs.
+`main.gd` is the Doors demo's title screen with other nodes: when the menu says a session runs (ENet,
+Steam or offline), tell the pit and the controls.
 
 ```gdscript file=demos/ballpit/main.gd
 extends Control
-## The title screen: Host, Join or Offline. `--server` after `--` on the command line starts a
-## dedicated server: `godot --headless --path . demos/ballpit/main.tscn -- --server`.
-
-const PORT := 7351
+## The title screen is gdnet's connect menu (`addons/gdnet/connect/`): Host, Host on Steam, Join (an
+## address or a join code) or Offline. `--server` after `--` on the command line starts a dedicated
+## server: `godot --headless --path . demos/ballpit/main.tscn -- --server`.
 
 @onready var pit: BallpitSpawner = $Pit
-@onready var menu: Control = $Menu
+@onready var menu: NetConnectMenu = $Menu
 @onready var hud: BallpitHud = $Hud
 
 
 func _ready() -> void:
-	$Menu/Host.pressed.connect(func() -> void: _start(Net.host(PORT)))
-	$Menu/Join.pressed.connect(func() -> void: _start(Net.join($Menu/Address.text, PORT)))
-	$Menu/Offline.pressed.connect(func() -> void: _start(Net.offline()))
+	menu.started.connect(_start)
 	if "--server" in OS.get_cmdline_user_args():
 		pit.dedicated = true
-		_start(Net.host(PORT))
+		menu.host()
 
 
-func _start(error: Error) -> void:
-	if error != OK:
-		push_error("could not start the session: %s" % error_string(error))
-		return
-	menu.hide()
+func _start() -> void:
 	hud.show()
 	pit.start()
 	hud.start()

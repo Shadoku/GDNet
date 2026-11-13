@@ -15,6 +15,10 @@ The concepts are in `docs/guide/09_rooms_and_travel.md` (rooms, chunks, placemen
 * **In the editor**: open `demos/doors/main.tscn` and press *Run Current Scene* (F6). Choose **Offline** to
   walk around alone (the host is a client of itself), **Host** to host on port 7350, **Join** to join the
   address in the box.
+* **Over the internet, through Steam**: with GodotSteam installed (`tools/install_godotsteam.sh`) and the
+  Steam client running, the menu also shows **Host on Steam**, which shows a six-character join code; the
+  other player types the code into the same box and presses **Join**. No port forwarding, no server of
+  your own. `docs/guide/12_playing_online.md` explains it, including how to send a build to a tester.
 * **Two clients on one machine**: *Debug > Customize Run Instances...*, enable *Enable Multiple
   Instances*, set the count to 3, and give the first instance the launch argument `-- --server` (the
   dedicated server, see below). Run `main.tscn`; press **Join** in the two other windows.
@@ -28,7 +32,9 @@ Move with the arrow keys or WASD (the project's `left`, `right`, `up`, `down` ac
 
 ## The title screen: `main.tscn` and `main.gd`
 
-`main.tscn` holds the menu, the `World` node and the chat. Nothing in it is networked.
+`main.tscn` holds the menu, the `World` node and the chat. Nothing in it is networked. The menu is gdnet's
+shared title screen, `addons/gdnet/connect/connect_menu.tscn` (the connect layer, guide page 12), given
+the demo's title and port; the Ballpit demo uses the same one.
 
 ```text file=demos/doors/main.tscn
 [gd_scene format=3]
@@ -36,6 +42,7 @@ Move with the arrow keys or WASD (the project's `left`, `right`, `up`, `down` ac
 [ext_resource type="Script" path="res://demos/doors/main.gd" id="1_main"]
 [ext_resource type="Script" path="res://demos/doors/world.gd" id="2_world"]
 [ext_resource type="PackedScene" path="res://demos/doors/chat.tscn" id="3_chat"]
+[ext_resource type="PackedScene" path="res://addons/gdnet/connect/connect_menu.tscn" id="4_menu"]
 
 [node name="Main" type="Control"]
 layout_mode = 3
@@ -47,73 +54,39 @@ script = ExtResource("1_main")
 [node name="World" type="Node2D" parent="."]
 script = ExtResource("2_world")
 
-[node name="Menu" type="VBoxContainer" parent="."]
-layout_mode = 1
-anchors_preset = 8
-anchor_left = 0.5
-anchor_top = 0.5
-anchor_right = 0.5
-anchor_bottom = 0.5
-offset_left = -100.0
-offset_top = -90.0
-offset_right = 100.0
-offset_bottom = 90.0
-
-[node name="Title" type="Label" parent="Menu"]
-layout_mode = 2
-text = "Doors"
-horizontal_alignment = 1
-
-[node name="Host" type="Button" parent="Menu"]
-layout_mode = 2
-text = "Host"
-
-[node name="Address" type="LineEdit" parent="Menu"]
-layout_mode = 2
-text = "127.0.0.1"
-
-[node name="Join" type="Button" parent="Menu"]
-layout_mode = 2
-text = "Join"
-
-[node name="Offline" type="Button" parent="Menu"]
-layout_mode = 2
-text = "Offline"
+[node name="Menu" parent="." instance=ExtResource("4_menu")]
+title = "Doors"
+port = 7350
 
 [node name="Chat" parent="." instance=ExtResource("3_chat")]
 visible = false
 layout_mode = 0
 ```
 
-`main.gd` starts a session with one of `Net`'s four calls and then tells the World and the chat that a
-session runs. `--server` (after `--` on the command line) makes this process a dedicated server.
+`main.gd` waits for the menu's `started` signal, which fires once a session runs, whichever button
+started it (ENet, Steam or offline), and then tells the World and the chat that a session runs. The game
+code after that is the same for every transport. `--server` (after `--` on the command line) makes this
+process a dedicated server: `menu.host()` hosts over ENet on the menu's port without a click.
 
 ```gdscript file=demos/doors/main.gd
 extends Control
-## The title screen: Host, Join or Offline. `--server` after `--` on the command line starts a
-## dedicated server without a window's worth of buttons: `godot --headless --path . demos/doors/main.tscn -- --server`.
-
-const PORT := 7350
+## The title screen is gdnet's connect menu (`addons/gdnet/connect/`): Host, Host on Steam, Join (an
+## address or a join code) or Offline. `--server` after `--` on the command line starts a dedicated server
+## without a window's worth of buttons: `godot --headless --path . demos/doors/main.tscn -- --server`.
 
 @onready var world: DoorsWorld = $World
-@onready var menu: Control = $Menu
+@onready var menu: NetConnectMenu = $Menu
 @onready var chat: Control = $Chat
 
 
 func _ready() -> void:
-	$Menu/Host.pressed.connect(func() -> void: _start(Net.host(PORT)))
-	$Menu/Join.pressed.connect(func() -> void: _start(Net.join($Menu/Address.text, PORT)))
-	$Menu/Offline.pressed.connect(func() -> void: _start(Net.offline()))
+	menu.started.connect(_start)
 	if "--server" in OS.get_cmdline_user_args():
 		world.dedicated = true
-		_start(Net.host(PORT))
+		menu.host()
 
 
-func _start(error: Error) -> void:
-	if error != OK:
-		push_error("could not start the session: %s" % error_string(error))
-		return
-	menu.hide()
+func _start() -> void:
 	chat.show()
 	world.start()
 	chat.start()

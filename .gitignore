@@ -26,3 +26,7 @@ addons/gdnet/bin/
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# GodotSteam (WP23): installed by tools/install_godotsteam.sh, never committed; Steam's app id file
+addons/godotsteam/
+steam_appid.txt

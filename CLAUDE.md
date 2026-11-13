@@ -208,6 +208,7 @@ tests/integration/     tests that instantiate scenes
 rust/                  Cargo workspace: netcore (sans-IO protocol engine, no godot dep),
                        gdnet (the GDExtension); rust/target/ is ignored
 addons/gdnet/          gdnet.gdextension + bin/<platform>/ (built, ignored) + addon assets (WP8: meter.tscn/.gd)
+addons/gdnet/connect/  WP23 connect layer: NetConnect (ENet, Steam join codes, offline), NetSteamBackend, connect_menu.tscn
 docs/guide/            the gdnet user guide, one page per topic (01_sessions.md, ...)
 demos/                 instructional demos, each a worked example with a README whose code listings a
                        test diffs against the files (WP13/WP16: doors/ = a 2 x 2 chunk overworld,
@@ -220,6 +221,7 @@ tools/godot.py         the Godot and cargo side of the stages: version, build, i
                        test (--dir/--filter/--jobs/--junit), smoke, wasm
 tools/validate_scripts.gd   compiles every script; used by tools/godot.py validate
 tools/install_godot.sh downloads the pinned Godot into ~/.cache/godot
+tools/install_godotsteam.sh  downloads the GodotSteam pinned in .godotsteam-version into addons/godotsteam/ (ignored; never in CI)
 .check/                the check's per-checkout state (ignored)
 .claude/skills/tdd-project/   the check kit (tools/check.py's source of truth, check.toml reference)
 .github/workflows/ci.yml    runs the full check on push and pull request (with the Emscripten target)

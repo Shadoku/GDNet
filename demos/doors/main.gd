@@ -1,28 +1,21 @@
 extends Control
-## The title screen: Host, Join or Offline. `--server` after `--` on the command line starts a
-## dedicated server without a window's worth of buttons: `godot --headless --path . demos/doors/main.tscn -- --server`.
-
-const PORT := 7350
+## The title screen is gdnet's connect menu (`addons/gdnet/connect/`): Host, Host on Steam, Join (an
+## address or a join code) or Offline. `--server` after `--` on the command line starts a dedicated server
+## without a window's worth of buttons: `godot --headless --path . demos/doors/main.tscn -- --server`.
 
 @onready var world: DoorsWorld = $World
-@onready var menu: Control = $Menu
+@onready var menu: NetConnectMenu = $Menu
 @onready var chat: Control = $Chat
 
 
 func _ready() -> void:
-	$Menu/Host.pressed.connect(func() -> void: _start(Net.host(PORT)))
-	$Menu/Join.pressed.connect(func() -> void: _start(Net.join($Menu/Address.text, PORT)))
-	$Menu/Offline.pressed.connect(func() -> void: _start(Net.offline()))
+	menu.started.connect(_start)
 	if "--server" in OS.get_cmdline_user_args():
 		world.dedicated = true
-		_start(Net.host(PORT))
+		menu.host()
 
 
-func _start(error: Error) -> void:
-	if error != OK:
-		push_error("could not start the session: %s" % error_string(error))
-		return
-	menu.hide()
+func _start() -> void:
 	chat.show()
 	world.start()
 	chat.start()
