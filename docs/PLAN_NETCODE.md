@@ -1,7 +1,9 @@
 # Plan: a Rust GDExtension for rapid multiplayer development in Godot 4
 
 2026-11-08, revised the same day after the owner's review (the managed layer added, then the two demo end
-goals). Approved 2026-11-08, with every recommendation of section 7 taken.
+goals). Approved 2026-11-08, with every recommendation of section 7 taken. Extended 2026-11-13 with
+section 12 (v2: interest, seats and reconnection, 3D and physics modes), after an evaluation against three
+target games; section 12's decisions D19-D25 are recommendations until the owner takes them.
 
 **What.** A Godot 4 extension, written in Rust with gdext, that makes a single-player scene multiplayer by
 placing it under one node. A `NetManager` enrols everything beneath it: scene instances become networked
@@ -60,6 +62,9 @@ Rust-side Steam binding.
 8. **Two instructional demos are the end goals** (section 2.11, WP13 and WP14): players travelling between
    scenes, and a physics scene with hundreds of colliding bodies. Each is a worked example a reader can copy,
    and each runs headless in the test suite, so the library is not done until they are.
+9. **Function and flexibility before cheat prevention** (owner's note, 2026-11-13; decision D18). gdnet is a
+   general-purpose extension: what a game can do, and how close its code stays to the single-player
+   version, outrank protecting the server from a modified client. Section 12.1 has the consequences.
 
 ## 1. What the developer writes: the escalation ladder
 
@@ -442,6 +447,7 @@ state; replicas are frozen and interpolated; a sleeping body produces no dirty f
 costs nothing; the priority accumulator sends bodies near the client's player (interacting, 100) far more
 often than distant ones (1) and the budget degrades distant bodies gracefully instead of exceeding it.
 Fiedler-style ownership handoff for bodies a client-owned paddle touches is a follow-up (WP15), not v1.
+(2026-11-13: WP15 is now the `handoff` mode of WP19, one of four physics modes; section 12.4.)
 
 ## 3. Contracts
 
@@ -523,6 +529,8 @@ with each package).
 
 Order: WP0 → WP1 → WP2 → WP3 → WP4 → WP5 → WP6 → WP7 → WP8 → WP13 → WP14, then WP9-WP12 and WP15 in any
 order. WP6 may be pulled forward after WP2 for lobby code. v1 = WP0-WP8 plus the two demos (decision D11).
+After v1 (2026-11-13): section 12.6 replaces "in any order" with WP16 → WP17 (with WP11) → WP18 → WP19 →
+WP20 → WP21; WP15 is folded into WP19; gates G9-G12 are in section 12.7.
 
 - **G0 Single player untouched.** The extension installed, no `Net` call, no manager: no packets, no polling,
   no measurable frame cost. The repo's smoke test plus a frame-time assertion.
@@ -578,7 +586,9 @@ Each with a recommendation. The owner took every recommendation on 2026-11-08; t
   20-tick rollback window, 2-tick jitter buffer, 250 ms lag-compensation cap. *Recommended* as starting
   values.
 - **D9 Shared authority exposure.** Ship `client_owned`, `transfer = take` and `spawn_policy =
-  owner_allowed` in WP7 with the trust warning and the overlay. *Recommended: ship.*
+  owner_allowed` in WP7 with the trust warning and the overlay. *Recommended: ship.* (2026-11-13, D18:
+  these are ordinary modes, chosen for how the game should feel; the guide describes what each does and
+  drops the warning tone when WP19 rewrites that page.)
 - **D10 Adaptive delay.** Experimental, off by default, in WP4. *Recommended.*
 - **D11 v1 scope.** WP0-WP8 plus the two demos WP13 and WP14; WP9 first follow-up; WP10-WP12 and WP15 by
   demand. *Recommended; the owner added the demos as end goals.*
@@ -661,7 +671,16 @@ Package status (updated as each lands):
 | WP14 demo: Ballpit (many colliding bodies) | built 2026-11-08: `netcore` `priority` (`near()`: the proximity half of interaction scoring over a coarse grid of cells as large as the largest radius, `Body`, `cmp()`), `delta` (`ReplStats` gains `deferred_entities`, `deferred_fields` and their `_tick` forms, counted in `Replication::build` where candidates with pending fields are left out of a snapshot (budget at zero, MTU or allowance full) and where an entity's remaining fields did not fit; `begin_tick`, `interacting(peer)`, `sends(peer, id)` (a per-peer, per-entity count of snapshots that carried it)), `session` (`interacting`, `entity_sends`, `begin_tick` in `send_snapshots`); `gdnet` `physics.rs` (the interaction pass: entity roots' global positions (`Node2D`/`Node3D`), contacts of the player's body (`get_colliding_bodies()` with `contact_monitor`, a CharacterBody's slide collisions), the setting `gdnet/budget/interaction_radius`), `NetManager.interaction_radius` and `roots()`, `NetSession` (the pass each server tick after recording and before `send_snapshots`, scoring every peer but the server's own player and re-asserting the set every tick; `interacting(peer)`, `entity_sends(node, peer)`, `hash_sample`, the `stats()` keys of 3.1 with per-second windows); the meter's `budget` line gains `deferred: N ent/s  interacting N`; demo `demos/ballpit/` (`main.tscn/.gd` with `--server`, `pit.tscn` + `spawner.gd` (the Spawner: balls in loose rows, a paddle per peer, `set_ball_count`, `set_trusted_paddles`, `shake`, `layer_shift`), `ball.tscn` (a script-less `RigidBody2D`), `paddle.tscn/.gd` (rung 1), `trusted_paddle.tscn` (the same scene with a `client_owned` `NetEntity`), `hud.tscn/.gd`) and its README tutorial with a bandwidth chapter; tests `tests/integration/test_ballpit_demo.gd` (4: 300 balls settle, converge and cost nothing asleep in both host modes, with the trusted-paddle toggle and its overlay role; a predicted paddle push over a 50 ms link with the interaction pass checked against the radius, no double simulation and no rollback; the halved budget with near and far send rates, the deferred counter and hash bytes; G8's README listings) and netcore `three_hundred_bodies_pack_into_mtu_sized_snapshots`, `near_bodies_are_sent_ten_times_as_often_as_far_ones`, `deferred_counters_count_what_the_budget_left_out`, `near_lists_bodies_within_their_radius`; guide `docs/guide/10_physics_and_bandwidth.md`; `CHECK: PASS` (TESTS: 115 passed, 0 failed, 0 errors, 0 skipped (115 total); netcore 175 Rust tests, gdnet 2). Measured (headless, physics 60 Hz, release build): 300 balls fall asleep 2.2-2.4 s after spawning; asleep, the server sends a client 56 B/s in total (0 snapshot bytes, 0 recorded changes over a second; pings only), so a sleeping `RigidBody2D` produces no dirty field and needs no dead band (Godot does not move a sleeping body); a body update is 20.6 bytes (4 hot fields ~15.5 bytes at `mm` / 16-bit angles plus a ~5-byte entry header: more bit, id varint, record-length varint, 9 mask bits) [review 2026-11-08, D17: 15.8 bytes, positions and velocities 2 bytes per axis at 0.1 px], and 300 moving bodies fill every snapshot to within 24 bytes of the 1,200-byte MTU; in netcore at 32 KB/s 20 interacting bodies went out on 600 of 600 ticks and 280 others 15 times each (40x); the push test (50 ms each way): the owner's paddle moves on the tick after the press, the owner sees the first ball move 5-6 ticks after the server moved it (67 ticks after its press, most of it the paddle's travel to the pile), 17-18 balls interacting at the deepest point, zero rollbacks, the server's pile asleep again ~110 ticks after the push and the client within 0.5 px 32 ticks and within 0.05 px 77 ticks after that (WP5's decaying correction offsets) [D17: a replica now sits up to half a 0.1 px step off, so the test's bar is 0.075 px; measured 6 and 41 ticks]; with the budget halved to 16,384 B/s and 300 shaken balls: 16,387 B/s of snapshots in a one-second window, 273 bytes per snapshot (about 13 ball updates a tick), ~17,200 deferred entities/s and ~68,800 deferred fields/s, interacting balls sent on 100 % of the ticks they moved (354 slots), the far moving balls on 3 % (35,646 slots) [D17: about 17 updates a tick, far balls 5 %, hashes and pings 88 B/s]; hash telemetry at `hash_sample = 2` plus pings 66 B/s on channel 2 (0.4 % of that budget); the interaction pass 0.36-0.56 ms per tick for 300 bodies and one client (a linear Rust pass over engine getters, the grid query itself negligible). Deviations: (1) the budget slider sets the host session's `budget_bytes_per_s` (`Net.session_for(pit)`, which is `Net`'s session in a game) instead of `Net.budget_bytes_per_s`, which is read when a session starts (3.4) and so does not reach a running session. (2) `hash_sample` is a `NetSession` property (no `Net.hash_sample`): the demo sets it on its session in `start()`. (3) The walls sit beside the `NetManager`, not under it (level geometry, identical everywhere; under the manager they would be bare-node entities with a warning). (4) The paddle's collision mask holds only the walls (the balls' mask holds the paddle): its motion never depends on replicas, so prediction never fights the server, and a push is seen one trip from the server plus the jitter buffer late; a player that collides with frozen replicas would be stopped by the past and roll back (documented, no library change). (5) The demo's `interaction_radius` is 50 px, not the 300 px default: at the halved budget a snapshot carries ~13 ball updates, and a larger radius marks more moving balls than fit (100 px measured 75 % of near balls sent per tick). (6) The balls have `angular_damp = 3` (a ball rolling on the floor otherwise dozes off and wakes for many seconds) and the push test lifts the paddle out of the pile afterwards (a kinematic paddle resting inside the pile keeps nudging balls awake). (7) An entity-id delta encoding within a snapshot was considered and not built: it would save at most ~1 byte of 20.6 per update while making the MTU accounting depend on the write order; the larger lever is the quantiser (a `Vector2` at `mm` is 1/1000 px, `cm` saves a byte per axis), left as a project choice. (8) Tests set `timeout_sec` (20-40 s): a 300-body pile needs seconds of simulated time. (9) The G4 and G5 tests stay on their own fixtures, untouched (the row said they would reuse this scene); the demo's halved-budget test is the bodies' bandwidth gate. Contract choices: interacting = within the radius of the entity's own manager, measured between entity roots' global positions, plus the player's contacts; `interaction_radius` 0 = the setting, negative = proximity off for that manager, 3D reads the setting at 100 px per metre; the set is re-asserted every tick (an entity that left a peer's scope and came back gets a fresh per-peer record); `deferred_entities` counts candidates that carried nothing this tick, `deferred_fields` every pending field not carried (partly sent entities included), both summed over peers; `stats()` per-second figures are the last full second; `entity_sends` and `interacting` answer 0 / empty on a client. Hand-off: WP15 hands touched bodies to the pusher; the hooks it needs are the interaction pass's contact list (physics.rs `contacts_of`) and `client_owned` (WP7). |
 | Review 2026-11-08 (end of v1) | the review-and-fix pass after WP14: (1) **D17** (section 7): 2D `mm`/`cm` are 0.1 px and 1 px steps (100 px per metre; 3D keeps metres), `netcore::quant::PX_PER_METRE` / `fixed_step()`, the wire format is 2 (`wire::WIRE_FORMAT`, a `Protocol` item "wire format", so a WP14 peer is refused naming it), the 2D prediction tolerance is one step (0.1 px); a Ballpit body update 20.6 -> 15.8 bytes, the halved-budget G4 far entities 17.4 -> 23.1 updates in 2 s, the pushed balls within 0.5 px 6 ticks and within 0.075 px 41 ticks after the pile settles; tests that compared a replica with the server at 0.001 px (`test_net_prediction` `MM` = 0.1, `test_net_state` `HALF_STEP` = 0.071, `test_ballpit_demo` `CONVERGED_PX` = 0.075 = half a step on both axes) were loosened deliberately to half a quantiser step, the most a replica's quantised copy can differ; (2) live settings: sessions re-read the budget and the hash sample every tick while their own value is unset, so `Net.budget_bytes_per_s` (WP14 deviation 1) and the new `Net.hash_sample` (WP14 deviation 2) reach a running session; the Ballpit HUD slider uses `Net.budget_bytes_per_s` again; `cold_poll_ticks`, `input_delay_ticks`, `adaptive_delay`, `emulation`, `empty_level_timeout` were already live, `profiles` is start-only (3.1 lists which is which); test `test_net_budget_and_hash_sample_apply_to_running_sessions`; (3) the one `unsafe impl` (`GodotImmutable for NetArg`, `call.rs`): gdext 0.5.5's contract (Copy-like, or a thread-safe `clone()` whose clones cannot mutate or race) is met because the trait is used only by `#[opt(default)]`, whose `into_runtime_immutable` now normalises every default to the RID sentinel (a refcount-free bitwise-copied Variant); `// SAFETY:` comment states it; no design change; (4) `gdnet/budget/interaction_every_ticks` (default 1; the sets are kept and re-asserted between passes), managers with a negative radius skip reading positions, `stats()` gains `interaction_ms_avg` and `interaction_passes`; Ballpit (300 bodies, one client): 0.41 ms per tick at 1, 0.11 ms at 4 (WP14 measured 0.36-0.56 ms); (5) the test stage: `runner.gd --jobs=N` runs whole test files in N Godot processes at once (each writes an ordered `--log-file`; files balanced by the last run's durations in `user://test_durations.json`), `check.py --jobs` (default 2); 138-141 s -> 73 s with every test kept (3 jobs: 50 s); ported to the skill template; CLAUDE.md lists the one-package commands; (6) docs swept against the `#[func]`/`#[var]`/`#[signal]` registrations: the undocumented public methods are in guide 01's "Smaller pieces of the surface" and its emulation fields list; the planned surface v1 does not build is marked in 3.1/3.4 (`send_rate`, `rewind_query`, `NetEntity.radius`/`visibility_filter`/`lag_compensated`, `gdnet/tick/send_rate`, `gdnet/lag_compensation/max_ms`); (7) README.md gains a gdnet section; (8) this row and the v1 line; (9) section 11. `CHECK: PASS` (TESTS: 116 passed, 0 failed, 0 errors, 0 skipped (116 total); netcore 175 Rust tests, gdnet 2). |
 | Check kit 2026-11-13 | `tools/check.py` replaced by the tdd-project kit's (stages in `check.toml`, the Godot and cargo side in `tools/godot.py`, runner `--dir`): `--no-build`, `--no-import` and `--only test` are gone (`--only unit` / `--only integration` skip build and import; `--filter` covers Rust and GDScript tests); the separate `wasm-check` CI job is the check's `wasm` stage (CI installs the target); a `lint` stage runs `cargo fmt --check` and clippy; pass cache and `--tier quick` (~7 s) |
-| WP9-WP12, WP15 | not started |
+| WP9-WP12 | not started (WP11 is scheduled with WP17, section 12.6) |
+| WP15 | folded into WP19 as the `handoff` physics mode (2026-11-13) |
+| Plan extension 2026-11-13 | section 12 added after evaluating the library against three target games (a top-down action adventure, a deckbuilding roguelike, a 3D physics game with player-built contraptions); goal 9 and D18 record the owner's note that cheat prevention is not a priority; no code changed |
+| WP16 interest, several rooms, level placement and state | not started |
+| WP17 seats, reconnection, session state; Cards demo | not started |
+| WP18 3D parity and cheap idle entities | not started |
+| WP19 physics modes | not started |
+| WP20 assemblies and entity references | not started |
+| WP21 demo: Workshop (3D contraptions) | not started |
+| WP22 the rest of v1's declared surface (`send_rate`, the Rust derive) | not started |
 
 **v1 complete 2026-11-08**: WP0-WP8, WP13 and WP14 built and reviewed; final figure after the review pass: `TESTS: 116 passed, 0 failed, 0 errors, 0 skipped (116 total)`, `CHECK: PASS`. WP9-WP12 and WP15 not started.
 
@@ -687,5 +706,257 @@ Collected from the status rows and the guide (review 2026-11-08), one line each,
 - **Stock RPCs under gdext.** gdext's `#[rpc]` defaults to `unreliable` where GDScript's `@rpc` defaults to `reliable`; anyone mixing stock RPCs with gdnet should state the mode (research note `godot_ecosystem.md`; gdnet's own verbs are reliable by default, guide 06).
 - **Emulation on real peers.** On ENet/WebRTC gdnet can delay only its own messages; stock `@rpc` traffic is not emulated (WP1 deviation 5, guide 01).
 - **Not built in v1.** `send_rate` / `gdnet/tick/send_rate` (snapshots go every tick), lag compensation and `rewind_query` (WP9), `NetEntity.radius` / `visibility_filter` (interest is rooms plus interaction scoring), the Rust derive (rung 5), the editor debugger tab is verified by hand only (WP8 deviation 7), no host migration (by design).
+- **Where v2 answers these** (section 12): frozen replicas and predicted players, WP19 (`simulated`, `handoff`); rooms all or nothing and `radius` / `visibility_filter`, WP16; levels overlapping in one physics space and levels reloading fresh, WP16; a client that drops loses its entities, WP17; polling cost, WP18 (idle entities) and WP22 (`mark_dirty()`); 3D untested, WP18; web, WP11 with WP17.
 - **A watched test.** `test_g4_idle_entities_cost_almost_nothing` once counted the 100-entity spawn burst (10,110 reliable bytes) in its one-second window during the review pass; a full check during the check-kit adoption (2026-11-13, four runner processes) failed one integration test once more, with the output lost, and eight re-runs passed; the cause (most likely physics catch-up after a stall when several test processes share the CPU) is unconfirmed. If it fails again, anchor the window on the counters settling rather than on a frame count (review row (5)).
 - **Test fixture.** Branches in one process share one physics space and the inference caches: tests move client copies to other collision layers and configure a scene once for every branch (WP3 deviation 8, CLAUDE.md).
+
+## 12. v2: three target games (added 2026-11-13)
+
+v1 was evaluated against three kinds of game. This section turns the gaps into work packages. Nothing in
+it is built; the status table in section 10 has a row per package.
+
+| game | fit after v1 | what is missing | packages |
+|---|---|---|---|
+| top-down action adventure: a large overworld, buildings and dungeons with interiors | good: the Doors demo in miniature | interest by distance, an overworld of chunks without hard transitions, many levels in one physics space, levels that keep their state, rejoining | WP16, WP17 (WP9 for PvP hits) |
+| deckbuilding roguelike card game | works; uses calls and keyed state, little else | state only some peers may see, a player who drops and comes back, resuming a run, a verified web export | WP16 (visibility), WP17, WP11 |
+| 3D physics game with player-built contraptions and structures | poor: 3D untested, bodies simulated only on the server, every body a separate entity, polling grows with the part count | 3D coverage, a choice of who simulates a body, jointed bodies treated as one thing, resting parts that cost no CPU | WP18, WP19, WP20, WP21 |
+
+### 12.1 Priorities (decision D18)
+
+The owner's note of 2026-11-13: cheat detection and prevention are not a priority, at least inside the
+extension. Function, flexibility and the single-player-first development cycle come first. For the plan
+this means:
+
+- **Client-simulated modes are ordinary modes.** `client_owned`, `transfer = take`, `spawn_policy =
+  owner_allowed` and the physics modes of 12.4 are chosen for how the game should feel. The guide says
+  what each does and who decides the outcome; it does not steer the reader away from them.
+- **No feature gains ceremony for the sake of trust.** Where a default has two candidates, the one whose
+  game code is closer to the single-player version wins.
+- **What exists stays, as game logic.** `_net_allow`, rejected writes, keyed-state permissions and views
+  are tools for rules ("only the active player may play a card"), not a security boundary, and no new
+  validation machinery is planned. A game that needs anti-cheat builds it on the server side of its own
+  code.
+- **Identifiers are not credentials.** WP17's rejoin key is chosen by the client and is not verified.
+- **Server authority remains the default model** (D3), because it is the one that needs no decisions
+  from the developer, not because it is the safe one.
+
+### 12.2 Interest, rooms and levels (WP16)
+
+**Radius.** `NetEntity.radius`, the `configure()` key `radius` and a manager default `NetManager.radius`
+(0 = unlimited, today's behaviour) are built: an entity is in a peer's scope only while its root is within
+the radius of the peer's *focus* (its player; `Net.set_focus(peer, node)` for a camera or a spectator). It
+leaves at 1.2 times the radius, so an entity at the edge is not created and freed in turn. The test reuses
+WP14's grid. Entering and leaving are the `Create` and `Scope { leave }` of WP13.
+
+**Visibility.** Three forms, cheapest first:
+
+- `visible_to` on an entity: `all` (default), `owner`, or a list of peers set with
+  `Net.show_to(node, peers)`. A card in a hand is an entity only its owner has.
+- the per-property option `audience: all | owner` (profiles, `NetEntity.state_options`, `configure()`):
+  everyone has the entity, only the owner receives that property; the others keep the scene's value. A
+  face-down card whose `card_id` only its holder knows.
+- `visibility_filter`: a `Callable(peer) -> bool` per entity, evaluated every
+  `gdnet/interest/filter_every_ticks` (default 6), for rules the first two cannot say (fog of war, teams).
+
+**Several rooms per peer.** A peer's scope becomes a set of rooms: its player's room, that manager's
+`neighbours: PackedStringArray`, and any added with `Net.add_room(peer, name)` (`remove_room` undoes it).
+The client keeps the levels of all its rooms loaded. An overworld is then a grid of chunk scenes, each
+naming its neighbours: a player sees and collides with the next chunk before entering it. `Net.travel`
+between two rooms the peer already has sends only the `Reparent`: no replica is freed, prediction keeps
+running and the position is continuous. A script at the chunk edge calls it, or `NetManager.auto_travel =
+true` moves a player to the manager whose `bounds: Rect2 / AABB` contains it.
+
+**Placement.** Levels stop overlapping at the origin. Each loaded level gets an origin, the same on the
+server and on every client (it travels in `Travel`): `Net.load_level(path, origin)`, or automatically the
+next free cell of a grid of `gdnet/levels/spacing` (default 0 = off, today's behaviour; a game with
+interiors sets it larger than its largest level). A chunk level that names neighbours keeps the position
+it was authored at. With placement on, the "one physics space" advice of guide 09 (a collision layer per
+level, `owner.is_ancestor_of(body)` in doors) is no longer needed.
+
+**Level state.** `NetManager.keep_state` (default true, decision D20): when the server unloads a level it
+keeps the level's entity table and replicated state in memory and restores them at the next load, so an
+opened chest stays open for the session. `NetSession.level_state(path) -> PackedByteArray` and
+`load_level(path, origin, state)` hand the same blob to the game, which stores it in its own save file.
+The calls work under `Net.offline()`, so they are the single-player save path for level state too. gdnet
+still ships no database and writes no file.
+
+### 12.3 Seats, reconnection and session state (WP17)
+
+**Seats.** A *seat* is a player's stable number for the session (1 = the host's or the first player's),
+separate from the peer id, which changes with every connection. A client sends a *key* in `Hello`:
+`Net.join(address, port, key := "")`, by default a random string kept in memory for the life of the
+process, or one the game passes (a save slot, an account name). The server maps key to seat.
+`Net.seat(peer)`, `Net.peer_of(seat)` (0 while the seat is away), `Net.my_seat()`. Existing APIs keep
+taking peer ids. The keyed state gains the rule `allow(prefix, "seat")`: the path segment after the
+prefix is the writer's seat, so a path survives a reconnection where an `"owner"` path would not.
+
+**Dropping and rejoining.** When a seated client disconnects, the seat is held for
+`gdnet/session/rejoin_timeout_s` (default 60; 0 = today's behaviour; -1 = for the whole session). Its
+entities stay as they are, simulated by the server with neutral input, and `peer_dropped(seat)` fires. A
+`Hello` with the same key takes the seat back: ownership, player, rooms, focus, `visible_to` lists and
+`audience` properties move to the new peer id (`SetOwner` to everyone), the client gets the late-join
+burst, and `peer_rejoined(seat, peer)` fires. After the timeout `seat_released(seat)` fires and the
+entities go back to the server as today. Host migration stays out of scope.
+
+**Session state.** `NetSession.save_state() -> PackedByteArray` holds the keyed state, the seats and
+their keys, and every level's state (12.2); `Net.host(port, state)` and `Net.offline(state)` start from
+one. A run of a roguelike is resumed by hosting from its last save; each player rejoins with the key
+they had. The game decides when and where to write the bytes.
+
+**Cards demo.** `demos/cards/`: a two-seat card game whose rules live in a `RefCounted` model on the
+server, which makes the README's point for this genre: keep the card table's `Control` nodes outside any
+`NetManager`, send intentions with `await Net.server(play_card, index)`, publish the table through the
+keyed state, and keep each hand under a view or as `visible_to = owner` entities. Its tests drop a
+client mid-turn and bring it back, check that no byte of a hand reaches the other seat, and resume a
+saved run. WP11 (the web export) is done alongside, with this demo as its exported scene, since a card
+game is the likeliest thing to ship in a browser.
+
+### 12.4 Physics modes (WP19)
+
+Who simulates a `RigidBody2D/3D` (and its subclasses, `VehicleBody3D` included) becomes a choice per
+entity: `physics` on `NetEntity`, the `configure()` key `"physics"`, a default per manager
+(`NetManager.physics`) and per project (`gdnet/physics/mode`). No mode needs a script change, and modes
+mix freely in one scene.
+
+| mode | who simulates | on the other peers | what it feels like | meant for |
+|---|---|---|---|---|
+| `server` (v1's behaviour, the default: D19) | the server | frozen, interpolated | controls and pushes show after a round trip plus the jitter buffer; piles are stable and identical everywhere | scenery physics, large settled structures, the Ballpit |
+| `owner` (v1's `client_owned`, for bodies) | the entity's owner | frozen, interpolated, the server included | immediate for the owner; where bodies of two owners meet, each side collides with the other's past | a player's own vehicle or contraption, co-op games |
+| `handoff` (WP15, generalised) | whoever is interacting with it: authority moves to the peer whose player or owned bodies touch, grab or stand on the body, and back to the server when it comes to rest | simulated by the current authority, interpolated elsewhere | immediate for the one touching; when two peers claim a body in the same tick, the higher ownership sequence number wins and the server breaks ties | loose shared objects: crates, balls, carried items, things players push |
+| `simulated` | every peer, locally; the server's result is the reference | not frozen: local physics runs, and each snapshot is applied as a correction (decaying offsets on position and rotation, velocities pulled to the server's, a hard snap beyond `teleport_distance`) | contacts are immediate on every screen; when the simulations disagree the body visibly slides to the server's answer | fast, contact-heavy play: vehicles ramming each other, a predicted player standing on moving bodies |
+
+Notes:
+
+- `simulated` and `handoff` remove v1's limit "predicted players and frozen replicas": the replica a
+  predicted player touches is a live body.
+- A body's mode applies to its whole assembly (12.5).
+- `physics = owner` is the same mechanism as `client_owned = true`; the option sets it for bodies, and
+  `client_owned` stays for entities that are not bodies (D21).
+- Rollback of Godot's physics stays ruled out: the engine cannot step a space on demand, and 4.6's
+  engines are not deterministic across machines. `simulated` is what state correction can do without
+  it. A rollback-quality option would be a physics world inside the extension (a Rust engine under
+  WP12's deterministic mode); it is not planned, and D24 says when to look at it again.
+- Tuning lives in the project settings `gdnet/physics/correction_*` (position and angle thresholds,
+  decay) and `gdnet/physics/handoff_rest_s` (how long a body rests before authority returns).
+
+### 12.5 Assemblies, entity references and cheap resting parts (WP18, WP20)
+
+**3D parity (WP18).** Every scenario family that exists in 2D gets a 3D twin under `NetFixture`: state
+(`Node3D`, `quaternion` with `smallest3`), prediction (`CharacterBody3D`), interpolation (slerp),
+interaction scoring in metres, travel to a `Marker3D`. Gate G10.
+
+**Idle entities (WP18).** Resting things stop costing CPU as well as bytes:
+
+- a sleeping `RigidBody` is not polled at all; its `sleeping_state_changed` signal puts it back on the
+  hot list in the tick it wakes;
+- any other entity whose hot properties did not change for `gdnet/sync/idle_after_ticks` (default 30) is
+  polled at the cold rate (`cold_poll_ticks`) until one changes, and at once after a call names it or
+  `Net.touch(node)`. The price is that a script moving a long-idle node is seen up to `cold_poll_ticks`
+  late on its first tick, which is the delay its cold properties always had;
+- target: 5,000 resting bodies under 0.5 ms of polling per server tick (v1: about 4 ms per 1,000 entities).
+
+**Assemblies (WP20).** Bodies connected by joints form an *assembly*, computed on the authority from the
+`Joint2D/3D` nodes under its managers (`node_a`, `node_b`) and updated when a joint enters or leaves the
+tree; `Net.assemble(bodies)` declares one where no joint says so. An assembly
+
+- has one authority: `owner`, `handoff` and ownership transfers move all its bodies together;
+- is one entry in the priority accumulator and goes out whole: every body of it in a snapshot carries
+  the same tick, split over several packets of that tick when it exceeds an MTU, and a client applies it
+  when it has all of them. Jointed parts therefore never show states from different ticks;
+- is encoded compactly: the root body in full, the others relative to the root in the root's frame with
+  short-range quantisers.
+
+**Welded structures.** Parts fixed to each other should be one body with many shapes, not many bodies. A
+scene instance added at run time under a body entity is an *attachment*: its own entity (a `Create` with
+the parent entity and part, as v1 already sends), a cold local transform, and no body of its own, so a
+castle of 500 blocks is one sleeping body and 500 entities that send nothing and are not polled. WP20
+tests this path and documents it as the way to build structures.
+
+**Entity references.** A new property type: a reference to a managed node, sent as (net id, part index)
+and resolved to the local node on arrival (D5: still no NodePath on the wire). Joint profiles use it for
+`node_a` and `node_b`, which clients need in every mode but `server`, because they simulate. It also
+makes `@export var target: Node` replicate for any game.
+
+**Building.** No new verb. A part is placed with `add_child` on the server, usually behind
+`Net.server(place_part, ...)`. For games where placing must feel instant, `spawn_policy = owner_allowed`
+lets the placing client spawn the part at once and the server adopt it (12.1: an ordinary mode).
+
+**Workshop demo (WP21).** `demos/workshop/`: a 3D floor, a handful of part scenes (block, wheel on a
+hinge joint, thruster, seat), players who build a contraption and drive it, a switch between the four
+physics modes on the running scene, the meter. It is the third end-goal demo, with a README whose listings
+a test diffs, and headless tests in both host modes (gate G11).
+
+### 12.6 Work packages and order
+
+| WP | scope | files | tests | docs |
+|---|---|---|---|---|
+| **WP16 interest, several rooms, level placement and state** | 12.2: `radius` with hysteresis and `set_focus`; `visible_to`, `Net.show_to`, the `audience` property option, `visibility_filter`; room sets, `neighbours`, `add_room` / `remove_room`, reparent-only travel, `bounds` and `auto_travel`; level origins and the grid; `keep_state`, `level_state`, `load_level(path, origin, state)` | `rust/netcore/src/{rooms,interest}.rs`, `rust/gdnet/src/{world,travel,interest}.rs`; the Doors demo gains a 2 x 2 chunk overworld | Rust: the scope rule with radius, hysteresis and room sets; audience masking; GDScript: an entity beyond the radius is absent and returns with current state; crossing a chunk edge frees no replica and causes no rollback; two interiors loaded at once do not collide; a level reloaded after its timeout has its chest open; a non-owner's packets never contain an `audience: owner` value | guide 09 rewritten; a new page on visibility |
+| **WP17 seats, reconnection, session state; Cards demo** | 12.3: the key in `Hello`, seats, `rejoin_timeout_s`, `peer_dropped` / `peer_rejoined` / `seat_released`, the keyed-state rule `"seat"`, `save_state` and hosting from one; `demos/cards/`; WP11 alongside | `rust/netcore/src/{seats,session,keyed}.rs`, `rust/gdnet/src/{net,session}.rs`, `demos/cards/` | Rust: key to seat mapping, the timeout, restoring ownership; GDScript: a client dropped mid-turn rejoins with its entities, rooms and hand; the timeout path gives the entities to the server; a saved run hosted again has the same keyed state and seats; the demo's hands never reach the other seat | a guide page on seats and rejoining; the demo README |
+| **WP18 3D parity and cheap idle entities** | 12.5: 3D twins of the 2D scenario families; sleeping bodies unpolled, the idle list, `Net.touch` | `rust/gdnet/src/poll.rs`, `tests/integration/test_net_3d.gd`, `tests/fixtures/` | GDScript: the 3D scenarios in both host modes; the polling benchmark with 5,000 resting bodies; a woken body is sent in the tick it wakes | guide 03 and 10 |
+| **WP19 physics modes** | 12.4: `physics = server \| owner \| handoff \| simulated` per entity, manager and project; handoff with ownership sequence numbers (WP15's scope); corrections for simulated replicas | `rust/netcore/src/{handoff,correct}.rs`, `rust/gdnet/src/physics.rs`; a mode switch in the Ballpit demo | Rust: sequence-number arbitration, correction thresholds and decay; GDScript, in 2D and 3D: `owner` moves on the tick of the input; a `handoff` body pushed by a client moves at once there and converges elsewhere, and returns to the server at rest; a predicted player on a `simulated` platform does not roll back every tick; two peers claiming one body agree on the winner | guide 10 rewritten around the mode table; guide 07's `client_owned` section |
+| **WP20 assemblies and entity references** | 12.5: assemblies from joints and `Net.assemble`, one authority, whole-or-nothing snapshots, root-relative encoding; attachments under a body; the entity-reference property type and joint profiles | `rust/netcore/src/{assembly,props,snapshot}.rs`, `rust/gdnet/src/{assembly,infer,profiles}.rs` | Rust: assembly membership as joints come and go, multi-packet assemblies, the relative encoding; GDScript: jointed bodies on a replica never differ by more than a quantiser step from the server's relative pose; a joint's `node_a` resolves on the client; 500 attachments under a sleeping body cost no bytes and no polling | a guide page on contraptions and structures |
+| **WP21 demo: Workshop (3D contraptions)** | 12.5: `demos/workshop/` | `demos/workshop/`, `tests/integration/test_workshop_demo.gd` | gate G11 | the demo README |
+| **WP22 the rest of v1's declared surface** | `send_rate` (snapshots every N ticks); rung 5's `#[derive(NetSync)]` with `mark_dirty()` and `INetEntity` | `rust/gdnet-derive/`, `rust/gdnet/src/tick.rs` | Rust: the derive's table equals the inferred one; a derived entity is never polled | guide page on Rust entities |
+
+Order: **WP16 → WP17 (with WP11) → WP18 → WP19 → WP20 → WP21**. WP16 first because the adventure game is
+the closest to done and WP17's demo needs its visibility; WP18 before WP19 so the modes are built and
+tested in 3D from the start. WP9, WP10, WP12 and WP22 stay independent and by demand; WP9 matters to the
+adventure game only if it has PvP.
+
+### 12.7 Gates
+
+- **G9 Interest.** With a radius set, a client holds no entity beyond 1.2 times it; a player crossing
+  between neighbouring rooms is never freed on a peer that has both; a value marked `audience: owner`
+  appears in no packet to another peer (WP16).
+- **G10 3D parity.** Each 2D scenario family has a 3D twin passing in both host modes (WP18).
+- **G11 Workshop.** Two clients; a 30-part jointed vehicle driven by its builder in `owner` mode moves on
+  the tick of the input for the driver and converges on the other client; its parts stay within a
+  quantiser step of their relative pose on every replica; 2,000 attached blocks at rest cost zero
+  snapshot bytes and stay inside the idle polling target (WP21).
+- **G12 Rejoin.** A client dropped under emulated loss rejoins inside the timeout and holds the same
+  entities, rooms and private state as before; nothing it owned was destroyed (WP17).
+- G0, G2 and G7 apply to every new package: no cost without a session, both host modes, and no script
+  change needed for any physics mode, radius or rejoin to work.
+
+### 12.8 Decisions for the owner
+
+D18 is taken (the owner's note). D19 to D25 are recommendations and stand until the owner says otherwise.
+
+- **D18 Trust.** Cheat prevention is not a priority inside the extension (12.1). *Taken 2026-11-13.*
+- **D19 Default physics mode.** `server`. *Recommended*: it is v1's behaviour, needs no tuning and is the
+  only mode where every peer sees the same pile. Alternative: `simulated`, more responsive by default
+  but with visible corrections in scenes that never needed them.
+- **D20 Levels keep their state for the session.** `NetManager.keep_state = true` by default.
+  *Recommended* for a game with interiors; a level that should reset (an arena) turns it off.
+  Alternative: off by default, as v1 behaves.
+- **D21 `client_owned` and `physics = owner`.** One mechanism, two spellings: `physics` for bodies,
+  `client_owned` for everything else. *Recommended.* Alternative: rename `client_owned` to one option
+  for all entities, which breaks v1 scenes.
+- **D22 Rejoin window.** 60 s by default, configurable, -1 for the whole session. *Recommended.* A
+  turn-based game sets -1.
+- **D23 Peer ids stay in the API.** Seats are added beside them; `spawn_for`, `set_owner` and the verbs
+  keep taking peer ids. *Recommended*: nothing in v1 breaks. Alternative: seats everywhere, cleaner for
+  new code.
+- **D24 A physics world inside the extension.** Not planned. *Recommended*: judge `simulated` and
+  `handoff` in the Workshop demo first; if their corrections are not good enough for the games the owner
+  wants, a Rust physics engine under WP12 is the next step, at the price of not using Godot's bodies.
+- **D25 Three more demos' worth of scope.** The chunk overworld extends Doors, the mode switch extends
+  Ballpit, and Cards and Workshop are new. *Recommended*: each target game ends in a worked example
+  that the check runs, as v1's did.
+
+### 12.9 Risks
+
+- **`simulated` corrections that fight the local simulation.** Two engines that disagree every tick give
+  a body that never settles. The thresholds, the Ballpit mode switch and a test that counts corrections
+  per second on a resting pile keep it measured; `server` remains the fallback per entity.
+- **Handoff disputes.** Two players pushing one crate from both sides. Sequence numbers pick a winner
+  per tick; the loser sees a correction. The Workshop tests include the case.
+- **Assemblies larger than a tick's budget.** A whole-or-nothing assembly that never fits would starve.
+  An assembly may exceed the budget for one tick (the bucket goes negative and recovers), and the meter
+  names assemblies that do so repeatedly.
+- **Runtime attachments and part tables.** v1's part indices come from the scene file; attachments rely
+  on run-time children being entities of their own. WP20 starts by pinning that behaviour with a test.
+- **Several levels loaded on a client.** Memory and load time grow with the neighbour count; the guide
+  says to keep chunks small, and the meter shows loaded levels.
+- **Scope.** Seven packages after a v1 of eleven. The order in 12.6 delivers the adventure game's needs
+  first and each package ends with a passing check, so the plan can stop after any of them.

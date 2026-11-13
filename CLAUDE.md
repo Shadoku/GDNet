@@ -10,6 +10,9 @@ packages are in `docs/PLAN_NETCODE.md` (approved 2026-11-08; the status table at
 its end says what is built); the research behind it is
 `docs/reports/Rust GDExtension multiplayer design.md` and `docs/research_notes/`.
 Follow the plan's packages in order and update its status table when one lands.
+Section 12 of the plan (v2, added 2026-11-13) holds the packages after v1 and their order. Priorities
+(the owner's, plan goal 9): function, flexibility and keeping game code close to its single-player
+version come first; cheat detection and prevention are not a priority inside the extension.
 
 ## Commands
 
