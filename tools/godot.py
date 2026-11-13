@@ -202,8 +202,27 @@ def cmd_build(_: argparse.Namespace) -> int:
     return 0
 
 
+def forget_removed_extensions() -> None:
+    """Drops GDExtensions whose file is gone from Godot's cached list: Godot does not, and prints an
+    error for each at every start (an addon that was removed, or is installed only on some machines)."""
+    listing = ROOT / ".godot" / "extension_list.cfg"
+    if not listing.exists():
+        return
+    lines = listing.read_text().splitlines()
+    kept = [l for l in lines if not l.startswith("res://") or (ROOT / l[len("res://"):]).exists()]
+    if kept != lines:
+        listing.write_text("".join(l + "\n" for l in kept))
+
+
 def cmd_import(_: argparse.Namespace) -> int:
+    forget_removed_extensions()
     code, out = run_godot(["--import"], TIMEOUT["import"])
+    if code != 0 and "handle_crash" in out:
+        # Godot 4.6 can crash while loading the editor layout at the end of the first headless import
+        # of a checkout or of a newly added extension, after the import itself is done. One more run
+        # tells that apart from a real failure.
+        print("import: Godot crashed; running it once more")
+        code, out = run_godot(["--import"], TIMEOUT["import"])
     if code != 0:
         say(clean(out)[-3000:])
     return code

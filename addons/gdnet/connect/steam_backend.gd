@@ -11,10 +11,9 @@ extends RefCounted
 ## (`tests/fixtures/connect/fake_steam_backend.gd`) that overrides every method below. Answers from Steam
 ## arrive as this object's signals, emitted while `poll()` runs Steam's callbacks.
 ##
-## UNVERIFIED (2026-11-13): the GodotSteam names below were written from GodotSteam's documentation as
-## remembered, not checked against the release (codeberg.org and godotsteam.com were refused by this
-## session's network) nor run against a Steam client. Each one is used only in this file, so a wrong name
-## is a one-line fix. The names: `steamInitEx(app_id, embed_callbacks)` (older builds:
+## Checked 2026-11-13 against the GodotSteam GDExtension 4.24 library loaded in Godot 4.6 (`ClassDB`
+## lists every method and signal below with these arguments, and `steamInitEx` returns the dictionary
+## described); not yet run against a Steam client. Each name is used only in this file. The names: `steamInitEx(app_id, embed_callbacks)` (older builds:
 ## `steamInitEx(retrieve_stats, app_id, embed_callbacks)`, detected below) returning
 ## `{"status": 0 on success, "verbal": String}`; `run_callbacks`, `isSteamRunning`, `loggedOn`,
 ## `getSteamID`; `createLobby(type, max_members)` -> signal `lobby_created(result, lobby_id)` (result 1 =

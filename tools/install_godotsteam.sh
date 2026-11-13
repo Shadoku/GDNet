@@ -8,11 +8,9 @@
 # Overrides: GODOTSTEAM_VERSION (the version), GODOTSTEAM_URL (the archive's URL), GODOTSTEAM_SHA256
 # (its SHA-256; default: .godotsteam-sha256 when that file exists and is not empty).
 #
-# UNVERIFIED (2026-11-13): the release URL below follows GodotSteam's release naming as remembered; the
-# releases moved to codeberg.org, which this script's author could not reach. If the download fails with
-# 404, open https://codeberg.org/godotsteam/godotsteam/releases, copy the GDExtension plugin archive's
-# link for the pinned version, and run GODOTSTEAM_URL=<link> tools/install_godotsteam.sh (then fix the
-# default below and write the archive's SHA-256 into .godotsteam-sha256).
+# Checked 2026-11-13: the URL below is release v4.24-gde on codeberg.org and its SHA-256 is pinned in
+# .godotsteam-sha256. For another version, set .godotsteam-version and write the new archive's SHA-256
+# (the script prints it when none is pinned) into .godotsteam-sha256.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

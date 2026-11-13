@@ -197,9 +197,9 @@ that one file, and its doc comment lists the names it assumes.
 ## Known limits
 
 * The Steam path is untested until the procedure above passes (see the top of this page).
-* The GodotSteam names in `steam_backend.gd` (`steamInitEx`, `createLobby`, `SteamMultiplayerPeer`'s
-  `create_host` / `create_client` ...) and the release URL in `tools/install_godotsteam.sh` are unverified
-  against the current GodotSteam release.
+* The GodotSteam calls in `steam_backend.gd` and the release URL and checksum in
+  `tools/install_godotsteam.sh` were checked against GodotSteam 4.24 loaded in Godot 4.6 (2026-11-13),
+  without a Steam client: the calls exist with the arguments used; what Steam answers is still untested.
 * Desktop only: GodotSteam does not run in a browser.
 * A dedicated server on Steam (`--server`) is not offered: `--server` hosts over ENet. A Steam-hosted game
   needs a logged-in Steam client on the host.
