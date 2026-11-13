@@ -14,6 +14,9 @@ func _physics_process(_delta: float) -> void:
 	move_and_slide()
 
 
-## After a door: the player stands in another level, so the camera jumps instead of gliding there.
+## After a door the player stands somewhere else, so the camera jumps instead of gliding there. A walk
+## into the next chunk is a travel too, and the camera keeps gliding.
 func _net_travelled(_from: String, _to: String) -> void:
-	$Camera2D.reset_smoothing()
+	var camera: Camera2D = $Camera2D
+	if camera.get_screen_center_position().distance_to(global_position) > 600.0:
+		camera.reset_smoothing()

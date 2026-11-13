@@ -10,6 +10,9 @@ const B := "res://tests/fixtures/rooms/chunk_b.tscn"
 const IN_A := "res://tests/fixtures/rooms/interior_a.tscn"
 const IN_B := "res://tests/fixtures/rooms/interior_b.tscn"
 const VAULT := "res://tests/fixtures/rooms/vault_3d.tscn"
+const CELL_A := "res://tests/fixtures/rooms/cell_3d_a.tscn"
+const CELL_B := "res://tests/fixtures/rooms/cell_3d_b.tscn"
+const WALKER_3D := preload("res://tests/fixtures/rooms/walker_3d.tscn")
 const SPACING := "gdnet/levels/spacing"
 const ACTIONS: Array[String] = ["left", "right", "up", "down", "jump"]
 ## The fixture player's speed (px/s) and the most it moves in one tick at 60 Hz.
@@ -337,3 +340,24 @@ func test_a_3d_level_takes_a_vector3_origin_and_a_cell() -> void:
 	assert_true(net.server_session.unload_level(VAULT))
 	var w: Node3D = net.server_session.load_level(VAULT)
 	assert_eq(w.position, Vector3(50, 0, 0), "without an origin it takes the first cell")
+
+
+## `bounds_3d` with `auto_travel`: a 3D player moved by the server across the edge of two cells that
+## name each other travels to the next cell's manager; the client's copy is moved, not recreated.
+func test_bounds_3d_auto_travel_moves_a_3d_player() -> void:
+	var ok := await NetFixture.run_both_modes(self, 1, func(f: NetFixture) -> void:
+		var ca: Node = f.clients[0]
+		var a := f.peer_id(ca)
+		var cell_a: Node = f.server_session.load_level(CELL_A)
+		var walker: Node3D = Net.spawn_for(a, WALKER_3D, cell_a.get_node("NetManager"), "Walker")
+		assert_true(await f.wait_until(func() -> bool:
+			return _has_levels(f.session(ca), [CELL_A, CELL_B]) and ca.has_node("cell_3d_a/NetManager/Walker")), "the client has both cells and its walker")
+		var copy: Node = ca.get_node("cell_3d_a/NetManager/Walker")
+		walker.position = Vector3(6, 0, 0)
+		assert_true(await f.wait_until(func() -> bool: return f.server_session.room_of(a) == CELL_B), "the server moved it into the next cell")
+		assert_eq(walker.get_parent().get_parent().name, &"cell_3d_b")
+		assert_true(await f.wait_until(func() -> bool: return copy.get_parent().get_parent().name == &"cell_3d_b"), "the client's copy followed")
+		assert_true(is_instance_valid(copy) and ca.get_node("cell_3d_b/NetManager/Walker") == copy, "moved, not recreated")
+		assert_eq(walker.global_position, Vector3(6, 0, 0), "it kept its position")
+	)
+	assert_true(ok, "fixtures connected")

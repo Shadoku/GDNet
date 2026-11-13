@@ -1,0 +1,8 @@
+[gd_scene format=3]
+
+[node name="Cell3DA" type="Node3D"]
+
+[node name="NetManager" type="NetManager" parent="."]
+neighbours = PackedStringArray("res://tests/fixtures/rooms/cell_3d_b.tscn")
+auto_travel = true
+bounds_3d = AABB(-5, -5, -5, 10, 10, 10)
