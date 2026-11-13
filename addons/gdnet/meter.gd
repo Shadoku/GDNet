@@ -79,8 +79,17 @@ func refresh() -> void:
 	_put("prediction", "rollbacks %d/s  replayed %d  inputs repeated %d" % [d.get("rollbacks_per_s", 0), d.get("replayed_ticks", 0), d.get("inputs_repeated", 0)])
 	_put("poll", "poll %.3f ms (avg %.3f)" % [d.get("poll_ms", 0.0), d.get("poll_ms_avg", 0.0)])
 	_put("hashes", "hashes out %d  in %d  divergences %d (%d/s)%s" % [d.get("hashes_sent", 0), d.get("hashes_received", 0), d.get("divergences", 0), d.get("divergences_per_s", 0), "" if d.get("hash_telemetry", true) else "  (off)"])
-	_put("authority", "owner changes %d  rejected writes %d" % [d.get("owner_changes", 0), d.get("writes_rejected", 0)])
+	_put("authority", "owner changes %d  rejected writes %d  %s" % [d.get("owner_changes", 0), d.get("writes_rejected", 0), _seats_text(d)])
 	_put("rooms", _rooms_text(d))
+
+
+## WP17: this peer's seat and the seats taken, with how many are away (dropped, held for a rejoin).
+func _seats_text(d: Dictionary) -> String:
+	var away: int = d.get("seats_away", 0)
+	var text := "seat %d of %d" % [d.get("my_seat", 0), d.get("seats", 0)]
+	if away > 0:
+		text += " (%d away)" % away
+	return text
 
 
 ## WP13/WP16: this peer's room and how many more it has (neighbours, added rooms), the entities per

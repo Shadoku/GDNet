@@ -346,6 +346,24 @@ impl InputBuffer {
         }
     }
 
+    /// WP17: the tick of an owner whose seat is away: a neutral (default) frame, not a repeat of the
+    /// last one, so a dropped player stops. Frames received earlier are discarded.
+    pub fn take_neutral(&mut self, tick: u64) -> TakenFrame {
+        let prev = self
+            .last
+            .as_ref()
+            .map(|(_, f)| f.clone())
+            .unwrap_or_default();
+        self.frames.clear();
+        self.last = Some((tick, InputFrame::default()));
+        TakenFrame {
+            tick,
+            frame: InputFrame::default(),
+            prev,
+            repeated: false,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.frames.len()
     }

@@ -93,11 +93,21 @@ impl NetOverlay {
                     .get("color")
                     .and_then(|v| v.try_to::<Color>().ok())
                     .unwrap_or(Color::WHITE);
-                placed.push((
-                    pos,
-                    GString::from(format!("#{id} owner {owner}").as_str()),
-                    color,
-                ));
+                // WP17: an entity of a dropped seat says so (its owner is the seat's old peer id).
+                let away = d
+                    .get("away")
+                    .and_then(|v| v.try_to::<bool>().ok())
+                    .unwrap_or(false);
+                let seat = d
+                    .get("seat")
+                    .and_then(|v| v.try_to::<i64>().ok())
+                    .unwrap_or(0);
+                let text = if away {
+                    format!("#{id} seat {seat} away")
+                } else {
+                    format!("#{id} owner {owner}")
+                };
+                placed.push((pos, GString::from(text.as_str()), color));
             }
         }
         while self.labels.len() < placed.len() {

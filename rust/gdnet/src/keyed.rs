@@ -141,7 +141,9 @@ impl NetKeyedState {
         keys.iter().map(|k| GString::from(k.as_str())).collect()
     }
 
-    /// Server: lets `who` (a peer id, `"all"` or `"owner"`) write the paths under `prefix`.
+    /// Server: lets `who` (a peer id, `"all"`, `"owner"` or `"seat"`) write the paths under `prefix`.
+    /// `"owner"`: the segment after the prefix is the writer's peer id; `"seat"` (WP17): its seat, so
+    /// the path stays the player's across a rejoin.
     #[func]
     fn allow(&mut self, prefix: GString, who: Variant) {
         let who = match who.get_type() {
@@ -149,9 +151,10 @@ impl NetKeyedState {
             _ => match who.to_string().as_str() {
                 "all" => netcore::Who::All,
                 "owner" => netcore::Who::Owner,
+                "seat" => netcore::Who::Seat,
                 other => {
                     godot_error!(
-                        "gdnet: Net.state.allow: who must be a peer id, \"all\" or \"owner\" (got {other:?})"
+                        "gdnet: Net.state.allow: who must be a peer id, \"all\", \"owner\" or \"seat\" (got {other:?})"
                     );
                     return;
                 }

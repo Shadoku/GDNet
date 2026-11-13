@@ -34,7 +34,7 @@ first session in the tree (set `meter.session` to choose one, e.g. a test branch
 | prediction | `rollbacks_per_s`, `replayed_ticks`, `inputs_repeated` (page 4) |
 | poll | `poll_ms`, `poll_ms_avg`: what reading the hot and cold properties cost (page 3, "Dirty tracking") |
 | hashes | `hashes_sent`, `hashes_received`, `divergences`, `divergences_per_s` |
-| authority | `owner_changes`, `writes_rejected` (page 7) |
+| authority | `owner_changes`, `writes_rejected` (page 7); WP17: `my_seat`, `seats` (taken, connected or away) and `seats_away` (page 1) |
 | rooms | `room` (this peer's primary room; on the server the host player's) and `+N` for the other rooms in `my_rooms`, `rooms` (entities per room), `levels`, `travelling` (page 9): `room chunk_0_0 +3  [chunk_0_0 7, ...]  levels 4  travelling 0` |
 
 Interest has no line of its own; its keys are in `stats()` (page 11): `interest_passes`, `interest_ms`,
@@ -54,7 +54,8 @@ Net.overlay_rows()          # the same data: one Dictionary per managed entity
 
 Each frame the overlay puts a small label at every managed entity whose root is a `Node2D` (its canvas
 position) or a `Node3D` (projected through the current `Camera3D`; skipped without one), reading
-`#<net id> owner <peer>`, coloured by role, Roblox-style:
+`#<net id> owner <peer>` (WP17: `#<net id> seat <seat> away` for an entity whose owner's seat dropped and is
+held for a rejoin), coloured by role, Roblox-style:
 
 | colour | `role` | meaning |
 |---|---|---|
@@ -65,7 +66,8 @@ position) or a `Node3D` (projected through the current `Camera3D`; skipped witho
 | red | `rejected` | a write to it was rejected in the last second (on the writer and on the server) |
 
 `overlay_rows()` rows: `net_id`, `owner`, `role`, `color`, `client_owned`, `transfer` (0 fixed, 1
-request, 2 take), `scene`, `parts`, `hashes_diverged` and `node`. `NetSession.overlay_rows()` gives a
+request, 2 take), `scene`, `parts`, `hashes_diverged`, `node`, `room`, `seat` (the owner's seat, 0 for
+none) and `away` (that seat dropped). `NetSession.overlay_rows()` gives a
 branch's rows; the overlay shows every session in the tree. `gdnet/debug/overlay = true` shows it when a
 session starts.
 

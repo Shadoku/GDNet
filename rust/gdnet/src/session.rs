@@ -174,6 +174,26 @@ pub struct NetSession {
     pub(crate) interest: crate::interest::State,
     /// WP16, server: the kept level state blobs by scene path (levelstate.rs), for this session.
     pub(crate) kept_levels: std::collections::BTreeMap<String, Vec<u8>>,
+    /// WP17: the seat key this session sends when it joins (a client) or plays with (a listen
+    /// server). A random string per session object unless set; set it before `start()` to rejoin a
+    /// seat (`Net` sets it from `Net.key` or `join`'s `key`). Setting "" picks a new random key.
+    #[var(get = get_key, set = set_key)]
+    #[init(val = GString::from(crate::seats::random_key().as_str()))]
+    key: GString,
+    /// WP17: a server that does not play: it holds no seat, and the first client is seat 1. Set it
+    /// before `start()`.
+    #[var]
+    pub(crate) dedicated: bool,
+    /// WP17: a dropped peer's seat is held this many seconds (0 = released at once, as v1 did; -1 =
+    /// for the whole session). Reads as the effective value: this session's when set, else
+    /// `Net.rejoin_timeout_s`, else the project setting `gdnet/session/rejoin_timeout_s` (60).
+    /// Writing a value below -1 goes back to the default. Applies to a running server at its next
+    /// tick.
+    #[var(get = get_rejoin_timeout_s, set = set_rejoin_timeout_s)]
+    #[init(val = f64::NAN)]
+    pub(crate) rejoin_timeout_s: f64,
+    /// WP17, server: restored level entities waiting for their owner's seat to be connected.
+    pub(crate) seat_claims: Vec<(u32, Gd<Node>)>,
 }
 
 /// WP8: the group every session joins (the overlay and the meter find sessions through it).
@@ -330,10 +350,50 @@ impl NetSession {
     /// `_net_travelled(from, to)` ran; on the server and on every client that still sees it.
     #[signal]
     fn travelled(player: Gd<Node>, from: GString, to: GString);
+    /// WP17: a seated peer disconnected and its seat is held for the rejoin window (on the server and
+    /// every remaining client). Its entities stay, owned by its old peer id, and stand still.
+    #[signal]
+    fn peer_dropped(seat: i64);
+    /// WP17: the away `seat` was taken back by `peer` (a new peer id): its entities, player, rooms and
+    /// private state are that peer's now.
+    #[signal]
+    fn peer_rejoined(seat: i64, peer: i64);
+    /// WP17: `seat` was released (its window ended, or the window is 0): its entities went back to
+    /// the server.
+    #[signal]
+    fn seat_released(seat: i64);
 
     #[func]
     fn get_empty_level_timeout(&self) -> f64 {
         self.empty_level_timeout
+    }
+
+    #[func]
+    pub fn get_key(&self) -> GString {
+        self.key.clone()
+    }
+
+    #[func]
+    pub fn set_key(&mut self, key: GString) {
+        self.key = if key.is_empty() {
+            GString::from(crate::seats::random_key().as_str())
+        } else {
+            key
+        };
+    }
+
+    #[func]
+    pub fn get_rejoin_timeout_s(&self) -> f64 {
+        if self.rejoin_timeout_s.is_nan() {
+            crate::seats::net_rejoin()
+        } else {
+            self.rejoin_timeout_s
+        }
+    }
+
+    #[func]
+    pub fn set_rejoin_timeout_s(&mut self, v: f64) {
+        self.rejoin_timeout_s = crate::seats::normalise(v);
     }
 
     #[func]
@@ -890,6 +950,11 @@ impl NetSession {
             d.set("prediction_lead", core.prediction_lead().unwrap_or(-1));
             d.set("input_delay", i64::from(core.input_delay()));
             d.set("predicted_tick", core.predicted_tick() as i64);
+            // WP17: seats taken (connected or away) and seats away.
+            let (seats, away) = core.seat_stats();
+            d.set("seats", seats as i64);
+            d.set("seats_away", away as i64);
+            d.set("my_seat", i64::from(core.my_seat().unwrap_or(0)));
         }
         d.set("rollbacks", c.rollbacks as i64);
         d.set("rollbacks_per_s", c.rollbacks_per_s as i64);
@@ -1041,6 +1106,16 @@ impl NetSession {
                 );
                 d.set("node", &e.node);
                 d.set("room", &room);
+                // WP17: the owner's seat (0: none), and whether that seat is away (dropped).
+                let seat = self
+                    .core
+                    .as_ref()
+                    .and_then(|c| c.seat(e.owner))
+                    .filter(|_| e.owner != netcore::SERVER || !self.dedicated)
+                    .unwrap_or(0);
+                let away = seat != 0 && self.core.as_ref().is_some_and(|c| c.peer_of(seat) == 0);
+                d.set("seat", i64::from(seat));
+                d.set("away", away);
                 out.push(&d.to_variant());
             }
         }
@@ -1085,8 +1160,26 @@ impl NetSession {
 
     /// Starts a session over `peer`, installing gdnet's `MultiplayerAPI` for `root_path` (empty: the
     /// whole tree). A peer whose unique id is 1 hosts; any other joins. Returns `OK` or an error code.
+    /// WP17: a host starts from `state` (`save_state()`'s bytes) when it is not empty: the keyed
+    /// state, the seats reserved for their keys, and the levels' states for when they load. A state
+    /// that does not decode is refused with an error (`ERR_INVALID_DATA`) and nothing starts; a
+    /// joining client ignores it.
     #[func]
-    pub fn start(&mut self, peer: Gd<MultiplayerPeer>, root_path: NodePath) -> Error {
+    pub fn start(
+        &mut self,
+        peer: Gd<MultiplayerPeer>,
+        root_path: NodePath,
+        #[opt(default = net_call::NetArg::absent())] state: NetArg,
+    ) -> Error {
+        let state = crate::seats::state_arg(state);
+        let hosting = peer.get_unique_id() == 1;
+        let saved = match crate::seats::decode_state(&state, hosting) {
+            Ok(s) => s,
+            Err(e) => {
+                godot_error!("NetSession.start: the session state was refused: {e}");
+                return Error::ERR_INVALID_DATA;
+            }
+        };
         if self.core.is_some() {
             self.leave();
         }
@@ -1178,12 +1271,31 @@ impl NetSession {
         cfg.profiles_hash = profiles::global_profiles().hash();
         cfg.budget_bytes_per_s = self.effective_budget();
         cfg.max_rollback_ticks = tick::max_rollback_ticks(cfg.tick_rate);
-        let hosting = peer.get_unique_id() == 1;
         let mut core = if hosting {
             Session::server(cfg)
         } else {
             Session::client(cfg)
         };
+        // WP17: the seat key, the rejoin window, and the state this host starts from.
+        self.seat_claims.clear();
+        let key = self.key.to_string();
+        if hosting {
+            core.set_rejoin_hold(netcore::seats::Hold::from_seconds(
+                self.get_rejoin_timeout_s(),
+                cfg.tick_rate,
+            ));
+            if let Some(st) = &saved {
+                core.restore_state(st);
+                for (path, blob) in &st.levels {
+                    self.kept_levels.insert(path.clone(), blob.clone());
+                }
+            }
+            if !self.dedicated {
+                core.take_server_seat(&key);
+            }
+        } else {
+            core.set_key(&key);
+        }
         core.set_interpolation(
             interp::jitter_buffer_ticks(),
             interp::adaptive(),
@@ -1416,6 +1528,8 @@ impl NetSession {
             self.sync_level_gone();
             self.process_travels();
             self.check_empty_levels();
+            // WP17: restored entities whose owner's seat is connected go to it.
+            self.process_seat_claims();
         }
         self.input_step();
         self.keyed_step();
@@ -1451,6 +1565,21 @@ impl NetSession {
                 }
                 Event::Disconnected(reason) => ended = Some(reason),
                 Event::EntityError(text) => godot_error!("{text}"),
+                Event::SeatDropped(seat) => {
+                    self.base_mut()
+                        .emit_signal("peer_dropped", &[i64::from(seat).to_variant()]);
+                }
+                Event::SeatRejoined { seat, peer, old } => {
+                    self.seat_rejoined(old, peer);
+                    self.base_mut().emit_signal(
+                        "peer_rejoined",
+                        &[i64::from(seat).to_variant(), i64::from(peer).to_variant()],
+                    );
+                }
+                Event::SeatReleased(seat) => {
+                    self.base_mut()
+                        .emit_signal("seat_released", &[i64::from(seat).to_variant()]);
+                }
             }
         }
         if let Some(reason) = ended {
@@ -1852,12 +1981,19 @@ impl NetSession {
     fn refresh_live_settings(&mut self) {
         let budget = self.effective_budget();
         let sample = self.effective_hash_sample();
+        let rejoin = self.get_rejoin_timeout_s();
         if let Some(c) = self.core.as_mut() {
             if c.budget() != budget {
                 c.set_budget(budget);
             }
             let on = c.hash_telemetry();
             c.set_hash_telemetry(on, sample);
+            if c.role() == netcore::Role::Server {
+                let hold = netcore::seats::Hold::from_seconds(rejoin, c.tick_rate());
+                if c.rejoin_hold() != hold {
+                    c.set_rejoin_hold(hold);
+                }
+            }
         }
     }
 

@@ -21,6 +21,13 @@ extends RefCounted
 ## Host modes (gate G2): `HOST_PLAYER` (the server branch is also a player, peer 1) and `DEDICATED`
 ## (the server branch only serves). Later packages spawn players per `players()`;
 ## `NetFixture.run_both_modes(test, n, scenario)` runs one scenario under each.
+##
+## WP17 (seats): a DEDICATED server session has `dedicated = true` (it holds no seat). Each client
+## session has its own random seat key unless the test sets `client_sessions[i].key` before starting.
+## `drop_client(i)` frees a client's branch as if its process ended (returns its key);
+## `rejoin_client(i, key)` connects a fresh branch, session and pipe end in that slot with the same key
+## (a new peer id), and `add_manager_to(branch)` gives it its managers. `start_server(state)` starts the
+## server from a saved session state.
 
 enum HostMode { HOST_PLAYER, DEDICATED }
 
@@ -45,6 +52,8 @@ var _client_count: int
 var _server_peer: NetPipePeer
 var _client_peers: Array[NetPipePeer] = []
 var _started: bool = false
+## WP17: the seat key of each dropped client slot (`drop_client`), by index.
+var _dropped_keys: Dictionary = {}
 
 
 func _init(test: Node, client_count: int = 1, mode: HostMode = HostMode.HOST_PLAYER) -> void:
@@ -62,6 +71,8 @@ func build() -> void:
 	var root := _test.get_tree().root
 	server = _make_branch(root, "Server")
 	server_session = _make_session(server)
+	# WP17: a dedicated server holds no seat (the first client is seat 1).
+	server_session.dedicated = host_mode == HostMode.DEDICATED
 	_server_peer = NetPipePeer.create_server()
 	for i in _client_count:
 		var branch := _make_branch(root, CLIENT_NAMES[i])
@@ -76,20 +87,65 @@ func start() -> void:
 	start_clients()
 
 
-## Starts only the server's session (late-join scenarios start the clients later).
-func start_server() -> void:
+## Starts only the server's session (late-join scenarios start the clients later). WP17: `state` (from
+## `NetSession.save_state()`) is the session state the server starts from.
+func start_server(state: PackedByteArray = PackedByteArray()) -> void:
 	if _started:
 		return
 	_started = true
-	server_session.start(_server_peer, server.get_path())
+	server_session.start(_server_peer, server.get_path(), state)
 
 
 ## Starts the clients' sessions that are not running yet (after `start_server()`).
 func start_clients() -> void:
 	start_server()
 	for i in clients.size():
-		if not client_sessions[i].is_online():
+		if client_sessions[i] != null and not client_sessions[i].is_online():
 			client_sessions[i].start(_client_peers[i], clients[i].get_path())
+
+
+## WP17: the client `index` drops, as if its process ended: its branch is freed (its session leaves
+## and its pipe end closes; the server notices at its next poll). Returns the seat key it used, which
+## `rejoin_client` sends again. Its slot in `clients` / `client_sessions` is null until then.
+func drop_client(index: int) -> String:
+	var key := ""
+	var s: NetSession = client_sessions[index]
+	if s != null:
+		key = s.key
+	if is_instance_valid(clients[index]):
+		clients[index].free()
+	clients[index] = null
+	client_sessions[index] = null
+	_client_peers[index] = null
+	_dropped_keys[index] = key
+	return key
+
+
+## WP17: a new connection for the client slot `index` (normally one `drop_client` emptied): a fresh
+## branch with the same name, a fresh session and pipe end, started with `key` (empty: the key the
+## dropped client used). Add its managers (`add_manager_to`) before or right after; returns the branch.
+func rejoin_client(index: int, key: String = "") -> Node:
+	if clients[index] != null:
+		drop_client(index)
+	var branch := _make_branch(_test.get_tree().root, CLIENT_NAMES[index])
+	var s := _make_session(branch)
+	s.key = key if key != "" else String(_dropped_keys.get(index, ""))
+	var p := NetPipePeer.create_client(_server_peer)
+	clients[index] = branch
+	client_sessions[index] = s
+	_client_peers[index] = p
+	s.start(p, branch.get_path())
+	return branch
+
+
+## Adds a `NetManager` named `manager_name` to one branch (a rejoined client's).
+func add_manager_to(branch: Node, manager_name: String = "World", configure: Callable = Callable()) -> NetManager:
+	var m := NetManager.new()
+	m.name = manager_name
+	if configure.is_valid():
+		configure.call(m)
+	branch.add_child(m)
+	return m
 
 
 ## Adds a `NetManager` named `manager_name` (default `World`) to every branch, at the same path, and
@@ -97,12 +153,9 @@ func start_clients() -> void:
 func add_managers(manager_name: String = "World", configure: Callable = Callable()) -> Dictionary:
 	var out := {}
 	for branch: Node in [server] + clients:
-		var m := NetManager.new()
-		m.name = manager_name
-		if configure.is_valid():
-			configure.call(m)
-		branch.add_child(m)
-		out[String(branch.name)] = m
+		if branch == null:
+			continue
+		out[String(branch.name)] = add_manager_to(branch, manager_name, configure)
 	return out
 
 
@@ -158,7 +211,8 @@ func players() -> PackedInt32Array:
 	if host_mode == HostMode.HOST_PLAYER:
 		ids.append(1)
 	for branch in clients:
-		ids.append(peer_id(branch))
+		if branch != null:
+			ids.append(peer_id(branch))
 	return ids
 
 
@@ -198,9 +252,10 @@ static func run_both_modes(test: Node, client_count: int, scenario: Callable) ->
 func _all_connected() -> bool:
 	if not is_instance_valid(server_session) or not server_session.is_online():
 		return false
-	if server_session.peers().size() != clients.size():
+	var live := client_sessions.filter(func(s: NetSession) -> bool: return s != null)
+	if server_session.peers().size() != live.size():
 		return false
-	for s in client_sessions:
+	for s: NetSession in live:
 		if not s.is_online() or not s.peers().has(1):
 			return false
 	return true

@@ -10,7 +10,8 @@
 //! A blob is [`MAGIC`], the format version (`u16`, little endian, [`LEVEL_STATE_VERSION`]), then the
 //! postcard encoding of the state with its strings interned (scene paths, part paths and property
 //! names repeat across entities, so they are stored once). A blob with another magic or version is
-//! refused ([`LevelStateError`]); a new format adds a version and keeps decoding the old ones.
+//! refused ([`LevelStateError`]). Version 2 (WP17) records an entity's owner as a seat instead of a
+//! peer id; version 1 blobs (WP16) are refused, since a peer id does not survive a save.
 //!
 //! Content: per manager (by its path relative to the level root), the entities to restore and the
 //! addresses of the level's own entities that were destroyed while it was loaded. An entity is
@@ -18,9 +19,9 @@
 //! false) is part of the level scene and is matched by its address; a *spawned* one was added at run
 //! time and is instantiated again from its scene under the node its address names as parent. Values are
 //! by part path and property name (not by index), so a blob survives a property added to a scene; they
-//! are the property values themselves (not quantised). `owner` is the owner when the state was
-//! captured: gdnet restores every entity owned by the server (a client's peer id means nothing in a
-//! later session) and keeps it for WP17's seats.
+//! are the property values themselves (not quantised). `owner_seat` is the seat of the entity's owner
+//! when the state was captured (0: the server, or an owner without a seat): gdnet restores every
+//! entity owned by the server and gives it to that seat's peer once the seat is connected (WP17).
 
 use crate::props::Value;
 use crate::rooms::Origin;
@@ -33,7 +34,7 @@ use std::vec::Vec;
 /// The first four bytes of every level state blob.
 pub const MAGIC: [u8; 4] = *b"GDLS";
 /// The format version this build writes (and the newest it reads).
-pub const LEVEL_STATE_VERSION: u16 = 1;
+pub const LEVEL_STATE_VERSION: u16 = 2;
 
 /// The state of one level: its scene path and its managers' entities.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -67,8 +68,9 @@ pub struct EntityState {
     /// Added at run time: instantiated again on restore. False: part of the level scene, matched by
     /// its address.
     pub spawned: bool,
-    /// The owner when the state was captured (restored entities belong to the server).
-    pub owner: u32,
+    /// The seat of its owner when the state was captured; 0 = the server (or an owner without a seat).
+    /// Restored entities belong to the server until that seat is connected.
+    pub owner_seat: u32,
     pub parts: Vec<PartValues>,
 }
 
@@ -167,7 +169,7 @@ impl LevelState {
                             address: strings.id(&e.address),
                             scene: strings.id(&e.scene),
                             spawned: e.spawned,
-                            owner: e.owner,
+                            owner_seat: e.owner_seat,
                             parts: e
                                 .parts
                                 .iter()
@@ -230,7 +232,7 @@ impl LevelState {
                     address: s(e.address)?,
                     scene: s(e.scene)?,
                     spawned: e.spawned,
-                    owner: e.owner,
+                    owner_seat: e.owner_seat,
                     parts,
                 });
             }
@@ -274,7 +276,7 @@ impl Strings {
     }
 }
 
-/// Version 1's body.
+/// Version 2's body.
 #[derive(Serialize, Deserialize)]
 struct Wire {
     strings: Vec<String>,
@@ -295,7 +297,7 @@ struct WireEntity {
     address: u32,
     scene: u32,
     spawned: bool,
-    owner: u32,
+    owner_seat: u32,
     parts: Vec<WirePart>,
 }
 
@@ -329,7 +331,7 @@ mod tests {
             address: address.to_string(),
             scene: scene.to_string(),
             spawned,
-            owner: 1,
+            owner_seat: 1,
             parts,
         }
     }
@@ -417,7 +419,7 @@ mod tests {
                 address: "E".into(),
                 scene: "Node2D".into(),
                 spawned: false,
-                owner: 7,
+                owner_seat: 7,
                 parts: vec![PartValues {
                     part: ".".into(),
                     fields,
@@ -471,14 +473,14 @@ mod tests {
     #[test]
     fn an_unknown_version_is_refused() {
         let mut bytes = sample().encode();
-        bytes[4] = 2;
+        bytes[4] = 9;
         bytes[5] = 0;
         assert_eq!(
             LevelState::decode(&bytes),
-            Err(LevelStateError::UnknownVersion(2))
+            Err(LevelStateError::UnknownVersion(9))
         );
         let msg = LevelState::decode(&bytes).unwrap_err().to_string();
-        assert!(msg.contains("version is 2"), "{msg}");
+        assert!(msg.contains("version is 9"), "{msg}");
     }
 
     #[test]

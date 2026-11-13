@@ -237,6 +237,17 @@ impl Interest {
         }
     }
 
+    /// WP17: `old` becomes `new` in every `visible_to` peer list (a rejoin).
+    pub fn rename_peer(&mut self, old: PeerId, new: PeerId) {
+        for v in self.visible.values_mut() {
+            if let Visible::Peers(list) = v {
+                if list.remove(&old) {
+                    list.insert(new);
+                }
+            }
+        }
+    }
+
     /// The radius pass: `positions` are the current positions of radius-limited entity roots (others
     /// are ignored; an entity missing from the list keeps its last position), `focus` every peer's
     /// focus position (a peer missing from it has none). Recomputes each peer's radius set: an

@@ -13,6 +13,10 @@
 //! comes back as [`KeyMsg::Rejected`] with the server's value, which the client restores. A client
 //! applies its own allowed writes at once (optimistically); the server's echo confirms them.
 //!
+//! WP17 adds [`Who::Seat`]: the segment after the prefix is the writer's seat, so a path such as
+//! `hand/2` stays writable by seat 2 after it reconnects under a new peer id. The session keeps the
+//! peer-to-seat map here ([`KeyedState::set_seats`]) on the server and on every client.
+//!
 //! Views: `view(prefix)` hides the paths under `prefix` from every peer whose decision for the view is
 //! not `true`. gdnet evaluates the view's filter (a Callable) per peer and feeds the decisions
 //! ([`KeyedState::set_visible`]); a path under several views needs every one of them.
@@ -32,6 +36,8 @@ pub enum Who {
     Owner,
     /// One peer.
     Peer(PeerId),
+    /// WP17: the peer whose seat is the path's segment after the prefix (survives a rejoin).
+    Seat,
 }
 
 /// The `KEYED` message (kind 16, reliable).
@@ -85,6 +91,8 @@ pub struct KeyedState {
     rules: Vec<(String, Who)>,
     /// View prefix -> per-peer decision (absent = not visible yet).
     views: BTreeMap<String, BTreeMap<PeerId, bool>>,
+    /// WP17: each connected peer's seat (for [`Who::Seat`]).
+    seats: BTreeMap<PeerId, u32>,
     events: VecDeque<KeyEvent>,
     pub stats: KeyedStats,
 }
@@ -151,6 +159,9 @@ impl KeyedState {
                     Who::Owner => {
                         segment_after(prefix, path).is_some_and(|s| s == std::format!("{peer}"))
                     }
+                    Who::Seat => self.seats.get(&peer).is_some_and(|seat| {
+                        segment_after(prefix, path).is_some_and(|s| s == std::format!("{seat}"))
+                    }),
                 }
         })
     }
@@ -175,6 +186,28 @@ impl KeyedState {
             return false;
         };
         d.insert(peer, visible) != Some(visible)
+    }
+
+    /// WP17: the seat of each connected peer.
+    pub fn set_seats(&mut self, seats: BTreeMap<PeerId, u32>) {
+        self.seats = seats;
+    }
+
+    /// WP17: `old`'s view decisions become `new`'s (a rejoin).
+    pub fn rename_peer(&mut self, old: PeerId, new: PeerId) {
+        for d in self.views.values_mut() {
+            if let Some(v) = d.remove(&old) {
+                d.insert(new, v);
+            }
+        }
+    }
+
+    /// Every entry (a saved session state).
+    pub fn entries(&self) -> Vec<(String, Vec<u8>)> {
+        self.map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     pub fn forget_peer(&mut self, peer: PeerId) {
@@ -286,6 +319,23 @@ mod tests {
         assert!(k.may_write(7, "admin/x"));
         assert!(!k.may_write(5, "admin/x"));
         assert!(!k.may_write(5, "other"));
+    }
+
+    #[test]
+    fn the_seat_rule_reads_the_writers_seat() {
+        let mut k = KeyedState::default();
+        k.allow("hand/", Who::Seat);
+        assert!(!k.may_write(5, "hand/2"), "no seat known yet");
+        k.set_seats([(5, 2), (6, 3)].into_iter().collect());
+        assert!(k.may_write(5, "hand/2"));
+        assert!(k.may_write(5, "hand/2/cards"));
+        assert!(!k.may_write(5, "hand/3"));
+        assert!(!k.may_write(5, "hand/22"));
+        assert!(!k.may_write(5, "hand/5"), "the peer id is not the seat");
+        // Peer 5 drops; seat 2 comes back as peer 9.
+        k.set_seats([(9, 2), (6, 3)].into_iter().collect());
+        assert!(k.may_write(9, "hand/2"));
+        assert!(!k.may_write(5, "hand/2"));
     }
 
     #[test]

@@ -284,6 +284,19 @@ impl Rooms {
         self.added.get(&peer).cloned().unwrap_or_default()
     }
 
+    /// WP17: `old`'s player, primary room override and added rooms become `new`'s (a rejoin).
+    pub fn rename_peer(&mut self, old: PeerId, new: PeerId) {
+        if let Some(p) = self.players.remove(&old) {
+            self.players.insert(new, p);
+        }
+        if let Some(o) = self.overrides.remove(&old) {
+            self.overrides.insert(new, o);
+        }
+        if let Some(a) = self.added.remove(&old) {
+            self.added.insert(new, a);
+        }
+    }
+
     pub fn forget_peer(&mut self, peer: PeerId) {
         self.players.remove(&peer);
         self.overrides.remove(&peer);
