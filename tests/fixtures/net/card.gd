@@ -4,3 +4,6 @@ extends Node2D
 
 ## The card's face, set on the server.
 @export var face: int = -1
+
+## A name only the holder learns (`audience: owner`, a string so a test can find it in packets).
+@export var secret_name: String = ""

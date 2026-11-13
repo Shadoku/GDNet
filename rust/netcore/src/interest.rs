@@ -247,6 +247,19 @@ impl Interest {
         positions: &[(NetId, [f64; 3])],
         focus: &[(PeerId, [f64; 3])],
     ) -> Vec<PeerId> {
+        self.update_changes(positions, focus)
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .collect()
+    }
+
+    /// [`Interest::update`], returning for each peer whose set changed (ascending) the entities that
+    /// entered or left it (ascending).
+    pub fn update_changes(
+        &mut self,
+        positions: &[(NetId, [f64; 3])],
+        focus: &[(PeerId, [f64; 3])],
+    ) -> Vec<(PeerId, Vec<NetId>)> {
         self.stats.passes += 1;
         for (id, p) in positions {
             if self.radius.contains_key(id) && p.iter().all(|v| v.is_finite()) {
@@ -298,19 +311,18 @@ impl Interest {
             if &set != old {
                 self.stats.entered += set.difference(old).count() as u64;
                 self.stats.left += old.difference(&set).count() as u64;
-                changed.push(*peer);
+                changed.push((*peer, set.symmetric_difference(old).copied().collect()));
             }
             next.insert(*peer, set);
         }
         for (peer, old) in &self.inside {
             if !next.contains_key(peer) && !old.is_empty() {
                 self.stats.left += old.len() as u64;
-                changed.push(*peer);
+                changed.push((*peer, old.iter().copied().collect()));
             }
         }
         self.inside = next;
-        changed.sort_unstable();
-        changed.dedup();
+        changed.sort_unstable_by_key(|(peer, _)| *peer);
         changed
     }
 
@@ -632,6 +644,10 @@ mod session_tests {
         }
 
         fn spawn(&mut self, owner: PeerId, x: f32, spec: Spec) -> NetId {
+            self.spawn_under(MANAGER_ROOT, owner, x, spec)
+        }
+
+        fn spawn_under(&mut self, parent: NetId, owner: PeerId, x: f32, spec: Spec) -> NetId {
             let now = self.now;
             self.server
                 .spawn(
@@ -639,7 +655,7 @@ mod session_tests {
                     Spawn::new(
                         ParentRef {
                             manager: 1,
-                            entity: MANAGER_ROOT,
+                            entity: parent,
                             part: 0,
                         },
                         "Card",
@@ -994,5 +1010,84 @@ mod session_tests {
         w.server.set_filter_result(fog, None, w.now);
         w.steps(2);
         assert!(w.has(2, fog) && w.has(3, fog));
+    }
+
+    /// The same interest changes applied through the incremental path and through whole-scope
+    /// rebuilds send every peer the same bytes; the incremental path rebuilds nothing.
+    #[test]
+    fn interest_changes_update_the_scope_incrementally_with_the_same_messages() {
+        fn run(rebuild_only: bool) -> (BTreeMap<PeerId, Vec<Vec<u8>>>, u64, u64) {
+            let mut w = World::new(&[2, 3]);
+            w.server.set_scope_rebuild_only(rebuild_only);
+            // Ten radius-limited roots in a row, every third with two children; a plain entity;
+            // a hidden child and a filtered root.
+            let mut roots = Vec::new();
+            let mut children = Vec::new();
+            for i in 0..10 {
+                let r = w.spawn(SERVER, 0.0, radius(100.0));
+                roots.push(r);
+                if i % 3 == 0 {
+                    children.push(w.spawn_under(r, SERVER, 0.0, Spec::default()));
+                    children.push(w.spawn_under(r, SERVER, 0.0, Spec::default()));
+                }
+            }
+            w.spawn(SERVER, 0.0, Spec::default());
+            let fog = w.spawn(
+                SERVER,
+                0.0,
+                Spec {
+                    filtered: true,
+                    ..Spec::default()
+                },
+            );
+            w.steps(2);
+            let before = w.server.scope_stats().rebuilds;
+            let left_before = w.server.scope_stats().left;
+            // Two foci walk along the row; each tick some roots enter and some leave.
+            for t in 0..40 {
+                let positions: Vec<(NetId, [f64; 3])> = roots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| (*id, [i as f64 * 80.0, 0.0, 0.0]))
+                    .collect();
+                let a = t as f64 * 25.0;
+                let b = 800.0 - t as f64 * 20.0;
+                w.server
+                    .interest_update(&positions, &[(2, [a, 0.0, 0.0]), (3, [b, 0.0, 0.0])], w.now);
+                match t {
+                    5 => w.server.set_visible(
+                        children[1],
+                        Visible::Peers([3].into_iter().collect()),
+                        w.now,
+                    ),
+                    9 => w
+                        .server
+                        .set_filter_result(fog, Some([2].into_iter().collect()), w.now),
+                    14 => w.server.set_visible(children[1], Visible::All, w.now),
+                    18 => w
+                        .server
+                        .set_filter_result(fog, Some([3].into_iter().collect()), w.now),
+                    22 => w.server.set_entity_radius(roots[4], 0.0, w.now),
+                    26 => w.server.set_entity_radius(roots[4], 50.0, w.now),
+                    30 => w.server.set_visible(roots[0], Visible::Owner, w.now),
+                    _ => {}
+                }
+                w.step();
+            }
+            let st = w.server.scope_stats();
+            assert!(st.left > left_before + 10, "entities left: {}", st.left);
+            (w.sent, st.rebuilds - before, st.entered)
+        }
+        let (full, full_rebuilds, full_entered) = run(true);
+        let (inc, inc_rebuilds, inc_entered) = run(false);
+        assert!(full_rebuilds > 20, "{full_rebuilds}");
+        assert_eq!(inc_rebuilds, 0, "an interest change rebuilds no scope");
+        assert_eq!(inc_entered, full_entered);
+        for peer in [2, 3] {
+            assert_eq!(inc[&peer].len(), full[&peer].len(), "packets to {peer}");
+            for (i, (a, b)) in inc[&peer].iter().zip(&full[&peer]).enumerate() {
+                assert_eq!(a, b, "packet {i} to {peer}");
+            }
+        }
     }
 }

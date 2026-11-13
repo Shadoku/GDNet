@@ -250,3 +250,118 @@ func test_g0_no_radius_means_no_interest_pass() -> void:
 		assert_eq(s["snapshot_bytes"], before["snapshot_bytes"], "an idle scene sends no snapshots")
 		assert_eq(f.session(client).stats()["entities_in_scope"], 6))
 	assert_true(ok)
+
+
+## Gate G9 (radius): 1,000 radius-limited markers over about 6,000 x 6,000 px and two clients whose
+## players walk across them. Sampled every frame, a client holds no marker farther than 1.2 r from its
+## player (the server's positions; the slack is the player's travel in three frames: the server's pass
+## may run before the test moves the player in a frame, and the `Scope` leave is applied at the
+## client's next poll). With `--verbose` it prints the interest pass's cost (the slice D benchmark).
+func test_g9_no_entity_beyond_one_point_two_r() -> void:
+	timeout_sec = 30.0
+	const R := 300.0
+	const SPEED := 8.0
+	var ok: bool = await NetFixture.run_both_modes(self, 2, func(f: NetFixture) -> void:
+		var managers := f.add_managers()
+		var server_world: Node = managers["Server"]
+		var players: Array[Node2D] = []
+		var dirs: Array[Vector2] = [Vector2(1, 0), Vector2(0.6, 0.8)]
+		var starts: Array[Vector2] = [Vector2(200, 3000), Vector2(1500, 200)]
+		for i in 2:
+			var p: Node2D = Net.spawn_for(f.peer_id(f.clients[i]), CRATE, server_world, "Player%d" % i)
+			p.position = starts[i]
+			players.append(p)
+		for i in 1000:
+			var m: Node2D = MARKER.instantiate()
+			m.name = "M%d" % i
+			m.position = Vector2((i % 32) * 190.0, (i / 32) * 190.0)
+			(m.get_node("NetEntity") as NetEntity).radius = R
+			server_world.add_child(m)
+		assert_true(await f.wait_until(func() -> bool:
+			return _present(f.clients[0], "World/Player0") and _present(f.clients[1], "World/Player1")))
+		var worst := 0.0
+		var held := 0
+		var ms: Array[float] = []
+		var changes_before: int = f.server_session.stats()["radius_changes"]
+		for frame in 150:
+			for i in 2:
+				players[i].position += dirs[i] * SPEED
+			await get_tree().physics_frame
+			ms.append(f.server_session.stats()["interest_ms"])
+			for i in 2:
+				var world: Node = f.clients[i].get_node("World")
+				for n: Node in world.get_children():
+					if not n.name.begins_with("M") or Net.net_id(n) <= 0:
+						continue
+					held += 1
+					var d: float = (server_world.get_node(NodePath(n.name)) as Node2D).position.distance_to(players[i].position)
+					worst = maxf(worst, d)
+		assert_lt(worst, R * 1.2 + 3.0 * SPEED, "no marker beyond 1.2 r (worst %.1f px)" % worst)
+		assert_gt(held, 1000, "the clients held markers near them (%d samples)" % held)
+		var changes: int = f.server_session.stats()["radius_changes"] - changes_before
+		assert_gt(changes, 50, "markers entered and left as the players walked")
+		var total := 0.0
+		var peak := 0.0
+		for v in ms:
+			total += v
+			peak = maxf(peak, v)
+		print("G9 radius, mode %d: 1000 markers, 2 clients, 150 ticks: interest pass avg %.3f ms, max %.3f ms; %d set changes; worst distance %.1f px (1.2 r = %.0f)" % [
+			f.host_mode, total / ms.size(), peak, changes, worst, R * 1.2]))
+	assert_true(ok)
+
+
+## Gate G9 (audience): a value marked `audience: owner` is in no packet the other client receives
+## (scanned at every bit offset by the pipe's test hook), and is in the owner's.
+func test_g9_an_owner_only_value_is_in_no_packet_to_another_peer() -> void:
+	var ok: bool = await NetFixture.run_both_modes(self, 2, func(f: NetFixture) -> void:
+		var managers := f.add_managers()
+		var a: Node = f.clients[0]
+		var b: Node = f.clients[1]
+		var first := "G9-SECRET-7f3a9c41d2e8".to_utf8_buffer()
+		var second := "G9-SECRET-b5c80e17aa64".to_utf8_buffer()
+		for end: NetPipePeer in [f.peer(a), f.peer(b)]:
+			end._debug_watch(first)
+		var card: Node = Net.spawn_for(f.peer_id(a), CARD, managers["Server"], "Card")
+		card.secret_name = "G9-SECRET-7f3a9c41d2e8"
+		assert_true(await f.wait_until(func() -> bool:
+			return _present(b, "World/Card") and a.has_node("World/Card") and a.get_node("World/Card").secret_name == "G9-SECRET-7f3a9c41d2e8"), "the owner learns it")
+		assert_gt(f.peer(a)._debug_watch_hits(), 0, "the scan finds it in the owner's packets")
+		# A change goes out as a reliable field.
+		for end: NetPipePeer in [f.peer(a), f.peer(b)]:
+			end._debug_watch(second)
+		card.secret_name = "G9-SECRET-b5c80e17aa64"
+		card.position = Vector2(40, 0)
+		assert_true(await f.wait_until(func() -> bool: return a.get_node("World/Card").secret_name == "G9-SECRET-b5c80e17aa64"))
+		await _frames(10)
+		assert_gt(f.peer(a)._debug_watch_hits(), 0)
+		assert_gt(f.peer(b)._debug_watch_scanned(), 0, "B received packets meanwhile")
+		assert_eq(f.peer(b)._debug_watch_hits(), 0, "and none held the value")
+		assert_eq(b.get_node("World/Card").secret_name, "", "B keeps the scene's value"))
+	assert_true(ok)
+
+
+## A client that joins after a `visibility_filter` was set gets the entity only once the filter
+## admits it.
+func test_a_late_joiner_gets_what_the_filter_admits() -> void:
+	net = NetFixture.new(self, 2)
+	net.start_server()
+	var a: Node = net.clients[0]
+	var b: Node = net.clients[1]
+	net.client_sessions[0].start(net.peer(a), a.get_path())
+	assert_true(await net.wait_until(func() -> bool: return net.client_sessions[0].is_online()))
+	var managers := net.add_managers()
+	var allowed := [net.peer_id(a)]
+	var fog: Node2D = CRATE.instantiate()
+	fog.name = "Fog"
+	Net.set_visibility_filter(fog, func(peer: int) -> bool: return allowed.has(peer))
+	managers["Server"].add_child(fog)
+	_add(managers["Server"], CRATE, "Table", Vector2.ZERO)
+	assert_true(await net.wait_until(func() -> bool: return _present(a, "World/Fog")), "A is admitted")
+	net.start_clients()
+	assert_true(await net.wait_connected())
+	assert_true(await net.wait_until(func() -> bool: return _present(b, "World/Table")), "the late joiner's burst")
+	await _frames(15)
+	assert_false(b.has_node("World/Fog"), "the burst leaves out what the filter refuses")
+	allowed.append(net.peer_id(b))
+	assert_true(await net.wait_until(func() -> bool: return _present(b, "World/Fog")), "admitted later: it arrives")
+	assert_true(_present(a, "World/Fog"))

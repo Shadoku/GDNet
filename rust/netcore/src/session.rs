@@ -294,6 +294,8 @@ struct ScopeState {
     /// Server (WP16, level state): per level scene path, the paths (relative to the level root) of
     /// the level's own entities that are gone; each `Travel` to the level names them.
     level_gone: BTreeMap<String, Vec<String>>,
+    /// Test switch: every scope change rebuilds the whole scope (the path before WP16 slice D).
+    rebuild_only: bool,
     stats: ScopeStats,
 }
 
@@ -312,6 +314,9 @@ pub struct ScopeStats {
     /// WP16: `RoomLeft` actions sent (server) and received (client).
     pub rooms_left: u64,
     pub rooms_left_received: u64,
+    /// Server: whole-scope rebuilds (rooms changed, or [`Session::set_scope_rebuild_only`]); an
+    /// interest change (radius, `visible_to`, filter) updates only the entities it touched.
+    pub rebuilds: u64,
 }
 
 /// WP13: which entity [`Spawn`] makes its owner's player (the entity whose manager's room is the
@@ -2929,14 +2934,14 @@ impl Session {
     /// Server: replaces `id`'s interest settings; every scope follows when anything changed.
     pub fn set_interest(&mut self, id: NetId, spec: &crate::interest::Spec, now_us: u64) {
         if self.interest.set(id, spec) && self.entities.contains(id) {
-            self.refresh_all_scopes(now_us);
+            self.refresh_entity_everywhere(id, now_us);
         }
     }
 
     /// Server: `visible_to` of `id` (`Net.show_to`, `NetEntity.visible_to`).
     pub fn set_visible(&mut self, id: NetId, v: crate::interest::Visible, now_us: u64) {
         if self.interest.set_visible(id, v) && self.entities.contains(id) {
-            self.refresh_all_scopes(now_us);
+            self.refresh_entity_everywhere(id, now_us);
         }
     }
 
@@ -2944,7 +2949,14 @@ impl Session {
     /// [`Session::interest_update`].
     pub fn set_entity_radius(&mut self, id: NetId, radius: f64, now_us: u64) {
         if self.interest.set_radius(id, radius) && self.entities.contains(id) {
-            self.refresh_all_scopes(now_us);
+            self.refresh_entity_everywhere(id, now_us);
+        }
+    }
+
+    /// Server: `id`'s interest changed for possibly every peer.
+    fn refresh_entity_everywhere(&mut self, id: NetId, now_us: u64) {
+        for peer in self.peers.joined() {
+            self.refresh_entities(peer, &[id], now_us);
         }
     }
 
@@ -2960,14 +2972,15 @@ impl Session {
         let changed = self.interest.set_filter(id, admitted, &joined);
         if self.entities.contains(id) {
             for peer in changed {
-                self.refresh_scope(peer, now_us);
+                self.refresh_entities(peer, &[id], now_us);
             }
         }
     }
 
     /// Server, each tick while [`crate::interest::Interest::is_active`]: the positions of the
     /// radius-limited entity roots and every peer's focus position. Peers whose radius set changed get
-    /// their scope refreshed (`Create` with current state, `Scope` leaves).
+    /// their scope updated for the entities that entered or left (`Create` with current state,
+    /// `Scope` leaves).
     pub fn interest_update(
         &mut self,
         positions: &[(NetId, [f64; 3])],
@@ -2977,8 +2990,8 @@ impl Session {
         if self.role != Role::Server {
             return;
         }
-        for peer in self.interest.update(positions, focus) {
-            self.refresh_scope(peer, now_us);
+        for (peer, ids) in self.interest.update_changes(positions, focus) {
+            self.refresh_entities(peer, &ids, now_us);
         }
     }
 }
@@ -3651,6 +3664,13 @@ impl Session {
         self.scope.travelling.len()
     }
 
+    /// Test hook: true makes every interest change rebuild the whole scope, as before the
+    /// incremental path (a test compares the two).
+    #[doc(hidden)]
+    pub fn set_scope_rebuild_only(&mut self, on: bool) {
+        self.scope.rebuild_only = on;
+    }
+
     pub fn scope_stats(&self) -> ScopeStats {
         self.scope.stats
     }
@@ -3777,6 +3797,7 @@ impl Session {
         if self.role != Role::Server || !self.peers.is_joined(peer) {
             return;
         }
+        self.scope.stats.rebuilds += 1;
         let rooms = self.scope_rooms(peer);
         self.scope.rooms_of.insert(peer, rooms.clone());
         let (gained, mut lost) = self.level_changes(peer, &rooms);
@@ -3810,23 +3831,7 @@ impl Session {
             .collect();
         let known = self.scope.known.get(&peer).cloned().unwrap_or_default();
         let leave: Vec<NetId> = known.difference(&desired).copied().collect();
-        if !leave.is_empty() {
-            self.scope.stats.left += leave.len() as u64;
-            if let Some(k) = self.scope.known.get_mut(&peer) {
-                for id in &leave {
-                    k.remove(id);
-                }
-            }
-            for id in &leave {
-                self.repl.forget_peer_entity(peer, *id);
-                self.hash.last.remove(&(peer, *id));
-            }
-            self.send(
-                peer,
-                &Message::Entity(EntityAction::Scope { leave }),
-                now_us,
-            );
-        }
+        self.leave_scope(peer, leave, now_us);
         for room in lost {
             self.send_room_left(peer, room, now_us);
         }
@@ -3835,6 +3840,65 @@ impl Session {
                 self.scope.stats.entered += 1;
                 self.send_create_to(peer, c, now_us);
             }
+        }
+    }
+
+    /// Server: the entities `leave` (ascending) leave `peer`'s scope: one `Scope` leave.
+    fn leave_scope(&mut self, peer: PeerId, leave: Vec<NetId>, now_us: u64) {
+        if leave.is_empty() {
+            return;
+        }
+        self.scope.stats.left += leave.len() as u64;
+        if let Some(k) = self.scope.known.get_mut(&peer) {
+            for id in &leave {
+                k.remove(id);
+            }
+        }
+        for id in &leave {
+            self.repl.forget_peer_entity(peer, *id);
+            self.hash.last.remove(&(peer, *id));
+        }
+        self.send(
+            peer,
+            &Message::Entity(EntityAction::Scope { leave }),
+            now_us,
+        );
+    }
+
+    /// Server: the interest of `ids` (radius set, `visible_to`, filter) changed for `peer`: only
+    /// they and the entities below them are re-checked, with the messages [`Self::refresh_scope`]
+    /// would send for them (a `Scope` leave, then `Create`s parents first with current state). A
+    /// peer whose rooms or levels changed since its last refresh gets the whole rebuild instead.
+    fn refresh_entities(&mut self, peer: PeerId, ids: &[NetId], now_us: u64) {
+        if self.role != Role::Server || !self.peers.is_joined(peer) {
+            return;
+        }
+        let rooms = self.scope_rooms(peer);
+        let current = !self.scope.rebuild_only
+            && self.scope.rooms_of.get(&peer) == Some(&rooms)
+            && self.scope.levels_of.get(&peer).cloned().unwrap_or_default()
+                == self.scope.rooms.levels_of(&rooms);
+        if !current {
+            self.refresh_scope(peer, now_us);
+            return;
+        }
+        let mut touched = BTreeSet::new();
+        for id in ids {
+            touched.extend(self.entities.subtree(*id));
+        }
+        let mut leave = Vec::new();
+        let mut enter = Vec::new();
+        for id in touched {
+            match (self.knows(peer, id), self.wants(peer, id, &rooms)) {
+                (true, false) => leave.push(id),
+                (false, true) => enter.push(id),
+                _ => {}
+            }
+        }
+        self.leave_scope(peer, leave, now_us);
+        for c in self.entities.creates_of(&enter) {
+            self.scope.stats.entered += 1;
+            self.send_create_to(peer, c, now_us);
         }
     }
 

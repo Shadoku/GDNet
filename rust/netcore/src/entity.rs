@@ -412,6 +412,47 @@ impl EntityTable {
         }
     }
 
+    /// The creates of `ids` in [`Self::burst`]'s order (parents first, siblings in creation order),
+    /// without walking the rest of the table.
+    pub fn creates_of(&self, ids: &[NetId]) -> Vec<CreateAction> {
+        let mut keyed: Vec<(Vec<u64>, &EntityRecord)> = ids
+            .iter()
+            .filter_map(|id| self.records.get(id))
+            .map(|r| {
+                // The creation numbers from the topmost entity down: their order is the burst's.
+                let mut key = std::vec![r.seq];
+                let mut cur = r;
+                while cur.parent.entity != MANAGER_ROOT && key.len() <= self.records.len() {
+                    match self.records.get(&cur.parent.entity) {
+                        Some(p) => {
+                            key.push(p.seq);
+                            cur = p;
+                        }
+                        None => break,
+                    }
+                }
+                key.reverse();
+                (key, r)
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.into_iter().map(|(_, r)| Self::create_of(r)).collect()
+    }
+
+    fn create_of(r: &EntityRecord) -> CreateAction {
+        CreateAction {
+            id: r.id,
+            scene_hash: r.scene,
+            parent: r.parent,
+            name: r.name.clone(),
+            owner: r.owner,
+            parts: r.parts,
+            initial_state: Vec::new(),
+            transfer: r.transfer,
+            client_owned: r.client_owned,
+        }
+    }
+
     /// The table as a sequence of creates a late joiner can apply in order: every parent before its
     /// children, siblings in creation order.
     pub fn burst(&self) -> Vec<CreateAction> {
@@ -425,17 +466,7 @@ impl EntityTable {
         let mut stack: Vec<NetId> = roots.into_iter().rev().map(|r| r.id).collect();
         while let Some(id) = stack.pop() {
             if let Some(r) = self.records.get(&id) {
-                out.push(CreateAction {
-                    id: r.id,
-                    scene_hash: r.scene,
-                    parent: r.parent,
-                    name: r.name.clone(),
-                    owner: r.owner,
-                    parts: r.parts,
-                    initial_state: Vec::new(),
-                    transfer: r.transfer,
-                    client_owned: r.client_owned,
-                });
+                out.push(Self::create_of(r));
             }
             for child in self.children_of(id).into_iter().rev() {
                 stack.push(child);

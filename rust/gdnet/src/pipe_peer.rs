@@ -225,6 +225,10 @@ pub struct NetPipePeer {
     emulation: Option<Gd<NetEmulation>>,
     /// WP8: bytes and packets this end put and got (what the transport carried, headers included).
     counts: [i64; 4],
+    /// WP16 test hook: the bytes `_debug_watch` looks for in every packet this end takes out, and
+    /// (packets scanned, packets that held them).
+    watch: Vec<u8>,
+    watch_counts: [i64; 2],
 }
 
 #[godot_api]
@@ -308,6 +312,25 @@ impl NetPipePeer {
     #[func]
     fn packets_received(&self) -> i64 {
         self.counts[3]
+    }
+
+    /// WP16 test hook (gate G9): from now on, every packet this end takes out of the pipe is scanned
+    /// for `needle` at every bit offset; `_debug_watch_hits()` counts the packets that held it and
+    /// `_debug_watch_scanned()` the packets scanned. An empty needle stops the scan.
+    #[func]
+    fn _debug_watch(&mut self, needle: PackedByteArray) {
+        self.watch = needle.to_vec();
+        self.watch_counts = [0, 0];
+    }
+
+    #[func]
+    fn _debug_watch_hits(&self) -> i64 {
+        self.watch_counts[1]
+    }
+
+    #[func]
+    fn _debug_watch_scanned(&self) -> i64 {
+        self.watch_counts[0]
     }
 
     /// Packets held by this end's emulators (sent and not yet released, or received and not yet due).
@@ -394,6 +417,12 @@ impl IMultiplayerPeerExtension for NetPipePeer {
             Some(p) => {
                 self.counts[2] += p.data.len() as i64;
                 self.counts[3] += 1;
+                if !self.watch.is_empty() {
+                    self.watch_counts[0] += 1;
+                    if netcore::quant::contains_bytes(&p.data, &self.watch) {
+                        self.watch_counts[1] += 1;
+                    }
+                }
                 PackedByteArray::from(p.data.as_slice())
             }
             None => PackedByteArray::new(),

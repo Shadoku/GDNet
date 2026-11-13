@@ -7,9 +7,12 @@ script = ExtResource("1_card")
 
 [node name="NetEntity" type="NetEntity" parent="."]
 inherit_profile = true
-state_properties = Array[NodePath]([NodePath("face")])
+state_properties = Array[NodePath]([NodePath("face"), NodePath("secret_name")])
 state_options = {
 "face": {
+"audience": "owner"
+},
+"secret_name": {
 "audience": "owner"
 }
 }

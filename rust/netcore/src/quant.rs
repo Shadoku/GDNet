@@ -587,9 +587,44 @@ impl Encoded {
     }
 }
 
+/// True when `needle` appears in `hay` starting at any bit offset, as [`BitWriter::write_raw`] puts
+/// bytes into a bit-packed message (byte-aligned messages included). For tests that scan packets for
+/// a value (gate G9).
+pub fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    let n = needle.len() * 8;
+    let total = hay.len() * 8;
+    if n == 0 || n > total {
+        return false;
+    }
+    (0..=total - n).any(|offset| {
+        let mut r = BitReader::new(hay);
+        r.skip(offset).is_some()
+            && needle
+                .iter()
+                .all(|b| r.read_bits(8) == Some(u64::from(*b)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_bytes_finds_bytes_written_at_any_bit_offset() {
+        let needle = b"G9-SECRET";
+        for skip in 0..16u32 {
+            let mut w = BitWriter::new();
+            w.write_bits(0b1011, skip.min(4));
+            w.write_bits(0, skip.saturating_sub(4));
+            w.write_bytes(needle);
+            w.write_bits(0x5, 3);
+            let bytes = w.into_bytes();
+            assert!(contains_bytes(&bytes, needle), "offset {skip}");
+            assert!(!contains_bytes(&bytes, b"G9-SECRFT"), "offset {skip}");
+        }
+        assert!(!contains_bytes(b"short", b"longer than it"));
+        assert!(!contains_bytes(b"anything", b""));
+    }
 
     fn roundtrip(ty: TypeTag, q: Quant, v: &Value) -> Value {
         let mut w = BitWriter::new();
