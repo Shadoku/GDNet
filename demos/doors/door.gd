@@ -13,7 +13,6 @@ func _ready() -> void:
 
 
 func _on_body_entered(body: Node2D) -> void:
-	# Only the server moves players, and only players of this door's own level: a server holding
-	# several levels has them all in one physics space.
-	if multiplayer.is_server() and body is DoorsPlayer and owner.is_ancestor_of(body):
+	# Only the server moves players.
+	if multiplayer.is_server() and body is DoorsPlayer:
 		Net.travel(body, target_scene, spawn_point)

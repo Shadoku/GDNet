@@ -21,7 +21,7 @@ position = Vector2(0, -175)
 collision_layer = 0
 collision_mask = 2
 script = ExtResource("1_door")
-target_scene = "res://demos/doors/hub.tscn"
+target_scene = "res://demos/doors/chunk_1_1.tscn"
 spawn_point = "FromGarden"
 
 [node name="Shape" type="CollisionShape2D" parent="ReturnDoor"]

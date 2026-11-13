@@ -15,7 +15,9 @@
 //! loss it is the server's state at T for every field, including fields that did not change at T (the
 //! case "the server did not move the player at all" is caught). A field whose update was lost and not
 //! yet resent can make one spurious rollback; the next snapshot corrects it. A confirmation older than
-//! the history window is not compared (counted as `stale`).
+//! the history window is not compared (counted as `stale`), except while the history is still filling:
+//! then a confirmation from before its first tick is compared at that tick (WP16: a player moved by the
+//! server right after its spawn, before the owner predicted, was otherwise never corrected).
 
 use crate::entity::NetId;
 use crate::props::{Quant, ScenePropsTable, Schedule, TypeTag, Value};
@@ -296,7 +298,23 @@ impl Prediction {
     /// Compares the newest confirmation with the history (once per confirmation). `None` when nothing
     /// was confirmed since the last call, nothing differs, or every policy forbids a rollback.
     pub fn evaluate(&mut self) -> Option<Rollback> {
-        let tick = self.confirmed.take()?;
+        let mut tick = self.confirmed.take()?;
+        // A confirmation from before an entity's first recorded tick, while its history is not full
+        // yet (tracking started after the server's tick: a player moved right after its spawn), is
+        // compared at that first tick when no entity has a record at the confirmed tick: an idle
+        // server sends no newer snapshot, and the mirror holds its latest values.
+        let max = self.max_ticks as usize;
+        let checked = self.tracked.values().filter(|t| t.policy != Policy::Disabled);
+        if checked.clone().all(|t| t.at(tick).is_none()) {
+            if let Some(start) = checked
+                .filter(|t| t.history.len() < max)
+                .filter_map(|t| t.history.front().map(|(f, _)| *f))
+                .filter(|f| *f > tick)
+                .min()
+            {
+                tick = start;
+            }
+        }
         let mut mismatched = Vec::new();
         let mut any_compared = false;
         for (&id, t) in &self.tracked {
@@ -431,6 +449,38 @@ mod tests {
         assert_eq!(p.evaluate(), None);
         assert_eq!(p.evaluate(), None, "evaluated once");
         assert_eq!(p.stats.confirmations, 1);
+    }
+
+    /// A server change made before the owner's first predicted tick (a player teleported right after
+    /// its spawn) is still found: the confirmation is compared at the first recorded tick, since an
+    /// idle server sends nothing more.
+    #[test]
+    fn a_confirmation_from_before_the_history_is_compared_at_its_start() {
+        let mut p = Prediction::default();
+        p.track(1, &table(), Policy::Check, &[(0, 0, v2(1140.0, 0.0))]);
+        for t in 12..=15 {
+            rec(&mut p, 1, t, 1140.0);
+        }
+        confirm_all(&mut p, 1, 10, 4000.0);
+        let r = p.evaluate().expect("a rollback");
+        assert_eq!(r.to_tick, 12, "to the first recorded tick");
+        assert_eq!(r.entities[0].1[0], (0, 0, v2(4000.0, 0.0)));
+        // A matching early confirmation changes nothing; a full window keeps the old rule.
+        let mut q = Prediction::default();
+        q.track(1, &table(), Policy::Check, &[]);
+        for t in 12..=15 {
+            rec(&mut q, 1, t, 1140.0);
+        }
+        confirm_all(&mut q, 1, 10, 1140.0);
+        assert_eq!(q.evaluate(), None);
+        let mut full = Prediction::new(4);
+        full.track(1, &table(), Policy::Check, &[]);
+        for t in 12..=15 {
+            rec(&mut full, 1, t, 1140.0);
+        }
+        confirm_all(&mut full, 1, 10, 4000.0);
+        assert_eq!(full.evaluate(), None, "older than a full history: stale");
+        assert_eq!(full.stats.stale, 1);
     }
 
     #[test]

@@ -14,12 +14,20 @@ const KEEP := "gdnet/levels/keep_state"
 const SPACING := "gdnet/levels/spacing"
 
 var net: NetFixture
+## project.godot's `gdnet/levels/spacing` (4000, for the Doors demo), put back after each test.
+var _project_spacing: Variant = null
 var offline_world: Node2D
+
+
+func before_each() -> void:
+	# These tests choose placement themselves: off unless a test sets it.
+	_project_spacing = ProjectSettings.get_setting(SPACING, null)
+	ProjectSettings.set_setting(SPACING, null)
 
 
 func after_each() -> void:
 	ProjectSettings.set_setting(KEEP, null)
-	ProjectSettings.set_setting(SPACING, null)
+	ProjectSettings.set_setting(SPACING, _project_spacing)
 	Net.empty_level_timeout = 0.0
 	if net != null:
 		net.teardown()

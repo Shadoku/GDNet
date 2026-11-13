@@ -5,3 +5,7 @@
 [node name="Flame" type="Polygon2D" parent="."]
 color = Color(1, 0.6, 0.1, 1)
 polygon = PackedVector2Array(0, -16, 8, 0, 0, 8, -8, 0)
+
+[node name="NetEntity" type="NetEntity" parent="."]
+inherit_profile = true
+radius = 400.0

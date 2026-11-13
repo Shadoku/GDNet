@@ -1,12 +1,13 @@
 class_name DoorsWorld
 extends Node2D
 ## The World node: every level this peer shows is loaded under it. The server holds every level
-## someone is in; a client holds only the level its player is in (docs/guide/09_rooms_and_travel.md).
+## someone needs; a client holds its player's level and that level's neighbours
+## (docs/guide/09_rooms_and_travel.md).
 
 const PLAYER := preload("res://demos/doors/player.tscn")
 
 ## The level new players start in.
-@export_file("*.tscn") var start_level: String = "res://demos/doors/hub.tscn"
+@export_file("*.tscn") var start_level: String = "res://demos/doors/chunk_0_0.tscn"
 ## True on a dedicated server: peer 1 gets no player.
 @export var dedicated: bool = false
 

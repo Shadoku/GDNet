@@ -1,0 +1,63 @@
+[gd_scene format=3]
+
+[ext_resource type="PackedScene" path="res://demos/doors/torch.tscn" id="1_torch"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_long"]
+size = Vector2(1200, 40)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_side"]
+size = Vector2(40, 800)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_boulder"]
+size = Vector2(80, 80)
+
+[node name="Chunk10" type="Node2D"]
+position = Vector2(1200, 0)
+
+[node name="Floor" type="ColorRect" parent="."]
+offset_right = 1200.0
+offset_bottom = 800.0
+color = Color(0.35, 0.55, 0.3, 1)
+
+[node name="Walls" type="StaticBody2D" parent="."]
+
+[node name="North" type="CollisionShape2D" parent="Walls"]
+position = Vector2(600, -20)
+shape = SubResource("RectangleShape2D_long")
+
+[node name="East" type="CollisionShape2D" parent="Walls"]
+position = Vector2(1220, 400)
+shape = SubResource("RectangleShape2D_side")
+
+[node name="Boulder" type="StaticBody2D" parent="."]
+position = Vector2(0, 250)
+
+[node name="Shape" type="CollisionShape2D" parent="Boulder"]
+shape = SubResource("RectangleShape2D_boulder")
+
+[node name="Look" type="Polygon2D" parent="Boulder"]
+color = Color(0.45, 0.42, 0.4, 1)
+polygon = PackedVector2Array(-40, -40, 40, -40, 40, 40, -40, 40)
+
+[node name="NetManager" type="NetManager" parent="."]
+neighbours = PackedStringArray("res://demos/doors/chunk_0_0.tscn", "res://demos/doors/chunk_0_1.tscn", "res://demos/doors/chunk_1_1.tscn")
+auto_travel = true
+bounds = Rect2(0, 0, 1200, 800)
+
+[node name="Torch1" parent="NetManager" instance=ExtResource("1_torch")]
+position = Vector2(1400, 200)
+
+[node name="Torch2" parent="NetManager" instance=ExtResource("1_torch")]
+position = Vector2(1800, 200)
+
+[node name="Torch3" parent="NetManager" instance=ExtResource("1_torch")]
+position = Vector2(2200, 200)
+
+[node name="Torch4" parent="NetManager" instance=ExtResource("1_torch")]
+position = Vector2(1400, 600)
+
+[node name="Torch5" parent="NetManager" instance=ExtResource("1_torch")]
+position = Vector2(1800, 600)
+
+[node name="Torch6" parent="NetManager" instance=ExtResource("1_torch")]
+position = Vector2(2200, 600)

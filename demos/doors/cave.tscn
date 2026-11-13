@@ -2,6 +2,7 @@
 
 [ext_resource type="Script" path="res://demos/doors/door.gd" id="1_door"]
 [ext_resource type="PackedScene" path="res://demos/doors/torch.tscn" id="2_torch"]
+[ext_resource type="PackedScene" path="res://demos/doors/chest.tscn" id="3_chest"]
 
 [sub_resource type="RectangleShape2D" id="RectangleShape2D_door"]
 size = Vector2(96, 48)
@@ -20,12 +21,15 @@ color = Color(0.15, 0.12, 0.1, 1)
 [node name="CaveTorch" parent="NetManager" instance=ExtResource("2_torch")]
 position = Vector2(0, -150)
 
+[node name="Chest" parent="NetManager" instance=ExtResource("3_chest")]
+position = Vector2(200, -120)
+
 [node name="ReturnDoor" type="Area2D" parent="."]
 position = Vector2(0, 175)
 collision_layer = 0
 collision_mask = 2
 script = ExtResource("1_door")
-target_scene = "res://demos/doors/hub.tscn"
+target_scene = "res://demos/doors/chunk_0_0.tscn"
 spawn_point = "FromCave"
 
 [node name="Shape" type="CollisionShape2D" parent="ReturnDoor"]

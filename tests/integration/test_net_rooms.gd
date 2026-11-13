@@ -16,12 +16,20 @@ const ACTIONS: Array[String] = ["left", "right", "up", "down", "jump"]
 const SPEED := 200.0
 
 var net: NetFixture
+## project.godot's `gdnet/levels/spacing` (4000, for the Doors demo), put back after each test.
+var _project_spacing: Variant = null
+
+
+func before_each() -> void:
+	# These tests choose placement themselves: off unless a test sets it.
+	_project_spacing = ProjectSettings.get_setting(SPACING, null)
+	ProjectSettings.set_setting(SPACING, null)
 
 
 func after_each() -> void:
 	for a in ACTIONS:
 		Input.action_release(a)
-	ProjectSettings.set_setting(SPACING, null)
+	ProjectSettings.set_setting(SPACING, _project_spacing)
 	if net != null:
 		net.teardown()
 		net = null
