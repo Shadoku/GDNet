@@ -39,6 +39,57 @@ snapshot rolls it back. Two honest options:
 Handing a touched body to the pushing client for a while, so the push is immediate and still arbitrated by
 the server, is WP15 (cooperative physics ownership, after v1).
 
+## Physics modes
+
+Who simulates a body is a choice per entity (WP19, docs/PLAN_NETCODE.md 12.4), with no script change:
+`NetEntity.physics`, the `configure()` key `"physics"`, `NetManager.physics` for a manager's default,
+and the project setting `gdnet/physics/mode` (default `server`). The first that is not `default` wins. It
+applies to entities with a `RigidBody2D` / `RigidBody3D` part (subclasses such as `VehicleBody3D`
+included); an entity without one ignores it. Set it on the server at any time (the property,
+`Net.set_physics(node, "simulated")`) and every peer follows at the next tick; `Net.physics_of(node)`
+says what a peer holds.
+
+| mode | who simulates | the other peers |
+|---|---|---|
+| `server` | the server | the body is frozen and interpolated (everything above) |
+| `owner` | the entity's owner (a client, or the server when it owns it) | frozen and interpolated, the server included; the owner's body is live, wakes and sleeps as usual, and moves on the tick of its input |
+| `handoff` | not built yet: behaves as `server`, with a one-time warning | |
+| `simulated` | every peer, the server's result is the reference | the client's body is live; snapshots correct it |
+
+`owner` is `client_owned` for bodies (page 7): `physics = owner` and `client_owned = true` on a body are
+the same thing (a body with `client_owned = true` is `owner` whatever its option says). Changing the owner
+moves the simulation: the old owner's copy freezes, the new owner's thaws with the velocities it was
+showing. When a seat drops (page 13), its bodies freeze in place on the server until it rejoins or its
+seat is released. The overlay names the peer simulating an `owner` body (`owner-sim <peer>`).
+
+**`simulated`.** The client's body runs in the client's *predicted* timeline, the moment its own
+predicted player is at, so a player and the bodies it touches meet where they are: a player pushing a
+crate moves it in the tick of contact, and a player riding a platform rides the live platform. Each
+snapshot is compared with where the local body was at that snapshot's tick (both carried to the present
+at their velocities), so motion both sides share is never corrected, whatever the latency. A difference
+below the thresholds is left alone on a resting body (a pile stays asleep) and refined quietly on a
+moving one; above them it becomes a decaying offset on position and rotation and the velocities are set
+to the server's; beyond `gdnet/interpolation/teleport_distance` the body snaps. During a rollback replay
+the bodies are not stepped (Godot cannot step physics on demand): each replayed tick puts them where they
+were recorded at that tick, and the present comes back afterwards, so a replayed push does not count
+twice. The server never corrects its own bodies, and snapshots cost the same in every mode.
+
+Tuning, read at each use: `gdnet/physics/correction_position` (metres, default 0.02; 2 px in 2D at 100
+px per metre), `gdnet/physics/correction_angle` (degrees, default 3), `gdnet/physics/correction_decay`
+(the share of a correction left after one 60 Hz tick, default 0.85) and
+`gdnet/physics/correction_rest_speed` (metres per second, default 0.15: a server sample slower than this
+counts as at rest; keep it above Godot's sleep threshold). `NetSession.stats()` reports
+`sim_corrections` (and `_per_s`), `sim_snaps`, `sim_correcting` and `sim_bodies` on a client.
+
+What it costs and where it shows: a push only the server saw (its player, another client) reaches the
+client late and the body slides to the server's answer (measured: a crate pushed to 3 m/s slides 0.4 m;
+the client's largest step is 3x the server's own, it settles within 0.1 px). Bodies that settle while a
+client watches take longer to fall asleep there (a 40-crate pile: about 10 s on the client against 1 s
+on the server); a pile the client joins at rest sleeps at once. Setting a simulating `RigidBody`'s
+`position` in a script does not reach the physics server in Godot 4.6 (the next physics sync puts it
+back): move such a body with `PhysicsServer2D/3D.body_set_state(rid, BODY_STATE_TRANSFORM, ...)`, as
+gdnet's corrections do, and call `Net.touch(node)` when it was asleep.
+
 ## Sleeping bodies cost nothing
 
 The server records a hot field only when its *quantised* encoding changes. A body Godot put to sleep does

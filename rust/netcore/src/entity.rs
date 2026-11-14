@@ -105,6 +105,8 @@ pub struct EntityRecord {
     /// WP7: how ownership may move, and whether the owner's state is accepted (2.6).
     pub transfer: crate::authority::Transfer,
     pub client_owned: bool,
+    /// WP19: who simulates its bodies (`client_owned` is set for `owner`).
+    pub physics: crate::correct::PhysicsMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -121,6 +123,8 @@ pub struct CreateAction {
     pub transfer: crate::authority::Transfer,
     /// WP7: the owner's state is accepted and relayed (shared authority, D9).
     pub client_owned: bool,
+    /// WP19 (wire format 6): who simulates the entity's bodies.
+    pub physics: crate::correct::PhysicsMode,
 }
 
 /// `EntityAction` (2.4): one reliable ordered message per action.
@@ -172,6 +176,13 @@ pub enum EntityAction {
         id: NetId,
         granted: bool,
     },
+    /// WP19 (wire format 6), server to every peer that knows `id`: its physics mode and its effective
+    /// `client_owned` flag changed.
+    SetPhysics {
+        id: NetId,
+        physics: crate::correct::PhysicsMode,
+        client_owned: bool,
+    },
     /// WP13/WP16, server to a client: `room`, a level, joined the client's set of rooms: load
     /// `scene_path` (under the game's World node, its root at `origin`, else where it was authored)
     /// before the actions that follow, then answer `TravelAck`.
@@ -220,7 +231,8 @@ impl EntityAction {
             | EntityAction::ReleaseOwner { id }
             | EntityAction::OwnerQuery { id, .. }
             | EntityAction::OwnerAnswer { id, .. }
-            | EntityAction::OwnerReply { id, .. } => Some(*id),
+            | EntityAction::OwnerReply { id, .. }
+            | EntityAction::SetPhysics { id, .. } => Some(*id),
             EntityAction::Call(c) => Some(c.entity),
         }
     }
@@ -241,7 +253,8 @@ impl EntityAction {
             | EntityAction::ReleaseOwner { id }
             | EntityAction::OwnerQuery { id, .. }
             | EntityAction::OwnerAnswer { id, .. }
-            | EntityAction::OwnerReply { id, .. } => (Some(*id), None),
+            | EntityAction::OwnerReply { id, .. }
+            | EntityAction::SetPhysics { id, .. } => (Some(*id), None),
             EntityAction::Call(c) => (Some(c.entity), None),
             EntityAction::Reparent { id, parent: p } => (Some(*id), parent(p)),
         }
@@ -297,6 +310,7 @@ impl EntityTable {
                 seq: self.seq,
                 transfer: c.transfer,
                 client_owned: c.client_owned,
+                physics: c.physics,
             },
         );
         true
@@ -412,6 +426,23 @@ impl EntityTable {
         }
     }
 
+    /// WP19: sets the physics mode and the effective `client_owned` flag of `id`; false when unknown.
+    pub fn set_physics(
+        &mut self,
+        id: NetId,
+        physics: crate::correct::PhysicsMode,
+        client_owned: bool,
+    ) -> bool {
+        match self.records.get_mut(&id) {
+            Some(r) => {
+                r.physics = physics;
+                r.client_owned = client_owned;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The creates of `ids` in [`Self::burst`]'s order (parents first, siblings in creation order),
     /// without walking the rest of the table.
     pub fn creates_of(&self, ids: &[NetId]) -> Vec<CreateAction> {
@@ -450,6 +481,7 @@ impl EntityTable {
             initial_state: Vec::new(),
             transfer: r.transfer,
             client_owned: r.client_owned,
+            physics: r.physics,
         }
     }
 

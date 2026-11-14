@@ -186,6 +186,15 @@ pub struct NetEntity {
     /// The entity's net id once spawned (0 before). Read only.
     #[var(get = get_net_id, no_set)]
     net_id: i64,
+    /// WP19 (12.4): who simulates this entity's RigidBody parts: `default` (the manager's, else the
+    /// project setting `gdnet/physics/mode`, default `server`), `server`, `owner` (the owner simulates,
+    /// as `client_owned`), `handoff` (not built yet: behaves as `server`) or `simulated` (every peer
+    /// simulates; the server's snapshots correct the clients). Ignored by an entity without a body. Set
+    /// on the server at any time: every peer follows at the next tick. On a client it shows the mode
+    /// the server chose.
+    #[export]
+    #[var(get = get_physics, set = set_physics)]
+    physics: crate::manager::modes::PhysicsOption,
 }
 
 #[godot_api]
@@ -240,6 +249,38 @@ impl NetEntity {
     }
 
     /// WP16: pushes this entity's interest settings to a running server (deferred from the setters).
+    /// `physics`: the manager's, else the project's.
+    #[constant]
+    const PHYSICS_DEFAULT: i64 = 0;
+    #[constant]
+    const PHYSICS_SERVER: i64 = 1;
+    #[constant]
+    const PHYSICS_OWNER: i64 = 2;
+    #[constant]
+    const PHYSICS_HANDOFF: i64 = 3;
+    #[constant]
+    const PHYSICS_SIMULATED: i64 = 4;
+
+    #[func]
+    pub fn get_physics(&self) -> crate::manager::modes::PhysicsOption {
+        self.physics
+    }
+
+    #[func]
+    pub fn set_physics(&mut self, v: crate::manager::modes::PhysicsOption) {
+        self.physics = v;
+        if self.net_id != 0 {
+            self.to_gd().call_deferred("_net_apply_physics", &[]);
+        }
+    }
+
+    #[func]
+    fn _net_apply_physics(&self) {
+        if let Some(root) = self.base().get_parent() {
+            crate::manager::modes::apply_live(&root);
+        }
+    }
+
     #[func]
     fn _net_apply_interest(&self) {
         if let Some(root) = self.base().get_parent() {
@@ -278,6 +319,10 @@ impl NetEntity {
     }
 
     /// WP16: the setters without the live push (the caller pushes).
+    pub fn set_physics_quiet(&mut self, v: crate::manager::modes::PhysicsOption) {
+        self.physics = v;
+    }
+
     pub fn set_radius_quiet(&mut self, r: f64) {
         self.radius = r;
     }

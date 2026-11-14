@@ -4,7 +4,8 @@
 //! viewport's current `Camera3D.unproject_position()`; skipped without a camera or behind it), reading
 //! `#<net id> owner <peer>`, coloured by role, Roblox-style: green = owned by this peer, white =
 //! server-owned, grey = another client's, amber = `client_owned` (the trust label: its owner's state is
-//! accepted as is), red = a write was rejected in the last second. It shows the entities of every
+//! accepted as is), red = a write was rejected in the last second. WP19: a body's label ends with its
+//! physics mode (`owner-sim <peer>` for `owner`, naming the peer that simulates it). It shows the entities of every
 //! session in the tree (so a test's server and client branches all appear). The same data is
 //! `NetSession.overlay_rows()` / `Net.overlay_rows()`.
 
@@ -102,10 +103,21 @@ impl NetOverlay {
                     .get("seat")
                     .and_then(|v| v.try_to::<i64>().ok())
                     .unwrap_or(0);
+                // WP19: a body's physics mode (and for `owner`, the peer simulating it).
+                let physics = d.get("physics").map(|v| v.to_string()).unwrap_or_default();
+                let by = d
+                    .get("simulated_by")
+                    .and_then(|v| v.try_to::<i64>().ok())
+                    .unwrap_or(0);
+                let mode = match physics.as_str() {
+                    "" => String::new(),
+                    "owner" => format!(" owner-sim {by}"),
+                    m => format!(" {m}"),
+                };
                 let text = if away {
-                    format!("#{id} seat {seat} away")
+                    format!("#{id} seat {seat} away{mode}")
                 } else {
-                    format!("#{id} owner {owner}")
+                    format!("#{id} owner {owner}{mode}")
                 };
                 placed.push((pos, GString::from(text.as_str()), color));
             }

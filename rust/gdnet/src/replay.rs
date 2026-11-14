@@ -69,9 +69,21 @@ pub fn rollback(
         return 0;
     }
     let mut replayed = 0;
+    // WP19: the `simulated` bodies are not replayed (Godot cannot step physics on demand): each
+    // replayed tick puts them where they were at that tick (their recorded poses), and afterwards they
+    // get their present back, so what a replayed `_physics_process` does to them (an impulse on contact)
+    // does not count twice.
+    let saved: Vec<_> = managers
+        .iter()
+        .map(|(_, m)| (m.clone(), m.clone().bind_mut().save_simulated()))
+        .collect();
     {
         let _replaying = tick::Replaying::start();
         for t in rb.to_tick + 1..now {
+            // WP19: the simulated bodies as they were at that tick.
+            for (m, _) in &saved {
+                m.clone().bind_mut().pose_simulated_at(t);
+            }
             for (m, ids) in &restored {
                 let mut m = m.clone();
                 let hist = m.bind_mut().replay_tick(session, ids, t, delta);
@@ -84,6 +96,9 @@ pub fn rollback(
             }
             replayed += 1;
         }
+    }
+    for (mut m, bodies) in saved {
+        m.bind_mut().restore_simulated(bodies);
     }
     // WP5: the difference between what was shown and the replayed state blends out visually.
     let mut after = Vec::new();

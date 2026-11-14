@@ -241,6 +241,9 @@ struct Counters {
     /// WP14: deferred entities and fields per second.
     window_start_deferred: [u64; 2],
     deferred_per_s: [u64; 2],
+    /// WP19: corrections of simulated replicas per second.
+    window_start_sim_corrections: u64,
+    sim_corrections_per_s: u64,
 }
 
 #[godot_api]
@@ -987,6 +990,13 @@ impl NetSession {
         d.set("late_snapshots", i.late_snapshots as i64);
         d.set("late_snapshots_per_s", c.late_per_s as i64);
         d.set("offset_corrections", i.corrections as i64);
+        // WP19: corrections of `simulated` replicas (client).
+        let (sc, ss, busy, n) = self.sim_stats();
+        d.set("sim_corrections", sc as i64);
+        d.set("sim_corrections_per_s", c.sim_corrections_per_s as i64);
+        d.set("sim_snaps", ss as i64);
+        d.set("sim_correcting", busy as i64);
+        d.set("sim_bodies", n as i64);
         d.set("offset_corrections_per_s", c.corrections_per_s as i64);
         d.set("interp_teleports", i.teleports as i64);
         let cs = self
@@ -1129,6 +1139,15 @@ impl NetSession {
                 let away = seat != 0 && self.core.as_ref().is_some_and(|c| c.peer_of(seat) == 0);
                 d.set("seat", i64::from(seat));
                 d.set("away", away);
+                // WP19: the physics mode ("" without a body) and, for `owner`, who simulates it.
+                d.set("physics", e.physics);
+                let by = match e.physics {
+                    "owner" if e.client_owned => i64::from(e.owner),
+                    "" => 0,
+                    "simulated" => -1,
+                    _ => 1,
+                };
+                d.set("simulated_by", by);
                 out.push(&d.to_variant());
             }
         }
@@ -1683,6 +1702,16 @@ impl NetSession {
                     core.local_input(id, f);
                 }
             }
+            // WP19: each `simulated` replica's pose under the predicted tick.
+            let p = self.core.as_ref().map_or(0, |c| c.predicted_tick());
+            let managers = self.managers();
+            {
+                let _guard = self.base_mut();
+                for (_, mut m) in managers {
+                    m.bind_mut()
+                        .record_simulated(p, 1.0 / f64::from(tick_rate()));
+                }
+            }
             // WP7: the state of the client_owned entities this client owns, and writes to replicas.
             let tick = self.core.as_ref().map_or(0, |c| c.current_tick());
             let cold = self.effective_cold_poll();
@@ -1928,6 +1957,11 @@ impl NetSession {
                 }
                 c.window_start_deferred = now;
             }
+            // WP19: corrections of simulated replicas per second.
+            let sc = self.sim_stats().0;
+            let c = &mut self.stats;
+            c.sim_corrections_per_s = sc - c.window_start_sim_corrections;
+            c.window_start_sim_corrections = sc;
             c.poll_ms_avg = c.poll_us_window as f64 / 1000.0 / f64::from(c.window_ticks);
             c.poll_us_window = 0;
             c.window_ticks = 0;
@@ -2400,6 +2434,23 @@ impl NetSession {
                 m.bind_mut().gate_and_track(&me);
             }
         }
+        // WP19: the corrections of `simulated` replicas, before anything simulates this tick. The
+        // server's state is known up to the newest snapshot, or up to the server tick a snapshot sent
+        // now would have left (half a round trip and two ticks ago) when nothing changed since.
+        if !ctx.is_server {
+            let known = self.core.as_ref().map_or(0, |c| {
+                let newest = c.interp().timeline.newest().unwrap_or(0);
+                let half =
+                    c.rtt_ms(netcore::SERVER).unwrap_or(0.0) / 2000.0 * f64::from(c.tick_rate());
+                let quiet = (c.clock().server_tick_estimate() - half.ceil() - 2.0).max(0.0) as u64;
+                newest.max(quiet)
+            });
+            let _guard = self.base_mut();
+            for (_, m) in &managers {
+                let mut m = m.clone();
+                m.bind_mut().correct_simulated(ctx.tick, known, ctx.delta);
+            }
+        }
         let rollback = self.core.as_mut().and_then(|c| c.take_rollback());
         // The lead grew: the predicted ticks it skipped are simulated now (a rollback replays them).
         let catch_up = match (self.last_ptick, &rollback) {
@@ -2524,6 +2575,16 @@ impl NetSession {
         self.applied = None;
         self.base_mut().set_physics_process(false);
         self.base_mut().set_process(false);
+    }
+
+    /// WP19: (corrections, snaps, bodies correcting now, simulated replicas) over the managers.
+    fn sim_stats(&self) -> (u64, u64, usize, usize) {
+        let mut t = (0, 0, 0, 0);
+        for (_, m) in self.managers() {
+            let (a, b, c, d) = m.bind().sim_stats();
+            t = (t.0 + a, t.1 + b, t.2 + c, t.3 + d);
+        }
+        t
     }
 
     /// 2.2 step 7 (WP5, see interp.rs): advances the render timeline, writes the replicas' interpolated
