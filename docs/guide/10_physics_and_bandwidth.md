@@ -50,8 +50,9 @@ recorded changes and zero snapshot bytes over a second; everything a client rece
 
 Sleeping bodies cost no CPU either: a sleeping body is off the server's hot list, so its position,
 rotation and velocities are not even read until its `sleeping_state_changed` signal reports it awake,
-and it is sent in the tick it wakes (page 3, "Polling cost"). Its cold properties are still read every
-`cold_poll_ticks`. The meter's `poll` line counts the hot, idle and sleeping entities.
+and it is sent in the tick it wakes (page 3, "Polling cost"). Its cold properties (and whether it still
+sleeps and is not frozen, which Godot does not signal when a script sets them) are still read every
+`gdnet/sync/resting_poll_ticks` (24 ticks, 0.4 s at 60; `Net.touch(body)` reads them at once). The meter's `poll` line counts the hot, idle and sleeping entities.
 
 Two practical notes. A body that rolls very slowly on a flat floor can doze off and wake again for
 seconds, costing a few bytes each time it moves; a little `angular_damp` (the Ballpit balls use 3) brings

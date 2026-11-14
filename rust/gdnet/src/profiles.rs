@@ -28,8 +28,12 @@ use std::rc::Rc;
 pub const DEFAULT_PROFILES_PATH: &str = "res://addons/gdnet/default_profiles.tres";
 pub const SETTING_PROFILES: &str = "gdnet/sync/profiles";
 pub const SETTING_COLD_POLL: &str = "gdnet/sync/cold_poll_ticks";
-/// WP18: polls without a change before an entity is idle (polled at the cold rate); 0 = never.
+/// WP18: polls without a change before an entity is idle (polled at the resting rate); 0 = never.
 pub const SETTING_IDLE_AFTER: &str = "gdnet/sync/idle_after_ticks";
+/// WP18: idle and sleeping entities are polled every this many ticks (never below the cold rate).
+pub const SETTING_RESTING_POLL: &str = "gdnet/sync/resting_poll_ticks";
+/// The default of [`SETTING_RESTING_POLL`].
+pub const DEFAULT_RESTING_POLL: u32 = 24;
 pub const SETTING_EXPORT_VARS: &str = "gdnet/sync/export_vars";
 pub const SETTING_BUDGET: &str = "gdnet/budget/bytes_per_second";
 
@@ -419,6 +423,7 @@ impl NetProfiles {
 struct Globals {
     net_profiles: Option<Profiles>,
     cold_poll_ticks: Option<u32>,
+    resting_poll_ticks: Option<u32>,
     budget: Option<u32>,
     effective: Option<Rc<Profiles>>,
 }
@@ -474,6 +479,10 @@ pub fn set_cold_poll_ticks(v: Option<u32>) {
     GLOBALS.with(|g| g.borrow_mut().cold_poll_ticks = v);
 }
 
+pub fn set_resting_poll_ticks(v: Option<u32>) {
+    GLOBALS.with(|g| g.borrow_mut().resting_poll_ticks = v);
+}
+
 pub fn set_budget(v: Option<u32>) {
     GLOBALS.with(|g| g.borrow_mut().budget = v);
 }
@@ -488,6 +497,20 @@ pub fn cold_poll_ticks() -> u32 {
                 .map(|v| v as u32)
         })
         .unwrap_or(6)
+        .max(1)
+}
+
+/// WP18: `Net.resting_poll_ticks`, else `gdnet/sync/resting_poll_ticks`, else 24 (read every tick).
+/// Not raised to the cold rate here: the caller does that with its own effective cold rate.
+pub fn resting_poll_ticks() -> u32 {
+    GLOBALS
+        .with(|g| g.borrow().resting_poll_ticks)
+        .or_else(|| {
+            setting(SETTING_RESTING_POLL)
+                .and_then(|v| v.try_to::<i64>().ok())
+                .map(|v| v.clamp(1, i64::from(u32::MAX)) as u32)
+        })
+        .unwrap_or(DEFAULT_RESTING_POLL)
         .max(1)
 }
 

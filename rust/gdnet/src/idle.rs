@@ -3,8 +3,9 @@
 //!
 //! Every spawned entity on the server has a slot in the manager's [`netcore::Activity`]: hot (polled
 //! every tick), idle (nothing changed for `gdnet/sync/idle_after_ticks` polls: polled every
-//! `cold_poll_ticks` with its cold properties) or asleep (its RigidBody parts sleep: their hot
-//! properties are not polled at all, the rest is polled like an idle entity's). A body's
+//! `gdnet/sync/resting_poll_ticks` with its cold properties) or asleep (its RigidBody parts sleep:
+//! their hot properties are not polled at all, the rest is polled like an idle entity's). A hot
+//! entity's cold properties keep `cold_poll_ticks`; the resting rate is never below it. A body's
 //! `sleeping_state_changed` signal moves it; `Net.touch`, a call, an owner change, a reparent, travel and
 //! restored level state make an entity hot at once. Entities whose scripts read `Net.input` (players,
 //! including an away seat's body the server simulates with neutral input) and entities a client owns
@@ -156,13 +157,13 @@ pub fn flush_input_driven() {
 impl NetManager {
     /// 2.2 step 5 on the server: polls the hot list (hot properties, and the cold ones every `cold`
     /// ticks staggered by id, or right after `mark_cold_dirty`) and this tick's bucket of idle and
-    /// sleeping entities. `polled` says which parts of `out` belong to which entity. A resting poll
+    /// sleeping entities (one of `resting` buckets, staggered by id). `polled` says which parts of `out` belong to which entity. A resting poll
     /// whose values hash the same as the previous resting poll's pushes nothing (netcore holds exactly
     /// those values: every poll since the entity stopped being hot recorded all of them).
     pub fn record(
         &mut self,
         tick: u64,
-        cold: u32,
+        (cold, resting): (u32, u32),
         idle_after: u32,
         out: &mut Vec<Recorded>,
         polled: &mut Vec<Polled>,
@@ -171,7 +172,7 @@ impl NetManager {
             return;
         }
         self.activate_pending();
-        self.activity.set_period(cold);
+        self.activity.set_rates(cold, resting);
         self.activity.set_idle_after(idle_after);
         let mut due = Vec::new();
         self.activity.due(tick, &mut due);

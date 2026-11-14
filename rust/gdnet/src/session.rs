@@ -110,6 +110,11 @@ pub struct NetSession {
     /// setting (default 6).
     #[var(get = get_cold_poll_ticks, set = set_cold_poll_ticks)]
     cold_poll_ticks: i64,
+    /// WP18: idle and sleeping entities are polled every this many ticks; 0 = `Net.resting_poll_ticks`
+    /// / the project setting (default 24). Never below the effective `cold_poll_ticks`; applies at the
+    /// next tick.
+    #[var(get = get_resting_poll_ticks, set = set_resting_poll_ticks)]
+    resting_poll_ticks: i64,
     /// Test hook (WP3): this side's property tables change the quantiser of every property with this
     /// name, so a spawn fails the property check with a reason naming the scene and property. Set it
     /// before the first spawn.
@@ -885,6 +890,16 @@ impl NetSession {
     }
 
     #[func]
+    fn get_resting_poll_ticks(&self) -> i64 {
+        self.resting_poll_ticks
+    }
+
+    #[func]
+    fn set_resting_poll_ticks(&mut self, v: i64) {
+        self.resting_poll_ticks = v.max(0);
+    }
+
+    #[func]
     fn get_debug_perturb_property(&self) -> GString {
         self.debug_perturb_property.clone()
     }
@@ -897,7 +912,7 @@ impl NetSession {
     /// Counters for the meter (WP8) and tests: `bytes_sent_per_s` / `bytes_received_per_s` (per channel,
     /// the last full second), `bytes_sent_total` / `bytes_received_total` (per channel),
     /// `entities`, `poll_ms` (the last record step), `poll_ms_avg` (over the last second),
-    /// `budget_bytes_per_s`, `cold_poll_ticks`, and netcore's snapshot counters (`snapshots_sent`,
+    /// `budget_bytes_per_s`, `cold_poll_ticks`, `resting_poll_ticks` (effective), and netcore's snapshot counters (`snapshots_sent`,
     /// `snapshot_bytes`, `snapshot_entities_sent`, `snapshot_fields_sent`, `reliable_fields_sent`,
     /// `snapshots_received`, `snapshots_stale`, `snapshots_unacked`, `fields_received`, `fallbacks`,
     /// `changes`). WP4: `rollbacks` (total), `rollbacks_per_s` (the last full second),
@@ -926,6 +941,10 @@ impl NetSession {
         d.set("polled_entities", c.polled_last as i64);
         d.set("budget_bytes_per_s", i64::from(self.effective_budget()));
         d.set("cold_poll_ticks", i64::from(self.effective_cold_poll()));
+        d.set(
+            "resting_poll_ticks",
+            i64::from(self.effective_resting_poll()),
+        );
         if let Some(core) = self.core.as_ref() {
             let r = core.repl_stats();
             d.set("snapshots_sent", r.snapshots_sent as i64);
@@ -1623,6 +1642,7 @@ impl NetSession {
             let cold = self.effective_cold_poll();
             // WP18: the hot list and this tick's bucket of idle and sleeping entities, per manager;
             // netcore says which polls found a change, and each manager moves its entities.
+            let resting = self.effective_resting_poll();
             let idle_after = profiles::idle_after_ticks();
             crate::manager::idle::flush_input_driven();
             let managers = self.managers();
@@ -1635,7 +1655,7 @@ impl NetSession {
                 {
                     let _guard = self.base_mut();
                     m.bind_mut()
-                        .record(tick, cold, idle_after, &mut batch, &mut polled);
+                        .record(tick, (cold, resting), idle_after, &mut batch, &mut polled);
                 }
                 if let Some(core) = self.core.as_mut() {
                     let mut k = 0;
@@ -2054,6 +2074,17 @@ impl NetSession {
         } else {
             profiles::cold_poll_ticks()
         }
+    }
+
+    /// WP18: this session's `resting_poll_ticks`, else `Net`'s, else the setting; raised to the
+    /// effective `cold_poll_ticks`.
+    pub fn effective_resting_poll(&self) -> u32 {
+        let asked = if self.resting_poll_ticks > 0 {
+            self.resting_poll_ticks.min(i64::from(u32::MAX)) as u32
+        } else {
+            profiles::resting_poll_ticks()
+        };
+        asked.max(self.effective_cold_poll())
     }
 
     pub fn debug_perturb_property(&self) -> String {

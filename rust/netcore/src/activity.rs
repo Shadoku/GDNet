@@ -3,13 +3,15 @@
 //! An entity is in one of three states:
 //!
 //! - **hot**: polled every tick (its cold properties every `period` ticks, staggered);
-//! - **idle**: nothing it has changed for `idle_after` polls in a row; polled every `period` ticks with
-//!   its cold properties, until a poll finds a change;
+//! - **idle**: nothing it has changed for `idle_after` polls in a row; polled every `resting` ticks
+//!   with its cold properties, until a poll finds a change;
 //! - **asleep**: its bodies sleep; the bodies' hot properties are not polled at all, the rest is polled
-//!   every `period` ticks like an idle entity.
+//!   every `resting` ticks like an idle entity.
 //!
-//! Hot entities sit in a list of their own and the resting ones in `period` buckets by their stagger,
-//! so a tick costs the hot entities plus one bucket, not every entity. Entities are addressed by the
+//! `resting` (`gdnet/sync/resting_poll_ticks`) is never below `period` (`cold_poll_ticks`): a resting
+//! entity is polled at most as often as a hot one's cold properties. Hot entities sit in a list of
+//! their own and the resting ones in `resting` buckets by their stagger, so a tick costs the hot
+//! entities plus one bucket, not every entity. Entities are addressed by the
 //! slot index [`Activity::insert`] returns; `K` is the caller's key, handed back by [`Activity::due`].
 
 /// What to poll of an entity this tick.
@@ -56,9 +58,13 @@ pub struct Activity<K> {
     free: Vec<u32>,
     /// Hot entities: (slot, stagger).
     hot: Vec<(u32, u64)>,
-    /// Every live entity, by the tick of the period it is due on.
+    /// Every live entity, by the tick of the resting period it is due on.
     buckets: Vec<Vec<u32>>,
+    /// The cold rate of hot entities.
     period: u64,
+    /// The resting rate as asked for (1 = the same as `period`); the effective one (`buckets.len()`)
+    /// is at least `period`.
+    resting_asked: u64,
     idle_after: u32,
     idle: usize,
     asleep: usize,
@@ -71,8 +77,9 @@ impl<K: Copy> Default for Activity<K> {
 }
 
 impl<K: Copy> Activity<K> {
-    /// `period`: the cold rate in ticks (at least 1); `idle_after`: polls without a change before an
-    /// entity goes idle (0: never).
+    /// `period`: the cold rate in ticks (at least 1), also the resting rate until
+    /// [`Activity::set_resting`] asks for a slower one; `idle_after`: polls without a change before an entity goes idle
+    /// (0: never).
     pub fn new(period: u32, idle_after: u32) -> Self {
         let period = u64::from(period.max(1));
         Self {
@@ -81,18 +88,26 @@ impl<K: Copy> Activity<K> {
             hot: Vec::new(),
             buckets: vec![Vec::new(); period as usize],
             period,
+            resting_asked: 1,
             idle_after,
             idle: 0,
             asleep: 0,
         }
     }
 
+    /// The effective resting rate: how many ticks apart a resting entity is polled.
+    pub fn resting(&self) -> u64 {
+        self.buckets.len() as u64
+    }
+
     fn bucket_of(&self, stagger: u64) -> usize {
-        ((self.period - stagger % self.period) % self.period) as usize
+        let n = self.resting();
+        ((n - stagger % n) % n) as usize
     }
 
     /// Adds an entity, hot (its first poll records its initial state). `stagger` spreads the
-    /// cold polls: the entity is due on ticks where `(tick + stagger) % period == 0`.
+    /// cold polls: a hot entity's cold properties are due on ticks where `(tick + stagger) % period ==
+    /// 0`, a resting entity on ticks where `(tick + stagger) % resting == 0`.
     pub fn insert(&mut self, key: K, stagger: u64) -> u32 {
         let bucket = self.bucket_of(stagger);
         let slot = Slot {
@@ -225,7 +240,7 @@ impl<K: Copy> Activity<K> {
             let cold = (tick + stagger).is_multiple_of(self.period);
             out.push((i, self.slots[i as usize].key, Poll::Hot { cold }));
         }
-        let bucket = &self.buckets[(tick % self.period) as usize];
+        let bucket = &self.buckets[(tick % self.resting()) as usize];
         for &i in bucket {
             let s = &self.slots[i as usize];
             match s.state {
@@ -264,14 +279,40 @@ impl<K: Copy> Activity<K> {
         }
     }
 
-    /// Changes the cold rate (the buckets are rebuilt when it differs).
+    /// Changes the cold rate of hot entities (the resting rate is raised to it when below).
     pub fn set_period(&mut self, period: u32) {
         let period = u64::from(period.max(1));
         if period == self.period {
             return;
         }
         self.period = period;
-        self.buckets = vec![Vec::new(); period as usize];
+        for h in &mut self.hot {
+            h.1 = self.slots[h.0 as usize].stagger;
+        }
+        self.rebucket();
+    }
+
+    /// Changes the resting rate: idle and sleeping entities are polled every `resting` ticks, or every
+    /// `period` ticks when that is more (the buckets are rebuilt when the effective rate differs).
+    pub fn set_resting(&mut self, resting: u32) {
+        self.resting_asked = u64::from(resting.max(1));
+        self.rebucket();
+    }
+
+    /// Sets both rates (see [`Activity::set_period`] and [`Activity::set_resting`]).
+    pub fn set_rates(&mut self, period: u32, resting: u32) {
+        self.resting_asked = u64::from(resting.max(1));
+        self.set_period(period);
+        self.rebucket();
+    }
+
+    /// Rebuilds the buckets when the effective resting rate changed.
+    fn rebucket(&mut self) {
+        let n = self.resting_asked.max(self.period);
+        if n == self.resting() {
+            return;
+        }
+        self.buckets = vec![Vec::new(); n as usize];
         for i in 0..self.slots.len() {
             if !self.slots[i].live {
                 continue;
@@ -280,9 +321,6 @@ impl<K: Copy> Activity<K> {
             self.slots[i].bucket = b;
             self.slots[i].bucket_at = self.buckets[b].len();
             self.buckets[b].push(i as u32);
-        }
-        for h in &mut self.hot {
-            h.1 = self.slots[h.0 as usize].stagger;
         }
     }
 
@@ -495,6 +533,98 @@ mod tests {
     }
 
     #[test]
+    fn resting_entities_are_polled_at_the_resting_rate_and_hot_ones_cold_at_the_cold_rate() {
+        let mut a = Activity::new(6, 1);
+        a.set_resting(24);
+        assert_eq!(a.resting(), 24);
+        let idle = a.insert(1, 5);
+        let hot = a.insert(2, 5);
+        a.set_always(hot, true);
+        tick(&mut a, 0, &[]);
+        assert_eq!(a.state(idle), Some(State::Idle));
+        let resting: Vec<u64> = (1..100)
+            .filter(|&t| due(&a, t).iter().any(|x| x.0 == 1))
+            .collect();
+        assert_eq!(
+            resting,
+            vec![19, 43, 67, 91],
+            "every 24 ticks, where (t + 5) % 24 == 0"
+        );
+        assert_eq!(
+            due(&a, 19),
+            vec![(1, Poll::Idle), (2, Poll::Hot { cold: true })]
+        );
+        let cold: Vec<u64> = (1..40)
+            .filter(|&t| due(&a, t).contains(&(2, Poll::Hot { cold: true })))
+            .collect();
+        assert_eq!(
+            cold,
+            vec![1, 7, 13, 19, 25, 31, 37],
+            "the hot one's cold properties every 6"
+        );
+        let i = a.insert(3, 0);
+        a.set_asleep(i, true);
+        tick(&mut a, 1, &[3]);
+        tick(&mut a, 2, &[]);
+        assert_eq!(a.state(i), Some(State::Asleep));
+        let asleep: Vec<u64> = (3..60)
+            .filter(|&t| due(&a, t).iter().any(|x| x.0 == 3))
+            .collect();
+        assert_eq!(asleep, vec![24, 48], "a sleeping entity too");
+    }
+
+    #[test]
+    fn the_resting_rate_is_never_below_the_cold_rate_and_follows_changes() {
+        let mut a = Activity::new(6, 1);
+        assert_eq!(a.resting(), 6, "the cold rate until asked for another");
+        a.set_resting(3);
+        assert_eq!(a.resting(), 6, "raised to the cold rate");
+        a.set_resting(24);
+        a.set_period(30);
+        assert_eq!(a.resting(), 30, "a slower cold rate raises it");
+        a.set_period(6);
+        assert_eq!(a.resting(), 24, "and back");
+        a.set_rates(12, 8);
+        assert_eq!(a.resting(), 12);
+        for k in 0..30u32 {
+            a.insert(k, u64::from(k));
+        }
+        tick(&mut a, 0, &[]);
+        tick(&mut a, 1, &[]);
+        assert_eq!(a.counts(), (0, 30, 0));
+        for n in [24u32, 7, 6, 1] {
+            a.set_rates(6, n);
+            let r = a.resting();
+            assert_eq!(r, u64::from(n.max(6)));
+            let mut seen = Vec::new();
+            for t in 100..100 + r {
+                for (k, p) in due(&a, t) {
+                    assert_eq!(p, Poll::Idle);
+                    assert_eq!(
+                        (t + u64::from(k)) % r,
+                        0,
+                        "staggered by id over {r} buckets"
+                    );
+                    seen.push(k);
+                }
+            }
+            seen.sort();
+            assert_eq!(
+                seen,
+                (0..30).collect::<Vec<u32>>(),
+                "each once a period at {r}"
+            );
+        }
+        a.wake(5);
+        assert_eq!(
+            a.counts(),
+            (1, 29, 0),
+            "a wake is immediate whatever the rate"
+        );
+        assert_eq!(due(&a, 101).iter().filter(|x| x.0 == 5).count(), 1);
+    }
+
+    #[test]
     fn five_thousand_resting_entities_cost_one_bucket_a_tick() {
         let mut a = Activity::new(6, 30);
         for k in 0..5000u32 {
@@ -508,5 +638,9 @@ mod tests {
         let mut out = Vec::new();
         a.due(2, &mut out);
         assert!(out.len() <= 834, "one bucket: {}", out.len());
+        a.set_resting(24);
+        out.clear();
+        a.due(2, &mut out);
+        assert!(out.len() <= 209, "one of 24 buckets: {}", out.len());
     }
 }

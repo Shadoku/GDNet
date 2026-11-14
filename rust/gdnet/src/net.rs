@@ -119,6 +119,11 @@ pub struct Net {
     /// Cold properties are polled every this many ticks (0 = `gdnet/sync/cold_poll_ticks`, default 6).
     #[var(get = get_cold_poll_ticks, set = set_cold_poll_ticks)]
     cold_poll_ticks: i64,
+    /// WP18: idle and sleeping entities are polled every this many ticks (0 =
+    /// `gdnet/sync/resting_poll_ticks`, default 24; never below `cold_poll_ticks`). Reads as the
+    /// effective value; applies to running sessions at their next tick.
+    #[var(get = get_resting_poll_ticks, set = set_resting_poll_ticks)]
+    resting_poll_ticks: i64,
     /// Snapshot bytes per second per peer (0 = `gdnet/budget/bytes_per_second`, default 32,768) for
     /// sessions whose own `budget_bytes_per_s` is 0 (`Net`'s among them). Applies to running sessions
     /// at their next tick (review 2026-11-08; WP14 had it read only at session start).
@@ -226,6 +231,17 @@ impl Net {
     fn set_cold_poll_ticks(&mut self, v: i64) {
         self.cold_poll_ticks = v.max(0);
         profiles::set_cold_poll_ticks((v > 0).then_some(v as u32));
+    }
+
+    #[func]
+    fn get_resting_poll_ticks(&self) -> i64 {
+        i64::from(profiles::resting_poll_ticks().max(profiles::cold_poll_ticks()))
+    }
+
+    #[func]
+    fn set_resting_poll_ticks(&mut self, v: i64) {
+        self.resting_poll_ticks = v.max(0);
+        profiles::set_resting_poll_ticks((v > 0).then(|| v.min(i64::from(u32::MAX)) as u32));
     }
 
     #[func]

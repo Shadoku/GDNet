@@ -52,7 +52,8 @@ dictionaries). Node and object references never travel.
 * **Hot** properties are read every physics tick on the server and sent whenever their quantised value
   changed (transforms, velocities).
 * **Cold** properties are read every `cold_poll_ticks` (default 6, 10 Hz at 60 ticks), staggered across
-  entities, and sent when they changed.
+  entities, and sent when they changed. A resting entity (below) is read less often:
+  every `resting_poll_ticks`.
 
 Either way only changes travel: a value is compared by its quantised encoding, so an entity at rest
 costs nothing, and 100 idle entities cost only the session's pings (gate G4: about 50 B/s measured).
@@ -68,16 +69,24 @@ when nothing moves. Resting entities are therefore polled less:
 
 * **Sleeping bodies.** A `RigidBody2D` / `RigidBody3D` entity whose bodies Godot put to sleep is off the
   hot list: its bodies' hot properties are not read at all. Its `sleeping_state_changed` signal puts it
-  back, so a body that wakes is sent in the tick it wakes. Its cold properties, and the properties of its
-  parts that are not bodies, are still read every `cold_poll_ticks`. A frozen body, or one with
-  `can_sleep = false`, follows the idle rule below.
+  back, so a body that wakes is sent in the tick it wakes. Its cold properties, the properties of its
+  parts that are not bodies, and its sleep and freeze flags are still read, every `resting_poll_ticks`.
+  A frozen body, or one with `can_sleep = false`, follows the idle rule below.
 * **Idle entities.** Any other entity whose values did not change for `gdnet/sync/idle_after_ticks`
-  polls (default 30, half a second) is idle: it is polled every `cold_poll_ticks` (staggered, like cold
-  properties) until a poll finds a change, and is hot again from that tick.
+  polls (default 30, half a second) is idle: it is polled in full every `resting_poll_ticks` until a poll
+  finds a change, and is hot again from that tick.
 
-The price: a script that moves a long-idle node directly is seen up to `cold_poll_ticks` ticks late on
-its first tick (the delay cold properties always had). These make an idle or sleeping entity polled in
-the very next tick: `Net.touch(node)` (any part of it; also `NetSession.touch`), a call that runs on it
+`resting_poll_ticks` is the project setting `gdnet/sync/resting_poll_ticks` (default 24, 0.4 s at 60
+ticks; read every tick), or `Net.resting_poll_ticks`, or `NetSession.resting_poll_ticks` (0 = the next
+one along). Resting entities are staggered by id over that many ticks, so a tick polls a 24th of them.
+It is never below `cold_poll_ticks` (a smaller value is raised to it); hot entities keep
+`cold_poll_ticks` for their cold properties.
+
+The price: a script that writes directly to a resting entity is seen up to `resting_poll_ticks` ticks
+(0.4 s) late on its first tick. That includes setting `sleeping` or `freeze` on a sleeping body, for
+which Godot emits no signal. `gdnet/sync/resting_poll_ticks = 6` gives the previous behaviour (the delay
+cold properties always had) at about four times the polling cost. These make an idle or sleeping entity
+polled in the very next tick, whatever the setting: `Net.touch(node)` (any part of it; also `NetSession.touch`), a call that runs on it
 (page 6), an owner change, a reparent or travel, and restored level state. Entities simulated from input
 on the server (anything whose script reads `Net.input`, so players and an away seat's body; and every
 entity a client owns and the server simulates for it) are never idle. Set the setting to 0 to turn the
@@ -85,7 +94,7 @@ idle rule off (sleeping bodies still rest).
 
 ```gdscript
 func open() -> void:
-	$Lid.rotation = 1.2   # a long-idle chest: sent within cold_poll_ticks
+	$Lid.rotation = 1.2   # a long-idle chest: sent within resting_poll_ticks
 	Net.touch(self)       # or at once
 ```
 
@@ -93,13 +102,14 @@ What polling costs per server tick (`poll_ms`, release build, a 4-core machine, 
 
 | 5,000 entities | resting | moving |
 |---|---|---|
-| `Node2D` (idle) | 0.6-0.8 ms | 5-6 ms |
-| `RigidBody2D` + shape (asleep) | 1.1-1.4 ms | 10-12 ms |
-| `RigidBody3D` + shape (asleep) | 1.0-1.2 ms | 10-11 ms |
+| `Node2D` (idle) | 0.20-0.27 ms | 2-3 ms |
+| `RigidBody2D` + shape (asleep) | 0.32-0.42 ms | 12-14 ms |
+| `RigidBody3D` + shape (asleep) | 0.28-0.32 ms | 11-14 ms |
 
 Before the idle rule every entity was polled every tick: 7 ms for those `Node2D`s and 22 ms for the
-bodies, resting or not. What a resting entity still costs is its cold properties, read every
-`cold_poll_ticks`; `cold_poll_ticks = 12` halves it. Common built-in properties (transforms,
+bodies, resting or not. What a resting entity still costs is its resting polls, about 1.5 microseconds
+each, so the cost follows `resting_poll_ticks`: at 6 it is 0.7-1.1 ms for the `Node2D`s and 1.1-1.6 ms
+for the bodies, at 48 about half the figures above. Common built-in properties (transforms,
 velocities, `visible`, `modulate`, `z_index`, `disabled`) are read through their getters directly,
 several times faster than `Object::get`. `tests/integration/test_net_idle.gd` prints these figures with
 `--verbose`.
@@ -221,6 +231,7 @@ replaces the entry of the same name, `remove: true` drops it, an empty array emp
 | `gdnet/sync/profiles` | `""` | a `NetProfiles` `.tres` laid over the defaults |
 | `gdnet/sync/cold_poll_ticks` | 6 | also `Net.cold_poll_ticks`, `NetSession.cold_poll_ticks` |
 | `gdnet/sync/idle_after_ticks` | 30 | polls without a change before an entity is idle; 0 = never (read every tick) |
+| `gdnet/sync/resting_poll_ticks` | 24 | idle and sleeping entities are polled every this many ticks, never below `cold_poll_ticks` (read every tick); also `Net.resting_poll_ticks`, `NetSession.resting_poll_ticks` |
 | `gdnet/sync/export_vars` | true | sync every `@export` variable (D12) |
 | `gdnet/budget/bytes_per_second` | 32768 | per client; also `Net.budget_bytes_per_s`, `NetSession.budget_bytes_per_s` |
 

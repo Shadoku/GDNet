@@ -1,8 +1,9 @@
 extends TestCase
 ## WP18 (docs/PLAN_NETCODE.md 12.5, "Idle entities"): resting things cost no polling. A sleeping
 ## `RigidBody2D` / `RigidBody3D` is off the hot list until it wakes; any other entity whose values did
-## not change for `gdnet/sync/idle_after_ticks` is polled at the cold rate until one changes;
-## `Net.touch`, a call, an owner change and travel poll it at once; predicted players are always hot.
+## not change for `gdnet/sync/idle_after_ticks` is polled every `gdnet/sync/resting_poll_ticks` (24)
+## until one changes, as are a sleeping body's cold properties; `Net.touch`, a call, an owner change and
+## travel poll it at once; predicted players are always hot.
 ## The benchmarks print the polling time with `--verbose`. Headless over NetPipePeer.
 
 const BODY := preload("res://tests/fixtures/idle/body.tscn")
@@ -12,6 +13,7 @@ const SNAP := preload("res://tests/fixtures/idle/snap_marker.tscn")
 const PLAYER := preload("res://tests/fixtures/net/predicted_player.tscn")
 const FALLING := preload("res://tests/fixtures/idle/falling_player.tscn")
 const IDLE_AFTER := "gdnet/sync/idle_after_ticks"
+const RESTING := "gdnet/sync/resting_poll_ticks"
 const ACTIONS: Array[String] = ["left", "right", "up", "down", "jump"]
 
 ## The polling target of the plan (12.5): 5,000 resting entities under 0.5 ms per server tick.
@@ -19,16 +21,20 @@ const TARGET_MS := 0.5
 
 var net: NetFixture
 var _idle_after: Variant = null
+var _resting: Variant = null
 
 
 func before_each() -> void:
 	_idle_after = ProjectSettings.get_setting(IDLE_AFTER, null)
+	_resting = ProjectSettings.get_setting(RESTING, null)
 
 
 func after_each() -> void:
 	for a in ACTIONS:
 		Input.action_release(a)
 	ProjectSettings.set_setting(IDLE_AFTER, _idle_after)
+	ProjectSettings.set_setting(RESTING, _resting)
+	Net.resting_poll_ticks = 0
 	Net.rejoin_timeout_s = -2.0
 	if net != null:
 		net.teardown()
@@ -110,10 +116,10 @@ func test_a_sleeping_body_is_not_polled_and_a_woken_one_is_sent_in_the_tick_it_w
 		assert_true(await f.wait_until(func() -> bool: return b.sleeping and _stat(f.server_session, "sleeping_entities") == 1, 5.0), "the body falls asleep and is counted")
 		assert_eq(_stat(f.server_session, "hot_entities"), 1, "only the awake body is hot")
 		var polled := 0
-		for i in 12:
+		for i in 24:
 			await get_tree().physics_frame
 			polled += _stat(f.server_session, "polled_entities")
-		assert_eq(polled, 12 + 2, "12 ticks: the awake body every tick, the sleeper's cold properties twice")
+		assert_eq(polled, 24 + 1, "24 ticks: the awake body every tick, the sleeper's cold properties once (resting_poll_ticks)")
 		# Both are pushed in the same tick; the woken one reaches the client no later than the awake one.
 		var a0: float = copies[0].position.x
 		var b0: float = copies[1].position.x
@@ -130,37 +136,98 @@ func test_a_sleeping_body_is_not_polled_and_a_woken_one_is_sent_in_the_tick_it_w
 	assert_true(ok)
 
 
-func test_an_unmoving_node_goes_idle_and_a_script_moving_it_is_seen_within_cold_poll_ticks() -> void:
+## Lets `count` still markers (consecutive net ids, so consecutive phases of the stagger) go idle beside
+## a hot reference, moves them all by script in one tick, and returns how many ticks after the hot one
+## each move was seen on the client, sorted.
+func _idle_lateness(f: NetFixture, count: int) -> Array[int]:
+	ProjectSettings.set_setting(IDLE_AFTER, 30)
+	var m := await _reference_and_still(f, f.add_managers(), count)
+	var r: Node2D = m[0]
+	var stills: Array = m[1]
+	await _frames(36)
+	assert_eq(_stat(f.server_session, "idle_entities"), count, "the still markers went idle")
+	assert_eq(_stat(f.server_session, "hot_entities"), 1, "the reference is hot")
+	var r0: float = m[2].position.x
+	var conds := [func() -> bool: return m[2].position.x > r0 + 50.0]
+	r.position.x += 100.0
+	for i in stills.size():
+		var copy: Node2D = m[3][i]
+		var x0 := copy.position.x
+		conds.append(func() -> bool: return copy.position.x > x0 + 50.0)
+		stills[i].position.x += 100.0
+	var at := await _first_frames(conds, 90)
+	var late: Array[int] = []
+	for i in range(1, at.size()):
+		assert_ne(at[i], -1, "idle marker %d's move arrived" % (i - 1))
+		late.append(at[i] - at[0])
+	late.sort()
+	assert_true(await f.wait_until(func() -> bool: return _stat(f.server_session, "idle_entities") == 0), "each is hot after its move")
+	return late
+
+
+func test_an_unmoving_node_goes_idle_and_a_script_moving_it_is_seen_within_resting_poll_ticks() -> void:
 	var ok: bool = await NetFixture.run_both_modes(self, 1, func(f: NetFixture) -> void:
-		ProjectSettings.set_setting(IDLE_AFTER, 30)
-		# Six still markers have six different net ids, so they sit at six phases of the stagger.
-		var m := await _reference_and_still(f, f.add_managers(), 6)
-		var r: Node2D = m[0]
-		var stills: Array = m[1]
-		await _frames(36)
-		assert_eq(_stat(f.server_session, "idle_entities"), 6, "the still markers went idle")
-		assert_eq(_stat(f.server_session, "hot_entities"), 1, "the reference is hot")
+		# As many markers as resting_poll_ticks: one in every phase of the resting stagger.
+		var resting: int = f.server_session.stats()["resting_poll_ticks"]
 		var cold: int = f.server_session.stats()["cold_poll_ticks"]
-		var r0: float = m[2].position.x
-		var conds := [func() -> bool: return m[2].position.x > r0 + 50.0]
-		r.position.x += 100.0
-		for i in stills.size():
-			var copy: Node2D = m[3][i]
-			var x0 := copy.position.x
-			conds.append(func() -> bool: return copy.position.x > x0 + 50.0)
-			stills[i].position.x += 100.0
-		var at := await _first_frames(conds, 60)
-		var late: Array[int] = []
-		for i in range(1, at.size()):
-			assert_ne(at[i], -1, "idle marker %d's move arrived" % (i - 1))
-			late.append(at[i] - at[0])
-		late.sort()
-		print("a script moving an idle node: seen %s ticks after a hot one (cold_poll_ticks %d; mode %d)" % [late, cold, f.host_mode])
+		assert_eq(resting, 24, "the default")
+		var late := await _idle_lateness(f, resting)
+		print("a script moving an idle node: seen %s ticks after a hot one (resting_poll_ticks %d; mode %d)" % [late, resting, f.host_mode])
+		assert_true(late[0] >= 0, "never before the hot one")
+		assert_true(late[-1] <= resting, "within resting_poll_ticks (%d > %d)" % [late[-1], resting])
+		assert_gt(late[-1], cold, "polled at the resting rate, slower than cold_poll_ticks"))
+	assert_true(ok)
+
+
+func test_resting_poll_ticks_6_polls_an_idle_node_within_cold_poll_ticks() -> void:
+	ProjectSettings.set_setting(RESTING, 6)
+	var ok: bool = await NetFixture.run_both_modes(self, 1, func(f: NetFixture) -> void:
+		var cold: int = f.server_session.stats()["cold_poll_ticks"]
+		assert_eq(f.server_session.stats()["resting_poll_ticks"], 6)
+		var late := await _idle_lateness(f, 6)
+		print("resting_poll_ticks 6: seen %s ticks after a hot one (cold_poll_ticks %d; mode %d)" % [late, cold, f.host_mode])
 		assert_true(late[0] >= 0, "never before the hot one")
 		assert_true(late[-1] <= cold, "within cold_poll_ticks (%d > %d)" % [late[-1], cold])
-		assert_gt(late[-1], 0, "an idle entity is not polled every tick")
-		assert_true(await f.wait_until(func() -> bool: return _stat(f.server_session, "idle_entities") == 0), "each is hot after its move"))
+		assert_gt(late[-1], 0, "an idle entity is not polled every tick"))
 	assert_true(ok)
+
+
+## The setting, `Net.resting_poll_ticks` and `NetSession.resting_poll_ticks` (the session's first, then
+## `Net`'s, then the setting), read live; a value below `cold_poll_ticks` is raised to it.
+func test_resting_poll_ticks_is_read_live_and_never_below_cold_poll_ticks() -> void:
+	net = NetFixture.new(self, 0)
+	net.start_server()
+	var s := net.server_session
+	assert_eq(s.stats()["resting_poll_ticks"], 24, "the default")
+	assert_eq(Net.resting_poll_ticks, 24, "Net reads the effective value")
+	ProjectSettings.set_setting(RESTING, 30)
+	assert_eq(s.stats()["resting_poll_ticks"], 30, "the setting, live")
+	ProjectSettings.set_setting(RESTING, 2)
+	assert_eq(s.stats()["resting_poll_ticks"], 6, "raised to cold_poll_ticks")
+	Net.resting_poll_ticks = 12
+	assert_eq(Net.resting_poll_ticks, 12)
+	assert_eq(s.stats()["resting_poll_ticks"], 12, "Net's over the setting")
+	s.resting_poll_ticks = 40
+	assert_eq(s.stats()["resting_poll_ticks"], 40, "the session's over Net's")
+	s.cold_poll_ticks = 50
+	assert_eq(s.stats()["resting_poll_ticks"], 50, "never below the session's cold_poll_ticks")
+	s.cold_poll_ticks = 0
+	s.resting_poll_ticks = 0
+	assert_eq(s.stats()["resting_poll_ticks"], 12, "0: Net's again")
+	# A live change re-buckets the resting entities: an idle node is still polled once a period.
+	ProjectSettings.set_setting(IDLE_AFTER, 2)
+	var managers := net.add_managers()
+	var x: Node2D = MARKER.instantiate()
+	managers["Server"].add_child(x)
+	assert_true(await net.wait_until(func() -> bool: return _stat(s, "idle_entities") == 1))
+	for period in [12, 7, 24]:
+		Net.resting_poll_ticks = period
+		await get_tree().physics_frame
+		var polled := 0
+		for i in period:
+			await get_tree().physics_frame
+			polled += _stat(s, "polled_entities")
+		assert_eq(polled, 1, "polled once in %d ticks at resting_poll_ticks %d" % [period, period])
 
 
 func test_touch_and_a_call_poll_an_idle_entity_in_the_same_tick() -> void:
@@ -201,12 +268,12 @@ func test_a_cold_property_changed_on_a_sleeping_body_arrives() -> void:
 		managers["Server"].add_child(b)
 		var c: Array = await _copies(f, f.clients[0], ["Sleeper"])
 		assert_true(await f.wait_until(func() -> bool: return _stat(f.server_session, "sleeping_entities") == 1, 5.0))
-		var cold: int = f.server_session.stats()["cold_poll_ticks"]
+		var resting: int = f.server_session.stats()["resting_poll_ticks"]
 		b.modulate = Color(1, 0, 0)
 		var at := await _first_frames([func() -> bool: return c[0].modulate.is_equal_approx(Color(1, 0, 0))], 60)
-		print("a cold property of a sleeping body arrived after %d frames (cold_poll_ticks %d; mode %d)" % [at[0], cold, f.host_mode])
+		print("a cold property of a sleeping body arrived after %d frames (resting_poll_ticks %d; mode %d)" % [at[0], resting, f.host_mode])
 		assert_ne(at[0], -1, "it arrived")
-		assert_true(at[0] <= cold + 3, "within cold_poll_ticks plus the trip")
+		assert_true(at[0] <= resting + 3, "within resting_poll_ticks plus the trip")
 		assert_true(b.sleeping, "the body still sleeps")
 		assert_true(await f.wait_until(func() -> bool: return _stat(f.server_session, "sleeping_entities") == 1, 2.0), "and is off the hot list again")
 		# Destroyed while asleep: its copy goes, and nothing is left counted (or connected).
@@ -401,12 +468,22 @@ func _poll_ms(ticks: int, each_tick: Callable = Callable()) -> Vector2:
 
 
 ## The limit. The plan's target (12.5) is 0.5 ms per tick for 5,000 resting entities. Measured on this
-## machine (4 cores, release build, nothing else running), the steady state is about 0.6 ms for idle
-## `Node2D`s and 1.0-1.2 ms for sleeping bodies: what remains is reading the cold properties every
-## `cold_poll_ticks` (a sixth of the entities each tick, 4-6 engine reads each, a cache miss apiece), and
-## `cold_poll_ticks = 12` halves it (printed). The assertion is 2.5 ms, about twice the quiet figure,
-## because the integration stage runs four Godot processes side by side; the figure itself is printed.
-const LIMIT_MS := 2.5
+## machine (4 cores, release build, `resting_poll_ticks` 24), alone: 0.32-0.42 ms for sleeping
+## `RigidBody2D`s, 0.28-0.32 ms for `RigidBody3D`s, 0.20-0.27 ms for idle `Node2D`s; in the integration
+## stage's four processes 0.31-0.42 ms. Nearly all of it is the resting polls themselves (a 24th of the
+## entities each tick, about 1.5 microseconds apiece: the sleep and freeze flags and 3-6 property reads),
+## so the cost follows `resting_poll_ticks` (printed at 6, the previous rate: 1.1-1.9 ms). The assertion
+## is 1.0 ms, more than twice the loaded figure and below what the previous rate costs, so it stays green
+## under load and fails if resting entities fall back to the cold rate; the figure itself is printed.
+const LIMIT_MS := 1.0
+
+
+## The average resting `poll_ms` at the current settings, over two resting periods, after one period in
+## which each entity's first resting poll records its values once.
+func _rest_ms() -> Vector2:
+	var period: int = net.server_session.stats()["resting_poll_ticks"]
+	await _frames(period + 1)
+	return await _poll_ms(2 * period)
 
 
 func _bench_bodies(scene: PackedScene, label: String) -> void:
@@ -415,14 +492,12 @@ func _bench_bodies(scene: PackedScene, label: String) -> void:
 	var bodies := await _spawn_many(scene, 5000, true)
 	await _frames(20)
 	assert_true(await net.wait_until(func() -> bool: return _stat(net.server_session, "sleeping_entities") == 5000, 5.0), "every body sleeps")
-	await _frames(6)  # each body's first resting poll records its values once
-	var rest := await _poll_ms(36)
+	var rest := await _rest_ms()
 	assert_eq(_stat(net.server_session, "sleeping_entities"), 5000, "still asleep")
-	var rest12 := Vector2(-1, -1)
-	if scene == BODY:
-		net.server_session.cold_poll_ticks = 12
-		await _frames(13)
-		rest12 = await _poll_ms(36)
+	# The previous rate, for comparison: every cold_poll_ticks.
+	net.server_session.resting_poll_ticks = 6
+	var rest6 := await _rest_ms()
+	net.server_session.resting_poll_ticks = 0
 	for b in bodies:
 		if b is RigidBody2D:
 			(b as RigidBody2D).linear_velocity = Vector2(10, 0)
@@ -431,8 +506,9 @@ func _bench_bodies(scene: PackedScene, label: String) -> void:
 	await _frames(3)
 	assert_eq(_stat(net.server_session, "hot_entities"), 5000, "every body woke")
 	var moving := await _poll_ms(12)
-	print("BENCHMARK: polling 5000 %s: resting %.3f ms per tick (worst %.3f; %.3f at cold_poll_ticks 12), moving %.3f ms (target %.1f ms)" % [label, rest.x, rest.y, rest12.x, moving.x, TARGET_MS])
-	assert_lt(rest.x, LIMIT_MS, "5,000 resting bodies poll in under %.1f ms per tick" % LIMIT_MS)
+	print("BENCHMARK: polling 5000 %s: resting %.3f ms per tick (worst %.3f; %.3f at resting_poll_ticks 6), moving %.3f ms (target %.1f ms)" % [label, rest.x, rest.y, rest6.x, moving.x, TARGET_MS])
+	assert_lt(rest.x, LIMIT_MS, "5,000 resting bodies poll in under %.2f ms per tick" % LIMIT_MS)
+	assert_lt(rest.x, rest6.x, "the resting rate costs less than polling them every cold_poll_ticks")
 
 
 func test_benchmark_5000_resting_rigid_bodies_2d() -> void:
@@ -448,10 +524,14 @@ func test_benchmark_5000_idle_nodes() -> void:
 	var nodes := await _spawn_many(MARKER, 5000, false)
 	await _frames(32)
 	assert_eq(_stat(net.server_session, "idle_entities"), 5000, "every node is idle")
-	await _frames(6)  # each node's first idle poll records its values once
-	var rest := await _poll_ms(36)
+	var rest := await _rest_ms()
+	net.server_session.resting_poll_ticks = 6
+	var rest6 := await _rest_ms()
+	net.server_session.resting_poll_ticks = 0
+	assert_eq(_stat(net.server_session, "idle_entities"), 5000, "still idle")
 	var moving := await _poll_ms(12, func() -> void:
 		for n in nodes:
 			(n as Node2D).position.x += 1.0)
-	print("BENCHMARK: polling 5000 Node2D: idle %.3f ms per tick (worst %.3f), moving %.3f ms (target %.1f ms)" % [rest.x, rest.y, moving.x, TARGET_MS])
-	assert_lt(rest.x, LIMIT_MS, "5,000 idle nodes poll in under %.1f ms per tick" % LIMIT_MS)
+	print("BENCHMARK: polling 5000 Node2D: idle %.3f ms per tick (worst %.3f; %.3f at resting_poll_ticks 6), moving %.3f ms (target %.1f ms)" % [rest.x, rest.y, rest6.x, moving.x, TARGET_MS])
+	assert_lt(rest.x, LIMIT_MS, "5,000 idle nodes poll in under %.2f ms per tick" % LIMIT_MS)
+	assert_lt(rest.x, rest6.x, "the resting rate costs less than polling them every cold_poll_ticks")
