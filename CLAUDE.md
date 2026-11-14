@@ -193,7 +193,8 @@ These are the rules that keep it at seconds:
   cards with `_debug_watch`.
   Idle entities (WP18): `test_net_idle.gd` (sleeping and idle entities, `Net.touch`, three 5,000-entity
   polling benchmarks printed with `--verbose`; fixtures in `tests/fixtures/idle/`); reset
-  `gdnet/sync/idle_after_ticks` in `after_each` when a test sets it.
+  `gdnet/sync/idle_after_ticks`, `gdnet/sync/resting_poll_ticks` and `Net.resting_poll_ticks` in `after_each`
+  when a test sets them.
   3D (WP18, gate G10): the 3D twins are `test_net_3d.gd` (state, prediction), `test_net_3d_interp.gd`,
   `test_net_3d_world.gd` (calls, authority, interest, rooms, seats, overlay) and `test_net_3d_physics.gd`
   (a `RigidBody3D` pile, interaction scoring), with fixtures in `tests/fixtures/net3d/`. Lengths are metres;
