@@ -1142,7 +1142,8 @@ impl Net {
     }
 
     /// WP13 (2.11), server: sends the entity `player` belongs to into the level `scene_path`, at the
-    /// node named `spawn_point` inside it (WP16: without one it keeps its global position). The level is loaded under the World
+    /// node named `spawn_point` inside it, taking its position and rotation (2026-11-14; WP16: without
+    /// one it keeps its global position and rotation). The level is loaded under the World
     /// if needed; the player's client loads it too and frees its previous level. Applied at the next
     /// tick, so it is safe from a physics callback (a door's `body_entered`). Works in any branch.
     #[func]

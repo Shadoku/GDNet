@@ -222,12 +222,19 @@ func test_rooms_travel_to_a_marker3d_and_a_3d_level_keeps_its_state() -> void:
 			players[id] = Net.spawn_for(id, CRATE, lobby.get_node("NetManager"), "P%d" % id)
 		# A top_level node keeps its authored global place, moved with the level's origin.
 		assert_eq((hall.get_node("NetManager/Chest/Beacon") as Node3D).global_position, origin + Vector3(0, 3, 0))
+		# The hall's Entrance is turned a quarter about Y (2026-11-14: travel takes the marker's rotation);
+		# the crate keeps its own scale.
+		(players[a] as Node3D).scale = Vector3(1.5, 1.5, 1.5)
 		s.travel(players[a], HALL, "Entrance")
 		var spot := origin + Vector3(1.5, 0.25, -3)
+		var facing := (hall.get_node("Entrance") as Node3D).global_basis.get_rotation_quaternion()
 		assert_true(await f.wait_until(func() -> bool: return ca.has_node("hall_3d/NetManager/P%d" % a)), "the player travelled")
 		assert_eq((players[a] as Node3D).global_position, spot, "it stands at the Marker3D, origin applied")
+		assert_lt(_angle((players[a] as Node3D).quaternion, facing), 1e-5, "turned as the marker is")
+		assert_lt((players[a] as Node3D).scale.distance_to(Vector3(1.5, 1.5, 1.5)), 1e-5, "with its own scale")
 		var mine: Node3D = ca.get_node("hall_3d/NetManager/P%d" % a)
 		assert_true(await f.wait_until(func() -> bool: return mine.global_position.distance_to(spot) < HALF_STEP), "the client's copy is there too")
+		assert_true(await f.wait_until(func() -> bool: return _angle(mine.quaternion, facing) < ANGLE_BOUND and mine.scale.distance_to(Vector3(1.5, 1.5, 1.5)) < 0.01), "turned and scaled like the server's")
 		assert_eq((ca.get_node("hall_3d") as Node3D).position, origin, "the client placed the hall at the same origin")
 		assert_eq((ca.get_node("hall_3d/NetManager/Chest/Beacon") as Node3D).global_position, origin + Vector3(0, 3, 0), "and its top_level node")
 		# Play the hall, leave it, let it unload, come back.
@@ -258,6 +265,62 @@ func test_rooms_travel_to_a_marker3d_and_a_3d_level_keeps_its_state() -> void:
 		assert_eq(_kept(again), "", "the server's reloaded hall")
 		assert_eq(again.get_node("NetManager/Chest").at_spawn, {"open": true, "value": 1}, "restored before _net_spawned")
 		assert_true(await f.wait_until(func() -> bool: return _kept(ca.get_node("hall_3d")) == ""), "the client sees the kept state: %s" % _kept(ca.get_node("hall_3d"))))
+	assert_true(ok)
+
+
+## The owner's decision (2026-11-14): travel to a Marker3D gives the player the marker's global
+## rotation (the basis without the marker's scale) and keeps the player's own scale; travel without a
+## spawn point keeps the rotation. `quaternion` is a hot property of every Node3D, so the owner (rolled
+## back to the server's pose) and another client in the room see it.
+func test_rooms_travel_to_a_turned_marker3d_takes_its_rotation() -> void:
+	timeout_sec = 20.0
+	add_child(FLOOR.instantiate())
+	var ok: bool = await NetFixture.run_both_modes(self, 2, func(f: NetFixture) -> void:
+		var ca: Node = f.clients[0]
+		var cb: Node = f.clients[1]
+		var a := f.peer_id(ca)
+		var b := f.peer_id(cb)
+		var s := f.server_session
+		s.empty_level_timeout = 1000.0
+		var lobby: Node = s.load_level(LOBBY)
+		var hall: Node3D = s.load_level(HALL, Vector3(40, 0, 0))
+		# Turned about all three axes and scaled: only its rotation is taken.
+		var turned := Marker3D.new()
+		turned.name = "Turned"
+		turned.position = Vector3(-1, 0.5, 2)
+		turned.basis = Basis.from_euler(Vector3(0.3, -2.0, 0.2)).scaled(Vector3(2, 2, 2))
+		hall.add_child(turned)
+		var want := turned.global_basis.get_rotation_quaternion()
+		var players := {}
+		for id in f.players():
+			players[id] = Net.spawn_for(id, PLAYER, lobby.get_node("NetManager"), "P%d" % id)
+		s.travel(players[b], HALL, "Entrance")
+		assert_true(await f.wait_until(func() -> bool: return cb.has_node("hall_3d/NetManager/P%d" % b)), "the other player went in")
+		var entrance := (hall.get_node("Entrance") as Node3D).global_basis.get_rotation_quaternion()
+		assert_lt(_angle((players[b] as Node3D).quaternion, entrance), 1e-5, "it faces the way of the hall's Entrance")
+		assert_true(await f.wait_until(func() -> bool: return ca.has_node("vault_3d/NetManager/P%d" % a)), "A has its player")
+		var p: Node3D = players[a]
+		s.travel(p, HALL, "Turned")
+		var path := "hall_3d/NetManager/P%d" % a
+		assert_true(await f.wait_until(func() -> bool: return ca.has_node(path) and cb.has_node(path)), "the player travelled")
+		assert_lt(_angle(p.quaternion, want), 1e-5, "on the server it has the marker's rotation")
+		assert_lt(p.scale.distance_to(Vector3.ONE), 1e-5, "and keeps its own scale (%s)" % p.scale)
+		for c: Node in [ca, cb]:
+			var copy: Node3D = c.get_node(path)
+			assert_true(await f.wait_until(func() -> bool: return _angle(copy.quaternion, want) < ANGLE_BOUND), "%s: its copy is turned too" % c.name)
+			assert_lt(copy.scale.distance_to(Vector3.ONE), 0.01, "%s: unscaled" % c.name)
+		var mine: Node3D = ca.get_node(path)
+		await _frames(10)
+		assert_lt(_angle(mine.quaternion, want), ANGLE_BOUND, "the owner keeps the rotation")
+		# Back to the lobby without a spawn point (once it stands on the floor): the rotation is kept.
+		assert_true(await f.wait_until(func() -> bool: return (p as CharacterBody3D).is_on_floor()), "it landed")
+		var at := p.global_position
+		s.travel(p, LOBBY)
+		assert_true(await f.wait_until(func() -> bool: return ca.has_node("vault_3d/NetManager/P%d" % a)), "back in the lobby")
+		assert_lt(p.global_position.distance_to(at), 0.05, "without a spawn point it keeps its position")
+		assert_lt(_angle(p.quaternion, want), 1e-5, "and its rotation")
+		await _frames(10)
+		assert_lt(_angle((ca.get_node("vault_3d/NetManager/P%d" % a) as Node3D).quaternion, want), ANGLE_BOUND, "on its owner too"))
 	assert_true(ok)
 
 

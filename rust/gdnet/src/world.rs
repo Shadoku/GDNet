@@ -241,9 +241,11 @@ pub fn instantiate_level(scene_path: &str) -> Option<Gd<Node>> {
 }
 
 /// Puts `root` (a `Node2D` or `Node3D`) at the marker named `spawn_point` inside `level` (searched
-/// recursively; its global position, so the level's origin applies). An empty `spawn_point` leaves
-/// `root` where it is (WP16: travel without a marker keeps the global position); a missing marker
-/// warns and does the same.
+/// recursively; its global position, so the level's origin applies) and turns it the marker's way: a
+/// `Node2D` takes the marker's global rotation, a `Node3D` the rotation of the marker's global basis
+/// (without the marker's scale), keeping its own scale (the owner's decision, 2026-11-14). An empty
+/// `spawn_point` leaves `root` where and as it is (WP16: travel without a marker keeps the global
+/// transform); a missing marker warns and does the same.
 pub fn place_at_spawn(root: &Gd<Node>, level: &Gd<Node>, spawn_point: &str) {
     if spawn_point.is_empty() {
         return;
@@ -263,12 +265,36 @@ pub fn place_at_spawn(root: &Gd<Node>, level: &Gd<Node>, spawn_point: &str) {
     if let Ok(mut r) = root.clone().try_cast::<Node2D>() {
         if let Ok(m) = at.try_cast::<Node2D>() {
             r.set_global_position(m.get_global_position());
+            r.set_global_rotation(m.get_global_rotation());
         }
     } else if let Ok(mut r) = root.clone().try_cast::<Node3D>() {
         if let Ok(m) = at.try_cast::<Node3D>() {
-            r.set_global_position(m.get_global_position());
+            let marker = m.get_global_transform();
+            let mut t = r.get_global_transform();
+            t.basis = turned(marker.basis, t.basis);
+            t.origin = marker.origin;
+            r.set_global_transform(t);
         }
     }
+}
+
+/// The rotation of `marker` (orthonormalised, a mirrored marker's reflection dropped, as Godot's
+/// `Basis.get_rotation_quaternion` does) with the scale of `own` along its axes; `own` itself when the
+/// marker's basis is degenerate (a zero scale has no rotation to take).
+fn turned(marker: Basis, own: Basis) -> Basis {
+    if marker.determinant().abs() < 1e-12 {
+        return own;
+    }
+    let scale = own.get_scale();
+    let mut rot = marker.orthonormalized();
+    if rot.determinant() < 0.0 {
+        rot = rot.scaled(Vector3::new(-1.0, -1.0, -1.0));
+    }
+    Basis::from_cols(
+        rot.col_a() * scale.x,
+        rot.col_b() * scale.y,
+        rot.col_c() * scale.z,
+    )
 }
 
 /// Calls `_net_travelled(from, to)` on every part that defines it (2.11). The caller holds a base guard.

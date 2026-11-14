@@ -146,11 +146,14 @@ func start() -> void:
 		spawn_player(id)
 
 
-## Server: a player for peer `id`, at the start level's `Entrance`.
+## Server: a player for peer `id`, at the start level's `Entrance` and turned its way, as a door's
+## `Net.travel` places it.
 func spawn_player(id: int) -> void:
 	var level: Node = Net.session_for(self).load_level(start_level)
 	var player: Node2D = Net.spawn_for(id, PLAYER, level.get_node("NetManager"), "Player%d" % id)
-	player.global_position = (level.get_node("Entrance") as Node2D).global_position
+	var entrance: Node2D = level.get_node("Entrance")
+	player.global_position = entrance.global_position
+	player.global_rotation = entrance.global_rotation
 	_players[id] = player
 
 
@@ -545,10 +548,12 @@ A door is an `Area2D`. When a player's body enters it on the server, `Net.travel
 spawn_point)` sends that player to the other level. The call is queued and applied at the next network
 tick, so it is safe inside `body_entered` (moving a physics body inside a physics callback is refused by
 the engine). On the server gdnet loads the target level if it is not loaded (at its grid cell), moves the
-player under its `NetManager` at the marker named `spawn_point`, and tells the player's client to load
-that level; the client loads it, applies the move once it is there, and frees the levels the player left.
-Other peers stop or start seeing the player as it leaves or enters their rooms. `multiplayer.is_server()`
-is Godot's own query; it is false on every client.
+player under its `NetManager` to the marker named `spawn_point` (its position and its rotation: the
+player faces the way the marker points), and tells the player's client to load that level; the client
+loads it, applies the move once it is there, and frees the levels the player left. Other peers stop or
+start seeing the player as it leaves or enters their rooms. The player's `rotation` is replicated (every
+`Node2D`'s is, by default), so every peer sees it turned. `multiplayer.is_server()` is Godot's own query;
+it is false on every client.
 
 ```gdscript file=demos/doors/door.gd
 extends Area2D

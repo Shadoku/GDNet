@@ -328,6 +328,63 @@ func test_an_explicit_origin_and_spawn_markers() -> void:
 	assert_true(ok, "fixtures connected")
 
 
+## The owner's decision (2026-11-14): travel to a spawn point gives the player the marker's global
+## rotation as well as its position, in another level and in the level it is in; travel without one
+## keeps both. `rotation` is a hot property of every Node2D (the default profile), so the owner (rolled
+## back to the server's pose) and another client that sees the room show it too.
+func test_travel_to_a_marker_takes_its_rotation() -> void:
+	var ok := await NetFixture.run_both_modes(self, 2, func(f: NetFixture) -> void:
+		var ca: Node = f.clients[0]
+		var cb: Node = f.clients[1]
+		var a := f.peer_id(ca)
+		var b := f.peer_id(cb)
+		var players := _spawn_players(f, A, Vector2.ZERO)
+		# Away from chunk A's bounds, so nobody walks back by auto-travel.
+		var inside: Node2D = f.server_session.load_level(IN_A, Vector2(-3000, 800))
+		var facing := Marker2D.new()
+		facing.name = "Facing"
+		facing.position = Vector2(-60, 30)
+		facing.rotation = 1.25
+		inside.add_child(facing)
+		# The other client's player goes in first, so that client sees the room the traveller enters.
+		f.server_session.travel(players[b], IN_A, "Entrance")
+		assert_true(await f.wait_until(func() -> bool: return _level_of(cb, b) == "interior_a"), "the other player went in")
+		assert_eq((players[b] as Node2D).global_rotation, 0.0, "an unturned marker turns nobody")
+		var p: Node2D = players[a]
+		assert_true(await f.wait_until(func() -> bool: return _player(ca, a) != null), "the traveller's owner has it")
+		f.server_session.travel(p, IN_A, "Facing")
+		assert_true(await f.wait_until(func() -> bool: return _level_of(ca, a) == "interior_a" and _level_of(cb, a) == "interior_a"), "the player travelled")
+		var spot := facing.global_position
+		assert_eq(p.global_position, spot, "it stands at the marker")
+		assert_almost_eq(p.global_rotation, 1.25, 1e-6, "and faces the marker's way on the server")
+		for c: Node in [ca, cb]:
+			assert_true(await f.wait_until(func() -> bool:
+				var q := _player(c, a)
+				return q.global_position.distance_to(spot) < 0.2 and absf(angle_difference(q.global_rotation, 1.25)) < 1e-4),
+				"%s: its copy stands there turned (%s)" % [c.name, _player(c, a).global_rotation])
+		await _frames(10)
+		assert_lt(absf(angle_difference(_player(ca, a).global_rotation, 1.25)), 1e-4, "the owner keeps the rotation")
+		# Back to A without a spawn point: position and rotation are kept.
+		f.server_session.travel(p, A)
+		assert_true(await f.wait_until(func() -> bool: return _level_of(ca, a) == "chunk_a"), "back in A")
+		assert_eq(p.global_position, spot, "without a spawn point the player keeps its position")
+		assert_almost_eq(p.global_rotation, 1.25, 1e-6, "and its rotation")
+		await _frames(10)
+		assert_lt(absf(angle_difference(_player(ca, a).global_rotation, 1.25)), 1e-4, "on its owner too")
+		# A spawn point in the level the player is already in turns it as well.
+		var turn := Marker2D.new()
+		turn.name = "Turn"
+		turn.position = Vector2(120, -40)
+		turn.rotation = -0.5
+		f.server.get_node("chunk_a").add_child(turn)
+		f.server_session.travel(p, A, "Turn")
+		assert_true(await f.wait_until(func() -> bool: return p.global_position == Vector2(120, -40)), "it moved to the marker in its own level")
+		assert_almost_eq(p.global_rotation, -0.5, 1e-6)
+		assert_true(await f.wait_until(func() -> bool: return absf(angle_difference(_player(ca, a).global_rotation, -0.5)) < 1e-4), "and its owner sees it turn")
+	)
+	assert_true(ok, "fixtures connected")
+
+
 func test_a_3d_level_takes_a_vector3_origin_and_a_cell() -> void:
 	ProjectSettings.set_setting(SPACING, 50.0)
 	net = NetFixture.new(self, 1, NetFixture.HostMode.DEDICATED)

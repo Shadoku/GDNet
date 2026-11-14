@@ -34,11 +34,14 @@ func start() -> void:
 		spawn_player(id)
 
 
-## Server: a player for peer `id`, at the start level's `Entrance`.
+## Server: a player for peer `id`, at the start level's `Entrance` and turned its way, as a door's
+## `Net.travel` places it.
 func spawn_player(id: int) -> void:
 	var level: Node = Net.session_for(self).load_level(start_level)
 	var player: Node2D = Net.spawn_for(id, PLAYER, level.get_node("NetManager"), "Player%d" % id)
-	player.global_position = (level.get_node("Entrance") as Node2D).global_position
+	var entrance: Node2D = level.get_node("Entrance")
+	player.global_position = entrance.global_position
+	player.global_rotation = entrance.global_rotation
 	_players[id] = player
 
 

@@ -112,10 +112,13 @@ func _on_body_entered(body: Node2D) -> void:
 is safe inside `body_entered`, where the engine refuses to move a body). Then, on the server:
 
 1. the target level is loaded under the World if it is not, and its managers register their rooms;
-2. the player's entity (and every entity below it) moves from its manager to the level's manager, at the
-   node named `spawn_point` inside the level (a `Marker2D` / `Marker3D`; its global position, so the
-   level's origin applies). **Without a spawn point the player keeps its global position**: that is the
-   form for walking into the chunk next door;
+2. the player's entity (and every entity below it) moves from its manager to the level's manager, to the
+   node named `spawn_point` inside the level (a `Marker2D` / `Marker3D`, or any `Node2D` / `Node3D`; its
+   global transform, so the level's origin applies). The player takes the marker's **position and
+   rotation**: in 2D the marker's `global_rotation`, in 3D the rotation of its global basis (the marker's
+   own scale is ignored, and the player keeps its scale). Point the marker the way an arriving player
+   should face. **Without a spawn point the player keeps its global position and rotation**: that is the
+   form for walking into the chunk next door (`auto_travel` uses it too);
 3. `_net_travelled(from, to)` runs on its parts and `travelled(player, from, to)` fires on `Net` /
    `NetSession`, with the two room names;
 4. the owner's rooms change: its client gets the `Travel`s, leaves and creates described above, then the
@@ -137,6 +140,16 @@ its managers, and its room in no peer's set): `NetSession.empty_level_timeout`, 
 `Net.empty_level_timeout`, else the project setting `gdnet/levels/empty_timeout_s` (default 30). Its entities
 are destroyed first. The next `travel` (or `load_level`) loads it again, as it was when it unloaded (see
 *Level state*).
+
+**Who sees the rotation.** The server sets it; the clients get it in the next snapshot like any other
+change, and the traveller's owner rolls back to it (as to the new position). That needs the player's
+rotation to be a replicated property, which it is by default (`rotation` of every `Node2D`, `quaternion`
+of every `Node3D`, both hot). A player whose profile leaves rotation out (an `exclude`, or a
+`NetEntity` with its own list) is turned on the server only: its clients keep the rotation they had, so
+replicate it, or turn the visible part yourself in `_net_travelled`. A `CharacterBody2D` / `3D` whose
+script sets its rotation every tick (to face its input, say) overwrites the marker's at its next tick;
+that is the game's choice. A spawn point in the level the player is already in moves and turns it in
+place (no travel callbacks: nothing changed rooms).
 
 **Moving an entity between managers by hand** (`remove_child` + `add_child`) is still a destroy and a
 create; `Net.travel` is the move.

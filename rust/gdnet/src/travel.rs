@@ -6,8 +6,8 @@
 //! body is refused by the engine): the target level is loaded under the World if it is not, its
 //! managers register their rooms, the player's entry (and the entries of the entities below it) move
 //! from its manager to the level's manager, the node is reparented under that manager (at the
-//! `spawn_point` marker, else keeping its global position), `_net_travelled(from, to)` runs on its
-//! parts and `travelled(player, from, to)` fires; then netcore's cross-manager `Reparent` changes the
+//! `spawn_point` marker's position and rotation, else keeping its global transform),
+//! `_net_travelled(from, to)` runs on its parts and `travelled(player, from, to)` fires; then netcore's cross-manager `Reparent` changes the
 //! player's rooms, which sends its owner a `Travel` for each level room it gains, the scope change
 //! (`Scope` leaves, `RoomLeft`s, `Create`s), then the `Reparent`. A peer that has both rooms gets only
 //! the `Reparent`. `NetManager.auto_travel` queues the same request when a player walks into the

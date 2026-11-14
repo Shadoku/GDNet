@@ -522,8 +522,8 @@ impl NetSession {
     }
 
     /// WP13/WP16, server: sends the entity `player` belongs to into the level `scene_path` (loaded if
-    /// needed), at the node named `spawn_point` inside it; without one it keeps its global position
-    /// (a chunk next door). Applied at the next tick.
+    /// needed), at the node named `spawn_point` inside it, turned the marker's way; without one it
+    /// keeps its global position and rotation (a chunk next door). Applied at the next tick.
     #[func]
     pub fn travel(
         &mut self,
