@@ -307,6 +307,7 @@ func _run_test(script: GDScript, path: String, id: String, method: String) -> vo
 		printerr("::end %s error 0 0" % id)
 		return
 	tc.name = method
+	_fresh_worlds()
 	root.add_child(tc)
 	var t0 := Time.get_ticks_msec()
 	var timed_out := not await _call_with_timeout(tc, "before_each", tc.timeout_sec)
@@ -331,6 +332,20 @@ func _run_test(script: GDScript, path: String, id: String, method: String) -> vo
 	root.remove_child(tc)
 	tc.free()
 	printerr("::end %s %s %d %s" % [id, status, elapsed, "1" if allow_errors else "0"])
+
+## Gives the root viewport a new World2D and World3D, so every test starts with new, empty physics
+## spaces. An emptied space is not a new one: its broadphase keeps the layout that earlier tests' bodies
+## left (the order they were added and removed in), which decides the order a later test's pairs and
+## contacts are solved in, and so its results down to the last bits. A test whose outcome hangs on those
+## bits (a contact that stops or does not, a rollback or none) would then pass or fail by which tests ran
+## before it in the same process.
+func _fresh_worlds() -> void:
+	# The old worlds must outlive the swap: the viewport unregisters from the old scenario after
+	# dropping its reference, and a world freed first prints `Parameter "scenario" is null`.
+	var old: Array[Resource] = [root.world_2d, root.world_3d]
+	root.world_2d = World2D.new()
+	root.world_3d = World3D.new()
+	old.clear()
 
 ## Calls a method (sync or coroutine); returns false if it did not finish in time.
 func _call_with_timeout(obj: Object, method: String, timeout: float) -> bool:

@@ -119,6 +119,8 @@ These are the rules that keep it at seconds:
 
 - Files: `tests/**/test_*.gd`, `extends TestCase`, methods named `test_*`.
 - A fresh instance runs per test method: `before_each` / `after_each` for fixtures.
+- Each test also starts with a new `World2D` and `World3D` on the root (new physics spaces): an emptied
+  space keeps the broadphase layout earlier bodies left, which changes later results in their last bits.
 - Assertions: `assert_eq`, `assert_ne`, `assert_true`, `assert_false`, `assert_null`,
   `assert_not_null`, `assert_almost_eq`, `assert_gt`, `assert_lt`, `assert_has`, `fail`, `skip`.
 - Tests are Nodes in the tree: `add_child(node)` to test scenes; children are
