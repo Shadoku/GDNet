@@ -10,8 +10,8 @@ packages are in `docs/PLAN_NETCODE.md` (approved 2026-11-08; the status table at
 its end says what is built); the research behind it is
 `docs/reports/Rust GDExtension multiplayer design.md` and `docs/research_notes/`.
 Follow the plan's packages in order and update its status table when one lands.
-Section 12 of the plan (v2, added 2026-11-13) holds the packages after v1 and their order (WP16, WP17 and
-WP23 are built; WP18 is next). Priorities
+Section 12 of the plan (v2, added 2026-11-13) holds the packages after v1 and their order (WP16, WP17, WP18 and
+WP23 are built; WP19 is next). Priorities
 (the owner's, plan goal 9): function, flexibility and keeping game code close to its single-player
 version come first; cheat detection and prevention are not a priority inside the extension.
 Nothing depends on the addon yet (the owner, 2026-11-13): keeping v1's behaviour, API or wire format is not
@@ -191,6 +191,9 @@ These are the rules that keep it at seconds:
   branch; seat 1 is the host or the first client); it points the dealer's `save_path` at a file of its own
   per test process and deletes it in `after_each`, and scans each client's packets for the other seat's
   cards with `_debug_watch`.
+  Idle entities (WP18): `test_net_idle.gd` (sleeping and idle entities, `Net.touch`, three 5,000-entity
+  polling benchmarks printed with `--verbose`; fixtures in `tests/fixtures/idle/`); reset
+  `gdnet/sync/idle_after_ticks` in `after_each` when a test sets it.
   3D (WP18, gate G10): the 3D twins are `test_net_3d.gd` (state, prediction), `test_net_3d_interp.gd`,
   `test_net_3d_world.gd` (calls, authority, interest, rooms, seats, overlay) and `test_net_3d_physics.gd`
   (a `RigidBody3D` pile, interaction scoring), with fixtures in `tests/fixtures/net3d/`. Lengths are metres;
