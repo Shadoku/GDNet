@@ -27,6 +27,7 @@ pub mod activity;
 pub mod authority;
 pub mod call;
 pub mod clock;
+pub mod correct;
 pub mod delta;
 pub mod emul;
 pub mod entity;
@@ -52,6 +53,7 @@ pub mod wire;
 pub use activity::{Activity, Poll};
 pub use authority::{AuthorityStats, Transfer};
 pub use call::{Arg, CallIn, CallMsg, CallPlan, CallResult, CallStats, OutCall, Verb};
+pub use correct::PhysicsMode;
 pub use delta::{Ack, FieldMsg, ReplStats, Replication, StateUpdate};
 pub use emul::{EmulSettings, Emulator, Pcg32};
 pub use entity::{

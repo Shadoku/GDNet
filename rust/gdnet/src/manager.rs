@@ -59,6 +59,10 @@ pub(crate) mod levelstate;
 #[path = "idle.rs"]
 pub(crate) mod idle;
 
+/// WP19: physics modes (who simulates bodies, freezing, the corrections of `simulated` replicas).
+#[path = "modes.rs"]
+pub(crate) mod modes;
+
 /// The group every manager joins, so a session can find the managers of its branch.
 pub const MANAGERS_GROUP: &str = "__gdnet_managers";
 /// Nodes in this group (and below them) are never enrolled (`Net.ignore()`).
@@ -174,6 +178,11 @@ struct Entry {
     input_driven: bool,
     /// WP18: the hash of its last resting poll's values (0: none since it was last polled hot).
     rest_sig: u64,
+    /// WP19 (modes.rs): who simulates its bodies, whether it has any (None: not checked yet), and
+    /// whether this peer's copies are live (None: not decided yet).
+    physics: netcore::PhysicsMode,
+    has_body: Option<bool>,
+    body_live: Option<bool>,
 }
 
 impl Entry {
@@ -209,6 +218,9 @@ impl Entry {
             sleep_conns: Vec::new(),
             input_driven: false,
             rest_sig: 0,
+            physics: netcore::PhysicsMode::Server,
+            has_body: None,
+            body_live: None,
         }
     }
 }
@@ -291,6 +303,14 @@ pub struct NetManager {
     #[export]
     #[var(get = get_body_prediction, set = set_body_prediction)]
     body_prediction: crate::predict_body::BodyPrediction,
+    /// WP19 (12.4): the default `physics` of this manager's body entities (a `NetEntity.physics`
+    /// overrides it): `default` = the project setting `gdnet/physics/mode` (default `server`).
+    #[export]
+    #[var(get = get_physics, set = set_physics)]
+    physics: modes::PhysicsOption,
+    /// WP19, client: the `simulated` replicas being corrected, and (corrections, snaps) so far.
+    sim: HashMap<NetId, modes::SimBody>,
+    sim_counts: (u64, u64),
     /// WP16, server: the addresses of this level's own entities (see `Entry::home`).
     homes: Vec<Rc<str>>,
     /// WP16, server: an entity of `homes` went away since the session last asked.
@@ -418,6 +438,19 @@ impl NetManager {
     /// `keep_state`: a fresh level at every load.
     #[constant]
     const KEEP_OFF: i64 = 2;
+
+    /// WP19: the manager's default `physics`.
+    #[func]
+    pub fn get_physics(&self) -> modes::PhysicsOption {
+        self.physics
+    }
+
+    /// WP19: sets the default; on a running server its entities follow at once.
+    #[func]
+    pub fn set_physics(&mut self, v: modes::PhysicsOption) {
+        self.physics = v;
+        self.refresh_physics_all();
+    }
 
     #[func]
     fn get_profiles(&self) -> Option<Gd<NetProfiles>> {
@@ -902,6 +935,7 @@ impl NetManager {
                         e.parent = Some(create.parent);
                         e.client_owned = create.client_owned;
                         e.transfer = create.transfer;
+                        e.physics = create.physics;
                     }
                 } else {
                     let mut entry = Entry::new(scene.clone(), create.owner, Origin::Remote);
@@ -909,6 +943,7 @@ impl NetManager {
                     entry.parent = Some(create.parent);
                     entry.client_owned = create.client_owned;
                     entry.transfer = create.transfer;
+                    entry.physics = create.physics;
                     self.entries.insert(iid, entry);
                     self.order.push(iid);
                     let mut n = node.clone();
@@ -969,8 +1004,9 @@ impl NetManager {
                         apply::write(&n, &f, &v);
                     }
                 }
+                // WP19: a replica's bodies are frozen unless this peer simulates them (modes.rs).
+                self.apply_body_role(iid);
                 if !self.is_server {
-                    freeze_bodies(&nodes);
                     // WP19: a body replica may be predicted (predict_body.rs).
                     if let Some(rt) = &rt {
                         session
@@ -1066,6 +1102,16 @@ impl NetManager {
                     if old != owner {
                         self.owner_changed_callbacks(session, &node, old, owner);
                     }
+                }
+            }
+            EntityEvent::SetPhysics {
+                id,
+                physics,
+                client_owned,
+                ..
+            } => {
+                if let Some(iid) = self.by_id.get(&id).copied() {
+                    self.on_set_physics(iid, physics, client_owned);
                 }
             }
             EntityEvent::OwnerQuery { id, requester, .. } => {
@@ -1350,7 +1396,10 @@ impl NetManager {
             let priority = priority_of(&node);
             // WP7: the transfer rule, client_owned, and whether the owner is inherited from the
             // enclosing entity (2.6).
-            let (transfer, client_owned, inherit) = authority_of(&node);
+            let (transfer, explicit_co, inherit) = authority_of(&node);
+            // WP19: the physics mode of its bodies (`owner` sets `client_owned`, D21).
+            let body = modes::has_body(&nodes);
+            let (physics, owner_simulates) = self.physics_spec(&node, explicit_co, body);
             // WP13: whether it becomes its owner's player.
             let mark = if node.has_meta(META_PLAYER) {
                 node.get_meta(META_PLAYER).try_to::<i64>().unwrap_or(0)
@@ -1368,7 +1417,8 @@ impl NetManager {
             let tracked = interest.radius > 0.0;
             let result = s.bind_mut().with_core(|c, now| {
                 let spec = Spawn::new(parent, &name, owner, scene.part_count(), Vec::new())
-                    .with_authority(transfer, client_owned)
+                    .with_authority(transfer, owner_simulates)
+                    .with_physics(physics)
                     .with_interest(interest);
                 let spec = if inherit {
                     spec.inheriting_owner()
@@ -1399,6 +1449,8 @@ impl NetManager {
                         e.notified_owner = owner;
                         e.client_owned = client_owned;
                         e.transfer = transfer;
+                        e.physics = physics;
+                        e.has_body = Some(body);
                     }
                     self.by_id.insert(id, iid);
                     if self.is_server {
@@ -1406,7 +1458,14 @@ impl NetManager {
                         self.pending_act.push(iid);
                     }
                     set_net_entity(&node, Some(owner), Some(id));
-                    set_net_entity_authority(&node, transfer, client_owned);
+                    // WP19: the server keeps the declared flag (its `physics` may change later); a
+                    // client's own spawn is always `client_owned`.
+                    let declared = if self.is_server {
+                        explicit_co
+                    } else {
+                        client_owned
+                    };
+                    set_net_entity_authority(&node, transfer, declared);
                     let info = self.info(id, owner);
                     self.spawned_callbacks(&node, &scene, info, session);
                 }
@@ -1522,6 +1581,10 @@ impl NetManager {
     pub fn apply_states(&mut self, updates: Vec<StateUpdate>) {
         let mut writes = Vec::new();
         for u in updates {
+            // WP19: a `simulated` replica's pose corrects its live body instead (modes.rs).
+            if !self.sim.is_empty() && self.sim_sample(&u) {
+                continue;
+            }
             let Some(e) = self.by_id.get(&u.id).and_then(|i| self.entries.get(i)) else {
                 continue;
             };
@@ -1646,7 +1709,12 @@ impl NetManager {
             } else {
                 false
             };
-            let want = (!is_server && owned && !e.client_owned && e.policy != Policy::Disabled)
+            // WP19: a `simulated` body is corrected (modes.rs), not predicted.
+            let want = (!is_server
+                && owned
+                && !e.client_owned
+                && e.physics != netcore::PhysicsMode::Simulated
+                && e.policy != Policy::Disabled)
                 .then_some(e.policy);
             let track = (want != e.predicted).then_some(want);
             e.predicted = want;
@@ -1695,6 +1763,8 @@ impl NetManager {
                 let _guard = self.base_mut();
                 tick::check_global_input(&nodes);
             }
+            // WP19: freeze or thaw its bodies when who simulates them changed.
+            self.apply_body_role(iid);
         }
     }
 
@@ -2064,7 +2134,9 @@ impl NetManager {
                 continue;
             };
             let simulating = e.gate.as_ref().is_some_and(|g| g.simulating == Some(true));
-            if e.owner == self.local_id || simulating || e.everywhere {
+            // WP19: a live (`simulated`) body changes by itself.
+            let live = e.body_live == Some(true);
+            if e.owner == self.local_id || simulating || e.everywhere || live {
                 continue;
             }
             if !(tick + u64::from(id)).is_multiple_of(cold) {
@@ -2421,6 +2493,8 @@ pub struct OverlayEntry {
     pub scene: String,
     pub parts: u16,
     pub rejected_ms: u64,
+    /// WP19: the physics mode ("" without a body).
+    pub physics: &'static str,
 }
 
 impl NetManager {
@@ -2441,6 +2515,7 @@ impl NetManager {
                     scene: e.scene.path.clone(),
                     parts: e.scene.part_count(),
                     rejected_ms: e.rejected_ms,
+                    physics: NetManager::physics_name(e),
                 })
             })
             .collect()
@@ -2497,17 +2572,6 @@ fn state_writes(
             Some((node, field, v))
         })
         .collect()
-}
-
-/// Replicas never simulate bodies (2.5): RigidBody parts are frozen once.
-fn freeze_bodies(nodes: &[Option<Gd<Node>>]) {
-    for n in nodes.iter().flatten() {
-        let is_body = n.is_class("RigidBody2D") || n.is_class("RigidBody3D");
-        if is_body {
-            let mut n = n.clone();
-            n.set("freeze", &true.to_variant());
-        }
-    }
 }
 
 /// An entity's priority: `Net.configure(node, {"priority": p})`, else its `NetEntity`'s, else 1.

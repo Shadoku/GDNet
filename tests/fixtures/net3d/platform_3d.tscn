@@ -1,0 +1,22 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/fixtures/net3d/platform_3d.gd" id="1_platform"]
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_platform"]
+size = Vector3(1.6, 0.2, 1.6)
+
+[node name="Platform3D" type="RigidBody3D"]
+collision_layer = 2
+collision_mask = 3
+mass = 1000.0
+axis_lock_angular_x = true
+axis_lock_angular_y = true
+axis_lock_angular_z = true
+gravity_scale = 0.0
+linear_damp_mode = 1
+angular_damp_mode = 1
+can_sleep = false
+script = ExtResource("1_platform")
+
+[node name="Shape" type="CollisionShape3D" parent="."]
+shape = SubResource("BoxShape3D_platform")

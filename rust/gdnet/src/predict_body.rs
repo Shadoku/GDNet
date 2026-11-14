@@ -78,11 +78,10 @@
 //! out for a supported body).
 //!
 //! **Settings** (read when used): `gdnet/physics/body_prediction` (`interpolate`), `predict_max_ms`
-//! (250), `correction_position` (5 px; 3D reads it at 100 px per metre: 5 cm), `correction_angle` (5
+//! (250), `correction_position` (metres, 0.02: 2 px in 2D at 100 px per metre), `correction_angle` (3
 //! degrees), `correction_decay` (0.85 per 60 Hz frame). The teleport thresholds are the position and
 //! rotation fields' interpolation ones (`teleport_distance`, WP5). The three `correction_*` names are
-//! shared with `simulated` corrections (WP19 slice A): this module defines them; a merge keeps one
-//! definition.
+//! shared with `simulated` corrections (modes.rs `tuning`), with the same units and defaults.
 //!
 //! **Stats**: `predicted_bodies` (moving bodies predicted in the last frame), `prediction_corrections`
 //! and `prediction_corrections_per_s` (snapshots that disagreed beyond the thresholds),
@@ -108,10 +107,10 @@ pub const SETTING_CORRECTION_POSITION: &str = "gdnet/physics/correction_position
 pub const SETTING_CORRECTION_ANGLE: &str = "gdnet/physics/correction_angle";
 pub const SETTING_CORRECTION_DECAY: &str = "gdnet/physics/correction_decay";
 pub const DEFAULT_MAX_MS: f64 = 250.0;
-/// Pixels (2D); 3D reads it at 100 px per metre.
-pub const DEFAULT_CORRECTION_POSITION: f64 = 5.0;
+/// Metres (2D reads it at 100 px per metre).
+pub const DEFAULT_CORRECTION_POSITION: f64 = 0.02;
 /// Degrees.
-pub const DEFAULT_CORRECTION_ANGLE: f64 = 5.0;
+pub const DEFAULT_CORRECTION_ANGLE: f64 = 3.0;
 /// Per 60 Hz frame.
 pub const DEFAULT_CORRECTION_DECAY: f64 = 0.85;
 /// The root meta `Net.configure(node, {"body_prediction": ...})` stores.
@@ -214,11 +213,11 @@ pub fn predict_max_ms() -> f64 {
     number_setting(SETTING_MAX_MS, DEFAULT_MAX_MS).max(0.0)
 }
 
-/// `gdnet/physics/correction_position` (default 5 px; 3D: 5 cm), `correction_angle` (default 5 degrees,
-/// returned in radians), `correction_decay` (default 0.85 per 60 Hz frame).
+/// `gdnet/physics/correction_position` (metres, default 0.02; returned in pixels at 100 px per metre,
+/// which 3D reads back as metres), `correction_angle` (default 3 degrees, returned in radians), `correction_decay` (default 0.85 per 60 Hz frame).
 pub fn correction_settings() -> (f64, f64, f64) {
     (
-        number_setting(SETTING_CORRECTION_POSITION, DEFAULT_CORRECTION_POSITION).max(0.0),
+        number_setting(SETTING_CORRECTION_POSITION, DEFAULT_CORRECTION_POSITION).max(0.0) * 100.0,
         number_setting(SETTING_CORRECTION_ANGLE, DEFAULT_CORRECTION_ANGLE)
             .max(0.0)
             .to_radians(),

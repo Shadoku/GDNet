@@ -123,6 +123,13 @@ pub enum EntityEvent {
         manager: u64,
         owner: PeerId,
     },
+    /// WP19: the entity's physics mode and effective `client_owned` flag changed (on the server too).
+    SetPhysics {
+        id: NetId,
+        manager: u64,
+        physics: crate::correct::PhysicsMode,
+        client_owned: bool,
+    },
     /// WP6: a call to run (or, on the server, to check and route), in order with the entity events.
     Call(CallIn),
     /// WP7: this peer owns (or, on the server, holds for the server) a `request` entity that
@@ -170,6 +177,7 @@ impl EntityEvent {
             EntityEvent::Destroy { record, .. } => record.parent.manager,
             EntityEvent::Reparent { from_manager, .. } => *from_manager,
             EntityEvent::SetOwner { manager, .. }
+            | EntityEvent::SetPhysics { manager, .. }
             | EntityEvent::OwnerQuery { manager, .. }
             | EntityEvent::OwnerReply { manager, .. }
             | EntityEvent::WriteRejected { manager, .. } => *manager,
@@ -1116,6 +1124,8 @@ pub struct Spawn {
     /// always `client_owned`).
     pub transfer: Transfer,
     pub client_owned: bool,
+    /// WP19: who simulates its bodies (gdnet sets `client_owned` too for `owner`).
+    pub physics: crate::correct::PhysicsMode,
     /// WP7: take the parent entity's owner instead of `owner` (nested entities, 2.6).
     pub inherit_owner: bool,
     /// WP13: whether the entity becomes its owner's player (server).
@@ -1141,6 +1151,7 @@ impl Spawn {
             values: None,
             transfer: Transfer::Fixed,
             client_owned: false,
+            physics: crate::correct::PhysicsMode::Server,
             inherit_owner: false,
             player: PlayerMark::No,
             interest: None,
@@ -1163,6 +1174,12 @@ impl Spawn {
     pub fn with_authority(mut self, transfer: Transfer, client_owned: bool) -> Self {
         self.transfer = transfer;
         self.client_owned = client_owned;
+        self
+    }
+
+    /// WP19: who simulates the entity's bodies.
+    pub fn with_physics(mut self, physics: crate::correct::PhysicsMode) -> Self {
+        self.physics = physics;
         self
     }
 
@@ -1207,6 +1224,7 @@ fn held_description(a: &EntityAction, paths: &BTreeMap<u64, String>) -> String {
         | EntityAction::OwnerReply { id, .. } => {
             std::format!("an ownership decision on entity {id}")
         }
+        EntityAction::SetPhysics { id, .. } => std::format!("the physics mode of entity {id}"),
         EntityAction::Scene { path, .. } => std::format!("the scene {path}"),
         EntityAction::Travel { room, .. } => std::format!("the travel to room {room}"),
         EntityAction::TravelAck { .. } => String::from("a travel acknowledgement"),
@@ -1350,6 +1368,7 @@ impl Session {
             values,
             transfer,
             mut client_owned,
+            physics,
             inherit_owner,
             player,
             interest,
@@ -1393,6 +1412,7 @@ impl Session {
             initial_state,
             transfer,
             client_owned,
+            physics,
         };
         self.entities.insert(&create);
         if self.role == Role::Client {
@@ -1642,6 +1662,7 @@ impl Session {
                             && self.entities.get(*id).is_none_or(|r| r.owner == peer)
                     }
                     EntityAction::SetOwner { .. }
+                    | EntityAction::SetPhysics { .. }
                     | EntityAction::Scene { .. }
                     | EntityAction::OwnerQuery { .. }
                     | EntityAction::OwnerReply { .. }
@@ -1833,7 +1854,80 @@ impl Session {
                     });
                 }
             }
+            EntityAction::SetPhysics {
+                id,
+                physics,
+                client_owned,
+            } => {
+                if self.role == Role::Client {
+                    self.apply_physics(id, physics, client_owned);
+                }
+            }
         }
+    }
+
+    /// WP19, server: changes the physics mode of `id` and its effective `client_owned` flag (gdnet
+    /// derives it: `owner` on a body sets it) and announces both. False for an unknown entity or on a
+    /// client; true with nothing sent when nothing changed.
+    pub fn set_physics(
+        &mut self,
+        id: NetId,
+        physics: crate::correct::PhysicsMode,
+        client_owned: bool,
+        now_us: u64,
+    ) -> bool {
+        if self.role != Role::Server {
+            return false;
+        }
+        let Some(r) = self.entities.get(id) else {
+            return false;
+        };
+        if r.physics == physics && r.client_owned == client_owned {
+            return true;
+        }
+        self.apply_physics(id, physics, client_owned);
+        self.share_known(
+            EntityAction::SetPhysics {
+                id,
+                physics,
+                client_owned,
+            },
+            id,
+            None,
+            now_us,
+        );
+        true
+    }
+
+    /// WP19: applies a physics change to the table and tells gdnet. A change of `client_owned` starts
+    /// a new owner-state stream; the replica's sample buffers start over (a `simulated` replica is not
+    /// interpolated).
+    fn apply_physics(
+        &mut self,
+        id: NetId,
+        physics: crate::correct::PhysicsMode,
+        client_owned: bool,
+    ) {
+        let Some(manager) = self.entities.get(id).map(|r| r.parent.manager) else {
+            return;
+        };
+        if self.entities.set_physics(id, physics, client_owned) {
+            self.auth.owner_tick.remove(&id);
+            self.auth.last_sent.remove(&id);
+            self.auth.pending_writes.retain(|k| k.0 != id);
+            self.interp.reset(id);
+            self.entity_events.push_back(EntityEvent::SetPhysics {
+                id,
+                manager,
+                physics,
+                client_owned,
+            });
+        }
+    }
+
+    /// WP19: the physics mode of `id` as this peer knows it.
+    pub fn physics_of(&self, id: NetId) -> Option<crate::correct::PhysicsMode> {
+        self.entities.get(id).map(|r| r.physics)
     }
 }
 
@@ -2408,7 +2502,12 @@ impl Session {
         if self.role != Role::Client || self.prediction.is_tracked(id) || self.owns_state(id) {
             return None;
         }
-        let scene = self.entities.get(id)?.scene;
+        let r = self.entities.get(id)?;
+        // WP19: a `simulated` replica runs its own physics; gdnet corrects it with the snapshots.
+        if r.physics == crate::correct::PhysicsMode::Simulated {
+            return None;
+        }
+        let scene = r.scene;
         let d = self.repl.table(scene)?.get(part, field)?;
         d.interpolate.then(|| d.clone())
     }
@@ -5850,6 +5949,77 @@ mod tests {
             t.b.is_interpolated(id, 0, 0),
             "another client interpolates it"
         );
+    }
+
+    #[test]
+    fn a_physics_mode_travels_in_the_create_and_its_changes_reach_every_peer() {
+        use crate::correct::PhysicsMode;
+        let mut t = Trio::new();
+        let mut table = props();
+        table.parts[0][0].interpolate = true;
+        for s in [&mut t.server, &mut t.a, &mut t.b] {
+            s.register_props(SCENE, table.clone(), names());
+        }
+        let id = t
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "Crate", 2, 3, std::vec![])
+                    .with_values(state(1.0))
+                    .with_physics(PhysicsMode::Simulated),
+                t.now,
+            )
+            .unwrap();
+        t.steps(2);
+        for s in [&t.server, &t.a, &t.b] {
+            assert_eq!(s.physics_of(id), Some(PhysicsMode::Simulated));
+        }
+        assert!(
+            !t.b.is_interpolated(id, 0, 0),
+            "a simulated replica is corrected, not interpolated"
+        );
+        entity_events(&mut t.server);
+        entity_events(&mut t.a);
+        entity_events(&mut t.b);
+        // `owner` on a body: gdnet sends the effective `client_owned` with it.
+        assert!(t.server.set_physics(id, PhysicsMode::Owner, true, t.now));
+        assert!(
+            !t.a.set_physics(id, PhysicsMode::Server, false, t.now),
+            "server only"
+        );
+        t.steps(2);
+        for s in [&mut t.server, &mut t.a, &mut t.b] {
+            let ev = entity_events(s);
+            assert!(
+                matches!(&ev[..], [EntityEvent::SetPhysics { id: i, physics: PhysicsMode::Owner, client_owned: true, .. }] if *i == id),
+                "{ev:?}"
+            );
+        }
+        assert!(t.a.owns_state(id), "the owner sends its state now");
+        assert!(t.b.is_interpolated(id, 0, 0), "and b interpolates it");
+        // No change, nothing sent.
+        assert!(t.server.set_physics(id, PhysicsMode::Owner, true, t.now));
+        t.steps(2);
+        assert!(entity_events(&mut t.b).is_empty());
+        // A late joiner's burst carries the mode.
+        let mut c = Session::client(SessionConfig::new(60));
+        t.server.peer_connected(4, t.now);
+        c.peer_connected(SERVER, t.now);
+        c.register_scene(SCENE, 42);
+        c.register_props(SCENE, table, names());
+        for o in c.outgoing() {
+            t.server.receive(4, &o.bytes, t.now);
+        }
+        for o in t.server.outgoing() {
+            if o.peer == 4 {
+                c.receive(SERVER, &o.bytes, t.now);
+            }
+        }
+        let ev = entity_events(&mut c);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, EntityEvent::Create { create, .. }
+            if create.id == id && create.physics == PhysicsMode::Owner && create.client_owned)));
     }
 
     #[test]

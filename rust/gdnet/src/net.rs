@@ -450,6 +450,16 @@ impl Net {
                 }
                 // WP19: the body's prediction on this peer (predict_body.rs).
                 "body_prediction" => crate::predict_body::configure(&root, &v),
+                // WP19 (modes.rs): who simulates the entity's bodies.
+                "physics" => match crate::manager::modes::PhysicsOption::from_variant(&v) {
+                    Some(opt) => {
+                        crate::manager::modes::store_physics(&root, opt);
+                        crate::manager::modes::apply_live(&root);
+                    }
+                    None => godot_error!(
+                        "Net.configure: physics {v} is not a mode (default, server, owner, handoff, simulated)"
+                    ),
+                },
                 "radius" => {
                     crate::interest::store_radius(&root, profiles::number(&v).unwrap_or(0.0));
                     crate::interest::apply_live(&root);

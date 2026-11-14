@@ -305,8 +305,9 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
 /// change meaning while the crate version stays. 1 = WP0-WP14; 2 = D17 (2D `mm`/`cm` steps of 0.1 px
 /// and 1 px instead of 0.001 px and 0.01 px); 3 = WP16 (`Travel` carries a level origin, `RoomLeft`,
 /// the `audience` property option); 4 = WP16 level state (`Travel` names the level content that is gone);
-/// 5 = WP17 (`Hello` carries the seat key, `Welcome` the seat and the seat table, `Seats`).
-pub const WIRE_FORMAT: u32 = 5;
+/// 5 = WP17 (`Hello` carries the seat key, `Welcome` the seat and the seat table, `Seats`); 6 = WP19
+/// (`Create` carries the physics mode, `SetPhysics`).
+pub const WIRE_FORMAT: u32 = 6;
 
 /// The protocol description both ends must agree on (3.3). WP1 covers the netcore version, the tick
 /// rate and a debug salt; later packages append scene part tables, profiles and option sets.
@@ -549,8 +550,14 @@ mod tests {
                 id: 2,
                 transfer: crate::authority::Transfer::Take,
                 client_owned: true,
+                physics: crate::correct::PhysicsMode::Simulated,
                 ..CreateAction::default()
             }),
+            EntityAction::SetPhysics {
+                id: 2,
+                physics: crate::correct::PhysicsMode::Owner,
+                client_owned: true,
+            },
         ] {
             let msg = Message::Entity(action);
             assert_eq!(msg.channel(), Channel::Reliable);
@@ -775,7 +782,12 @@ mod tests {
         assert_eq!(
             a.mismatch(&old.items, old.hash(), "server", "client")
                 .as_deref(),
-            Some("protocol mismatch: wire format differs (server 5, client 1)")
+            Some(
+                std::format!(
+                    "protocol mismatch: wire format differs (server {WIRE_FORMAT}, client 1)"
+                )
+                .as_str()
+            )
         );
         // Same items, forged hash.
         assert_eq!(
