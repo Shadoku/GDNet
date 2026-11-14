@@ -109,11 +109,28 @@ func _physics_process(delta: float) -> void:
 the client simulates it and its movement reaches everyone through the server. Ownership of a
 `client_owned` entity moves like any other (`set_owner`, `transfer`); whoever owns it is the one trusted.
 
-For bodies, `physics` (page 10) says who simulates them. `physics = owner` is `client_owned` for a body.
-`physics = handoff` makes the owner move by itself: a client whose player or bodies push the body owns it
-(and simulates it) until it rests, then the server owns it again; `Net.claim(node)` takes one for game code
-(a grab, a carried item) and `Net.release_owner(node)` gives it back. Each change raises the body's
-ownership sequence number, which settles two claims at once. `set_owner` and `request_owner` move it too.
+### `client_owned` and physics bodies
+
+For an entity with a `RigidBody2D/3D` part, the `physics` option (page 10) says who simulates it, and it
+is the same mechanism under another name (D21): `physics = owner` is `client_owned = true` for a body,
+and a body with `client_owned = true` is `owner` whatever its `physics` says. Use `physics` on bodies and
+`client_owned` on everything else (a cosmetic pet, a placement preview, a `CharacterBody` the client
+moves itself). How owner and mode combine on a body:
+
+| on the body | who simulates it | whose state is the truth | the owner changes |
+|---|---|---|---|
+| `physics = server` (the default), any owner | the server | the server's | by `set_owner`, `spawn_for`, `request_owner` (above) |
+| `physics = owner`, or `client_owned = true` | its owner (the server when it owns it) | the owner's | the same way; the simulation moves with it |
+| `physics = handoff` | its owner, which gdnet moves by itself: the client whose player or bodies push it, until it rests, then the server | the holder's | by contact, by `Net.claim(node)` and `Net.release_owner(node)`, and by the ways above |
+| `physics = simulated` | every peer, locally | the server's | as for `server`; the owner does not change who simulates |
+
+Who may own what: any entity may be owned by any peer, and the server decides. A client becomes an owner
+through `spawn_for` or `set_owner` on the server, through `request_owner` where `transfer` allows it,
+through its own spawns under `spawn_policy = owner_allowed`, or, for a `handoff` body, by pushing it or
+calling `Net.claim(node)` (a grab, a carried item; a claim may take a body from another client, a push
+never does). Every owner change raises the entity's ownership sequence number, which is how two claims
+in one tick agree on a winner. The trust warning above holds for every row in which a client's state is
+the truth: `owner` bodies always, `handoff` bodies while a client holds them.
 
 ## Rejected writes
 
@@ -189,7 +206,7 @@ typed arrays included.
 
 | where | what |
 |---|---|
-| `NetEntity` | `owner_peer`, `transfer` (`fixed` / `request` / `take`), `client_owned`, `inherit_owner`, signal `owner_changed(old, new)` |
+| `NetEntity` | `owner_peer`, `transfer` (`fixed` / `request` / `take`), `client_owned`, `inherit_owner`, `physics` (page 10), signal `owner_changed(old, new)` |
 | any part | `_net_owner_changed(old, new)`, `_net_grant_owner(requester) -> bool` |
 | `Net` (and `NetSession`) | `set_owner(node, peer)` (server), `request_owner(node) -> NetCall`, `release_owner(node)`, `claim(node) -> bool` (a `handoff` body, page 10), signals `owner_changed(node, old, new)`, `write_rejected(node, sender)`, `state` |
 | `NetKeyedState` | `set`, `get(path, default)`, `erase`, `has`, `keys(prefix)`, `allow(prefix, who)`, `view(prefix, filter)`, signals `changed(path, value)`, `erased(path)`, `write_rejected(path)` |

@@ -55,6 +55,11 @@ A property interpolates when its profile entry says `interpolate` (2.1). The shi
 inferred from a script export or added by `configure()` interpolates when it is numeric (a float, a
 vector, a quaternion, a colour).
 
+Physics bodies have two exceptions (page 10). A `RigidBody` replica with `body_prediction =
+dead_reckoning` or `custom` is drawn at the server's estimated present instead of on the render timeline;
+and a `simulated` body is not interpolated at all on a client, for any field: its local physics moves it
+and the snapshots correct it.
+
 How each type blends:
 
 | type | between two samples |

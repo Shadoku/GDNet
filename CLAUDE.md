@@ -10,8 +10,8 @@ packages are in `docs/PLAN_NETCODE.md` (approved 2026-11-08; the status table at
 its end says what is built); the research behind it is
 `docs/reports/Rust GDExtension multiplayer design.md` and `docs/research_notes/`.
 Follow the plan's packages in order and update its status table when one lands.
-Section 12 of the plan (v2, added 2026-11-13) holds the packages after v1 and their order (WP16, WP17, WP18 and
-WP23 are built; WP19 is next). Priorities
+Section 12 of the plan (v2, added 2026-11-13) holds the packages after v1 and their order (WP16, WP17, WP18,
+WP19 and WP23 are built; WP20 is next). Priorities
 (the owner's, plan goal 9): function, flexibility and keeping game code close to its single-player
 version come first; cheat detection and prevention are not a priority inside the extension.
 Nothing depends on the addon yet (the owner, 2026-11-13): keeping v1's behaviour, API or wire format is not
@@ -202,6 +202,15 @@ These are the rules that keep it at seconds:
   (a `RigidBody3D` pile, interaction scoring), with fixtures in `tests/fixtures/net3d/`. Lengths are metres;
   compare rotations with an angle (a replica may hold `-q`), and give the clients' `RigidBody3D` copies a
   collision layer of their own as they enter the manager (`child_entered_tree`).
+  Physics modes and body prediction (WP19, gate G13): `test_net_physics_modes.gd` (the option, `owner`),
+  `test_net_physics_simulated.gd`, `test_net_physics_modes_3d.gd`, `test_net_physics_handoff.gd` and
+  `test_net_physics_handoff_3d.gd`, `test_net_body_prediction.gd`, `test_net_body_prediction_motion.gd`,
+  `test_net_body_prediction_3d.gd`, `test_net_physics_prediction_mix.gd` (modes and prediction together, the
+  game's own `freeze`), with fixtures in `tests/fixtures/physics/`, `handoff/`, `predict/` and `net3d/`;
+  `test_fresh_physics_space.gd` checks that every test gets new physics spaces (the runner's
+  `_fresh_worlds()`), because Godot's solve order depends on a space's history and push tests hang on its
+  last bits. The Ballpit's switches are `test_ballpit_switches.gd`. Reset any `gdnet/physics/*` setting a
+  test sets in `after_each`; push a predicted player with `Input.action_press` and release it there.
 
 ## Design for testability
 
@@ -233,7 +242,8 @@ docs/guide/            the gdnet user guide, one page per topic (01_sessions.md,
 demos/                 instructional demos, each a worked example with a README whose code listings a
                        test diffs against the files (WP13/WP16: doors/ = a 2 x 2 chunk overworld,
                        interiors behind doors, torches with a radius, a chest that keeps its state;
-                       WP14: ballpit/ = hundreds of RigidBody2D balls, priority and the byte budget;
+                       WP14: ballpit/ = hundreds of RigidBody2D balls, priority and the byte budget,
+                       WP19: a physics-mode and a body-prediction switch on the running pit;
                        WP17: cards/ = a two-seat card game: Controls outside managers, calls, private
                        hands in the keyed state, seats and rejoining, saved games)
 check.toml             the check's stages, tiers, budget and cache settings

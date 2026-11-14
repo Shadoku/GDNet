@@ -183,6 +183,16 @@ dedicated server.
   (default 24: idle and sleeping entities are polled every 24 ticks; also `Net.resting_poll_ticks`,
   `NetSession.resting_poll_ticks`), `gdnet/sync/export_vars` (default true). `Net.touch(node)` / `NetSession.touch(node)` polls an idle or sleeping entity in the
   next tick.
+- Physics bodies (page 10): `Net.set_physics(node, mode)` and `Net.physics_of(node)`, `Net.claim(node)`
+  (also on `NetSession`), `Net.dead_reckon(body, delta)`, `Net.body_prediction_of(node)`; project
+  settings `gdnet/physics/mode` (default `server`), `gdnet/physics/body_prediction` (default
+  `interpolate`), `gdnet/physics/predict_max_ms` (250), `gdnet/physics/correction_position` (0.02 m),
+  `gdnet/physics/correction_angle` (3 degrees), `gdnet/physics/correction_decay` (0.85),
+  `gdnet/physics/correction_rest_speed` (0.15 m/s) and `gdnet/physics/handoff_rest_s` (0.5 s), all read
+  when used.
+- Other project settings, on their pages: `gdnet/budget/*` (page 10), `gdnet/interpolation/*` (page 5),
+  `gdnet/prediction/max_rollback_ticks` and `gdnet/input/actions` (page 4), `gdnet/debug/*` (page 8),
+  `gdnet/connect/*` (page 12).
 - `NetManager.get_managed_root()`: the node whose subtree it manages (itself, or the node given to
   `Net.manage()`).
 - `NetVersion`: `version()` (the gdnet crate) and `core_version()` (netcore; equal in a consistent build).

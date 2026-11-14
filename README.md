@@ -27,7 +27,10 @@ state, visibility and exported variables replicate from inferred per-class profi
 interpolated. Underneath are server authority, client prediction with rollback, most-recent-state deltas
 under a bandwidth budget, typed calls with return values, rooms and travel between levels (chunk
 overworlds, placed interiors, levels that keep their state), interest by distance and per-peer
-visibility, and diagnostics (a meter, network emulation, per-tick hashes, an ownership overlay).
+visibility, seats that a dropped player takes back, physics bodies simulated by the server, their owner,
+whoever pushes them or every peer (`physics = server | owner | handoff | simulated`) and shown
+interpolated or dead-reckoned (`body_prediction`), 2D and 3D alike, and diagnostics (a meter, network
+emulation, per-tick hashes, an ownership overlay).
 
 The escalation ladder (`docs/PLAN_NETCODE.md` section 1); most games stop at rung 2:
 
@@ -43,7 +46,8 @@ minutes the first time), imports, runs the Rust and GDScript tests, lint and a s
 
 * `demos/doors/` (a 2 x 2 chunk overworld walked across without a transition, interiors behind doors,
   torches with a radius, a chest that stays open), `demos/ballpit/` (300 colliding `RigidBody2D`
-  balls, priority and the byte budget) and `demos/cards/` (a two-seat card game: a table of Controls,
+  balls, priority and the byte budget, a switch between physics modes and one between interpolated and
+  dead-reckoned balls) and `demos/cards/` (a two-seat card game: a table of Controls,
   intentions as calls, private hands, a dropped player who sits down again, saved games). Open the demo's
   `main.tscn` and press *Run Current Scene* (F6);
   choose **Offline**, **Host** or **Join**. The title screen is gdnet's connect layer
@@ -64,10 +68,12 @@ section 10 is the status table, section 11 the known limits); the research behin
 **Status.** v1 is built (WP0-WP8, WP13, WP14, and the review of 2026-11-08), and of v2 (the plan's
 section 12) WP16 (interest by radius, `visible_to`, `audience` and `visibility_filter`; several rooms per
 peer, level placement and level state), WP17 (seats, rejoining within a window, saved sessions; the
-Cards demo) and WP23 (Steam join codes, with the Steam id as the seat key; the real Steam path awaits a
-manual test). Next is WP18 (3D parity and cheap idle entities). Not started: WP9 (lag compensation), WP10
+Cards demo), WP23 (Steam join codes, with the Steam id as the seat key; the real Steam path awaits a
+manual test), WP18 (3D parity, cheap idle and sleeping entities) and WP19 (physics modes, `handoff`
+replacing WP15, and body prediction; open problems with `simulated` piles and pushing are listed in its
+status row). Next is WP20 (assemblies and entity references). Not started: WP9 (lag compensation), WP10
 (a native renet peer), WP11 (the web build, waiting with WP24), WP12 (an optional deterministic mode),
-WP18-WP22, WP24; WP15 became WP19's `handoff` mode.
+WP20-WP22, WP24.
 
 **Versions.** Godot 4.6 (pinned in `.godot-version`; the extension declares `compatibility_minimum = 4.3`
 and is built against gdext 0.5.5's `api-4-3`), Rust stable (developed on 1.97), gdext (`godot` crate)

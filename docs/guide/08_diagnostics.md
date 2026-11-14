@@ -38,7 +38,12 @@ first session in the tree (set `meter.session` to choose one, e.g. a test branch
 | rooms | `room` (this peer's primary room; on the server the host player's) and `+N` for the other rooms in `my_rooms`, `rooms` (entities per room), `levels`, `travelling` (page 9): `room chunk_0_0 +3  [chunk_0_0 7, ...]  levels 4  travelling 0` |
 
 Interest has no line of its own; its keys are in `stats()` (page 11): `interest_passes`, `interest_ms`,
-`interest_ms_avg`, `filter_evaluations`, `radius_entities`, `radius_changes`.
+`interest_ms_avg`, `filter_evaluations`, `radius_entities`, `radius_changes`. Nor have physics modes and
+body prediction (page 10): `sim_bodies`, `sim_correcting`, `sim_corrections`, `sim_corrections_per_s`,
+`sim_snaps`; `handoff_claims`, `handoff_claims_per_s`, `handoff_claims_refused`, `handoff_returns`,
+`handoff_returns_per_s`, `handoff_held`, `handoff_stale_states`, `handoff_late_states`;
+`predicted_bodies`, `prediction_replicas`, `prediction_corrections`, `prediction_corrections_per_s`,
+`prediction_horizon_ms`.
 
 Byte counts are what gdnet handed to the transport: `SceneMultiplayer` adds one byte per raw packet,
 which a `NetPipePeer`'s `bytes_sent()` / `bytes_received()` include (`packets_sent()` /
@@ -55,7 +60,9 @@ Net.overlay_rows()          # the same data: one Dictionary per managed entity
 Each frame the overlay puts a small label at every managed entity whose root is a `Node2D` (its canvas
 position) or a `Node3D` (projected through the current `Camera3D`; skipped without one), reading
 `#<net id> owner <peer>` (WP17: `#<net id> seat <seat> away` for an entity whose owner's seat dropped and is
-held for a rejoin), coloured by role, Roblox-style:
+held for a rejoin), then for a body entity its physics mode (`server`, `handoff`, `simulated`, or
+`owner-sim <peer>` naming the peer that simulates an `owner` body) and, on a client that shows the body
+dead-reckoned or by its hook, `dead_reckoning` or `custom` (page 10); coloured by role, Roblox-style:
 
 | colour | `role` | meaning |
 |---|---|---|
@@ -67,7 +74,11 @@ held for a rejoin), coloured by role, Roblox-style:
 
 `overlay_rows()` rows: `net_id`, `owner`, `role`, `color`, `client_owned`, `transfer` (0 fixed, 1
 request, 2 take), `scene`, `parts`, `hashes_diverged`, `node`, `room`, `seat` (the owner's seat, 0 for
-none) and `away` (that seat dropped). `NetSession.overlay_rows()` gives a
+none), `away` (that seat dropped), and for bodies (WP19, page 10) `physics` (the mode, `""` for an entity
+without a RigidBody part), `simulated_by` (the peer simulating it: 1 for `server`, the owner for `owner`
+and `handoff`, -1 for `simulated`, 0 without a body), `handoff_seq` (the ownership sequence number) and
+`body_prediction` (`interpolate`, `dead_reckoning` or `custom` for a body this client shows frozen, else
+`""`). `NetSession.overlay_rows()` gives a
 branch's rows; the overlay shows every session in the tree. `gdnet/debug/overlay = true` shows it when a
 session starts.
 

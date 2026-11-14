@@ -1,11 +1,13 @@
 # Ballpit: hundreds of colliding bodies
 
-The second of gdnet's two instructional demos (docs/PLAN_NETCODE.md 2.11, WP14). A box full of balls, a
-paddle per player, sliders for the number of balls and the bandwidth budget. The balls are plain
-`RigidBody2D` scenes with no script: the server simulates them, every client receives their position,
-rotation and velocities and shows them interpolated. Read it top to bottom: every file of the demo is
-listed here, in full (a test, `tests/integration/test_ballpit_demo.gd`, checks that these listings are the
-files). The last chapter is about bandwidth: priority, the budget, degradation and what the meter shows.
+The second of gdnet's instructional demos (docs/PLAN_NETCODE.md 2.11, WP14, WP19). A box full of balls, a
+paddle per player, sliders for the number of balls and the bandwidth budget, and two switches: who
+simulates the balls (`physics`) and how a client shows them (`body_prediction`). The balls are plain
+`RigidBody2D` scenes with no script: by default the server simulates them, every client receives their
+position, rotation and velocities and shows them interpolated. Read it top to bottom: every file of the
+demo is listed here, in full (a test, `tests/integration/test_ballpit_demo.gd`, checks that these listings
+are the files). The last two chapters are about bandwidth (priority, the budget, degradation and what the
+meter shows) and about the two switches.
 
 The concepts are in `docs/guide/10_physics_and_bandwidth.md`; this page is the worked example.
 
@@ -143,18 +145,25 @@ around the paddle; a radius much larger than that would mark more balls than a s
 settle without bursting) and gives every peer a paddle with `Net.spawn_for`. On a client it does nothing:
 the balls and paddles arrive as entities. It also sets `hash_sample`, the number of entities hash
 telemetry checks per tick (docs/guide/08_diagnostics.md): two bodies a tick are enough to catch a
-divergence and cost well under 1 % of the budget.
+divergence and cost well under 1 % of the budget. The functions after `shake()` are the two switches;
+the chapter "Who simulates the balls, and what a client shows" explains them.
 
 ```gdscript file=demos/ballpit/spawner.gd
 class_name BallpitSpawner
 extends Node2D
 ## The pit and its Spawner. On the server it fills the NetManager with balls and gives every peer a
-## paddle; every other peer just receives them. Nothing here is network code beyond `Net.spawn_for`.
+## paddle; every other peer just receives them. Beyond `Net.spawn_for`, the network code is the two
+## switches at the end: who simulates the balls, and how this screen shows them.
 
 const BALL := preload("res://demos/ballpit/ball.tscn")
 const PADDLE := preload("res://demos/ballpit/paddle.tscn")
 const TRUSTED_PADDLE := preload("res://demos/ballpit/trusted_paddle.tscn")
 const SIZE := Vector2(640, 400)
+## The balls' physics modes the HUD offers (docs/guide/10_physics_and_bandwidth.md). `owner` is left
+## out: no player owns a ball.
+const PHYSICS := {"server": NetEntity.PHYSICS_SERVER, "handoff": NetEntity.PHYSICS_HANDOFF, "simulated": NetEntity.PHYSICS_SIMULATED}
+## How a client shows the balls it does not simulate.
+const PREDICTION := {"interpolate": NetEntity.BODY_PREDICTION_INTERPOLATE, "dead_reckoning": NetEntity.BODY_PREDICTION_DEAD_RECKONING}
 
 ## How many balls the server keeps in the pit.
 @export var ball_count: int = 300: set = set_ball_count
@@ -167,6 +176,7 @@ const SIZE := Vector2(640, 400)
 var _balls: Array[Node] = []
 var _paddles: Dictionary = {}
 var _trusted: bool = false
+var _physics: String = "server"
 var _rng := RandomNumberGenerator.new()
 
 @onready var manager: NetManager = $NetManager
@@ -176,6 +186,7 @@ func _ready() -> void:
 	_rng.seed = 7
 	_shift($Walls)
 	manager.child_entered_tree.connect(_shift)
+	manager.child_entered_tree.connect(_fit_paddle)
 
 
 ## Called once the session runs. Hash telemetry samples two bodies a tick: plenty for a check, a
@@ -183,6 +194,10 @@ func _ready() -> void:
 func start() -> void:
 	var session: NetSession = Net.session_for(self)
 	session.hash_sample = 2
+	session.state.changed.connect(func(path: String, value: Variant) -> void:
+		if path == "ballpit/physics":
+			_fit_paddles(value))
+	_fit_paddles(session.state.get("ballpit/physics", "server"))
 	if not session.is_server():
 		return
 	session.peer_joined.connect(spawn_paddle)
@@ -241,6 +256,46 @@ func set_trusted_paddles(on: bool) -> void:
 func shake() -> void:
 	for ball: RigidBody2D in _balls:
 		ball.apply_central_impulse(Vector2(_rng.randf_range(-150.0, 150.0), _rng.randf_range(-450.0, -250.0)))
+
+
+## Server: who simulates the balls, `"server"`, `"handoff"` or `"simulated"`. The manager's default
+## reaches every ball (those spawned later too) and every peer at the next tick; the keyed state tells
+## every peer's Spawner, which fits its paddles to the mode.
+func set_ball_physics(mode: String) -> void:
+	var session: NetSession = Net.session_for(self)
+	if not session.is_server():
+		return
+	manager.physics = PHYSICS[mode]
+	session.state.set("ballpit/physics", mode)
+	_fit_paddles(mode)
+
+
+## The balls' physics mode as this peer last heard it.
+func ball_physics() -> String:
+	return _physics
+
+
+## This peer's screen only: `"interpolate"` shows the balls a little in the past, exactly;
+## `"dead_reckoning"` carries each ball's newest state forward to the present. It changes nothing on
+## the wire or for the other peers, and applies only to the balls this peer shows frozen.
+func set_ball_prediction(mode: String) -> void:
+	manager.body_prediction = PREDICTION[mode]
+
+
+## With `server` balls a paddle collides with the walls only: the balls a client sees are frozen
+## pictures of the past, and a predicted paddle bumping into them would stop where the server's did
+## not. With `handoff` and `simulated` balls the ones a paddle touches are live, so it collides with
+## the balls too (and, in `handoff`, takes them over as it pushes them).
+func _fit_paddles(mode: String) -> void:
+	_physics = mode
+	for node in manager.get_children():
+		_fit_paddle(node)
+
+
+func _fit_paddle(node: Node) -> void:
+	if node is CharacterBody2D:
+		var mask := 1 if _physics == "server" else 3
+		(node as CharacterBody2D).collision_mask = mask << layer_shift
 
 
 func _shift(node: Node) -> void:
@@ -318,16 +373,24 @@ polygon = PackedVector2Array(-32, -8, 32, -8, 32, 8, -32, 8)
 ```gdscript file=demos/ballpit/paddle.gd
 class_name BallpitPaddle
 extends CharacterBody2D
-## Rung 1's predicted player (docs/PLAN_NETCODE.md section 1). Its collision mask holds only the
-## walls: the paddle's own motion never depends on the balls, so the owner's prediction is exact,
-## while the balls (which do collide with it) are pushed by the server's copy.
+## Rung 1's predicted player (docs/PLAN_NETCODE.md section 1). With `server` balls its collision mask
+## holds only the walls: the paddle's own motion never depends on the balls, so the owner's prediction
+## is exact, while the balls (which do collide with it) are pushed by the server's copy. With `handoff`
+## or `simulated` balls the Spawner adds the balls to the mask, and the paddle pushes what it hits.
 
 const SPEED := 300.0
+## The impulse a ball gets per tick of contact (a CharacterBody stops at a RigidBody; it does not push).
+const PUSH := 30.0
 
 
 func _physics_process(_delta: float) -> void:
 	velocity = Net.input(self).get_vector("left", "right", "up", "down") * SPEED
 	move_and_slide()
+	for i in get_slide_collision_count():
+		var hit := get_slide_collision(i)
+		var ball := hit.get_collider() as RigidBody2D
+		if ball != null:
+			ball.apply_central_impulse(-hit.get_normal() * PUSH)
 ```
 
 Look at the collision masks. The paddle (layer 3, value 4) collides only with the walls (mask 1); the balls
@@ -337,12 +400,15 @@ the owner the balls are replicas a few ticks in the past, and a paddle that bump
 where the server's paddle did not, then roll back. With this mask the owner's paddle and the server's
 always agree (the test asserts zero rollbacks during a push).
 
-The price is honest and worth knowing: **the owner sees its push one round trip late.** The server's
-paddle pushes the server's balls; the owner sees them move when the next snapshots arrive, plus the jitter
-buffer. Over a 50 ms link (each way) the test measures 5 or 6 ticks from the server's push to the first
-ball moving on the owner's screen, on top of the input's own trip to the server (the paddle on the owner's
-screen is already in the pile by then: contact on the owner is visual only). Until WP15 (cooperative physics ownership) this
-is the baseline for any server-owned body a client touches.
+The price is honest and worth knowing: **with `server` balls the owner sees its push one round trip
+late.** The server's paddle pushes the server's balls; the owner sees them move when the next snapshots
+arrive, plus the jitter buffer. Over a 50 ms link (each way) the test measures 5 or 6 ticks from the
+server's push to the first ball moving on the owner's screen, on top of the input's own trip to the server
+(the paddle on the owner's screen is already in the pile by then: contact on the owner is visual only).
+The `handoff` and `simulated` modes remove that delay; the Spawner then gives the paddle the balls' layer
+in its mask (mask 3), so it collides with them, and the loop after `move_and_slide()` pushes what it hits.
+That loop is the usual single-player recipe: a `CharacterBody2D` stops at a `RigidBody2D` and does not
+push it by itself. With `server` balls the paddle never touches a ball, so the loop does nothing.
 
 `trusted_paddle.tscn` is the same scene with a `NetEntity` that sets `client_owned = true`:
 
@@ -364,7 +430,9 @@ owner puts it. The trade-off is trust: a modified client can put its paddle anyw
 across the pit, and the server will relay it to everyone. The HUD's **Trusted paddles** toggle spawns
 every paddle again from this scene and shows the ownership overlay, where trusted entities are amber.
 Use it for prototypes and cooperative games among friends; keep the predicted paddle where cheating
-matters. The balls stay server-owned either way.
+matters. The toggle and the physics switch are independent: a trusted paddle gets the same mask as a
+predicted one when it is spawned (the Spawner's `_fit_paddle` runs for every paddle that enters the
+manager). Whether a trusted paddle claims `handoff` balls is not tested.
 
 ## The controls: `hud.tscn` and `hud.gd`
 
@@ -377,7 +445,7 @@ matters. The balls stay server-owned either way.
 offset_left = 8.0
 offset_top = 8.0
 offset_right = 248.0
-offset_bottom = 248.0
+offset_bottom = 368.0
 script = ExtResource("1_hud")
 
 [node name="BallsLabel" type="Label" parent="."]
@@ -405,6 +473,20 @@ value = 32768.0
 layout_mode = 2
 text = "Trusted paddles (client_owned)"
 
+[node name="PhysicsLabel" type="Label" parent="."]
+layout_mode = 2
+text = "Balls simulated by (physics)"
+
+[node name="Physics" type="OptionButton" parent="."]
+layout_mode = 2
+
+[node name="PredictionLabel" type="Label" parent="."]
+layout_mode = 2
+text = "This client shows them (body_prediction)"
+
+[node name="Prediction" type="OptionButton" parent="."]
+layout_mode = 2
+
 [node name="Shake" type="Button" parent="."]
 layout_mode = 2
 text = "Shake"
@@ -418,8 +500,9 @@ text = "Meter (F9)"
 ```gdscript file=demos/ballpit/hud.gd
 class_name BallpitHud
 extends VBoxContainer
-## The controls: ball count, the snapshot budget, trusted paddles, a shake, the meter. They change the
-## server's world, so only the host can use them; a client sees them greyed out.
+## The controls: ball count, the snapshot budget, trusted paddles, who simulates the balls, a shake,
+## the meter. They change the server's world, so only the host can use them; a client sees them greyed
+## out. The prediction selector is the other way round: it changes only what a client's screen shows.
 
 ## The pit the controls act on.
 @export var pit: BallpitSpawner
@@ -433,6 +516,12 @@ func _ready() -> void:
 		Net.budget_bytes_per_s = int(v)
 		_show_values())
 	$Trusted.toggled.connect(pit.set_trusted_paddles)
+	for mode: String in BallpitSpawner.PHYSICS:
+		$Physics.add_item(mode)
+	$Physics.item_selected.connect(func(i: int) -> void: pit.set_ball_physics($Physics.get_item_text(i)))
+	for mode: String in BallpitSpawner.PREDICTION:
+		$Prediction.add_item(mode)
+	$Prediction.item_selected.connect(func(i: int) -> void: pit.set_ball_prediction($Prediction.get_item_text(i)))
 	$Shake.pressed.connect(pit.shake)
 	$Meter.toggled.connect(Net.show_meter)
 
@@ -444,9 +533,12 @@ func start() -> void:
 	$Balls.editable = host
 	$Budget.editable = host
 	$Trusted.disabled = not host
+	$Physics.disabled = not host
+	$Prediction.disabled = host
 	$Shake.disabled = not host
 	$Balls.set_value_no_signal(pit.ball_count)
 	$Budget.set_value_no_signal(Net.budget_bytes_per_s)
+	$Physics.select(BallpitSpawner.PHYSICS.keys().find(pit.ball_physics()))
 	Net.show_meter($Meter.button_pressed)
 	_show_values()
 
@@ -457,7 +549,8 @@ func _show_values() -> void:
 ```
 
 The budget slider sets `Net.budget_bytes_per_s`: snapshot bytes per second per peer, applied to the
-running session at its next tick.
+running session at its next tick. The two selectors are the subject of the last chapter; the host
+uses the first, each client the second.
 
 ## Bandwidth
 
@@ -498,11 +591,65 @@ your paddle stay smooth; at 64 KB/s and 300 balls still nothing is dropped, only
 `stats()` has the same figures: `deferred_entities`, `deferred_fields` (totals), their `_per_s` and
 `_tick` forms, `interacting`, `interaction_ms`, and `NetSession.interacting(peer)` lists the ids.
 
+## Who simulates the balls, and what a client shows
+
+Two settings change how the same balls behave on the network, with no change to `ball.tscn`
+(docs/guide/10_physics_and_bandwidth.md has the whole story).
+
+**The physics mode** (the host's **Balls simulated by** selector, `set_ball_physics`). It sets
+`NetManager.physics`, the default for every body under the manager, balls spawned later included; the
+server sends the change to every peer at its next tick. The demo offers three of the four modes (`owner`
+needs an owner, and a ball has none):
+
+| mode | who simulates a ball | what the pusher sees | what to look for |
+|---|---|---|---|
+| `server` | the server | the push one round trip late (above) | stable piles, identical everywhere; the paddle passes through the balls on its owner's screen |
+| `handoff` | the client whose paddle pushes it, until it rests; the server otherwise | the ball moves on the first physics step after the contact | the ball pushed is live on the pusher, frozen elsewhere; the overlay's `simulated_by` names the holder; it goes back to the server about 0.7 s after it rests |
+| `simulated` | every peer; the server's result corrects the clients | at once, every ball is live | contacts are immediate everywhere; where the simulations disagree a ball slides to the server's answer |
+
+The paddle's mask follows the mode (`_fit_paddles`). With `server` balls it must stay off the balls, as the
+paddle chapter explains. With `handoff` or `simulated` balls the balls the paddle touches on its owner's
+screen are live bodies, so the paddle collides with them and pushes them, and the prediction does not fight
+frozen pictures of the past. Every peer must fit its own paddles, so the mode also goes into the keyed
+state (`ballpit/physics`, docs/guide/07_authority.md): every Spawner listens to `state.changed`, and one
+that starts late reads the value in `start()`.
+
+Measured by `tests/integration/test_ballpit_switches.gd` over 50 ms links (each way): in `handoff` the
+paddle touched a ball, the ball moved on the pusher's screen on the next tick and on the server 11 ticks
+after the contact; the pusher claimed six balls as they pushed each other, gave each back once it rested,
+and its paddle never rolled back; nobody touching the pile means no claims at all (a `handoff` pile nobody
+touches is a `server` pile, and the client converges on it to within half a quantiser step).
+
+`simulated` is where this demo shows the mode's open problem: a pile of balls stacked two or more deep
+does not settle on a client. In the test (60 balls, two rows, shaken), a second after the server's pile
+fell asleep the worst client ball was still 22 to 31 px from the server's, after about 500 corrections;
+a few balls go on moving and being corrected for 10 s and more (40 to 200 corrections a second), and no
+client ball falls asleep. A single row of balls settles at once (0.28 px, no corrections). docs/PLAN_NETCODE.md
+section 10, the WP19 row, lists it as open. Switching back to `server` heals it at once: the replicas
+freeze and converge to within 0.075 px.
+
+**Body prediction** (each client's **This client shows them** selector, `set_ball_prediction`). It sets
+`NetManager.body_prediction` on that client's own manager: what its screen shows for the balls it holds
+frozen (all of them with `server`, those other players hold with `handoff`; it is ignored with `simulated`,
+where the local physics is the prediction). It sends nothing and changes nothing for anyone else, so the
+selector is greyed out on the host, which shows its own balls as they are.
+
+* `interpolate` (the default) shows the server's past between two snapshots: exact, and late by half a
+  round trip plus the jitter buffer.
+* `dead_reckoning` carries the newest snapshot forward to the present by the ball's velocity, gravity and
+  damping. Measured with one thrown ball over 50 ms links: 2.8 px from the server's present on average in
+  flight, against 16.5 px interpolated. It overshoots at every contact (a ball predicted into the floor
+  bends back when the snapshot of the bounce arrives), which is why it is not the default; try it with
+  **Shake** and watch the pile land.
+
 ## What to look at while it runs
 
 * **Shake** kicks every ball upwards: the budget meter jumps to 100 % and the deferred count climbs; when
   the pile is asleep again both fall back to zero.
 * **Balls**: more balls cost more only while they move. A sleeping pile of 600 costs what a pile of 60 does.
 * **Trusted paddles**: amber in the overlay; the paddle no longer rolls back, and no longer can be trusted.
-* What is not here yet: a ball pushed by a client's paddle is the server's, so the client sees it react
-  late. WP15 (docs/PLAN_NETCODE.md section 4) hands touched bodies to the pushing client for a while.
+* **Balls simulated by `handoff`**: push the pile from a client and the balls you touch react at once; turn
+  the ownership overlay on (the **Trusted paddles** toggle shows it, or the project setting
+  `gdnet/debug/overlay`) to see who holds them.
+* **This client shows them `dead_reckoning`**: shake, and the flying balls are where the host sees them;
+  watch them dip into the floor and come back as they land.
