@@ -13,12 +13,12 @@ var net: NetFixture
 
 
 func before_each() -> void:
-	Door.allow_others = false
+	Door._set_allow_others(false)
 
 
 func after_each() -> void:
 	Input.action_release("jump")
-	Door.allow_others = false
+	Door._set_allow_others(false)
 	if net != null:
 		net.teardown()
 		net = null
@@ -166,7 +166,7 @@ func test_a_non_owners_sync_is_refused_and_net_allow_admits_it() -> void:
 	await _frames(5)
 	for k: String in doors:
 		assert_eq(doors[k].calls, [], "nobody ran it on " + k)
-	Door.allow_others = true
+	Door._set_allow_others(true)
 	call = Net.sync(bdoor.open_door, 2)
 	await call.completed
 	assert_true(call.ok, call.error)

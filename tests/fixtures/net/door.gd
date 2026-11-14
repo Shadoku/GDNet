@@ -10,12 +10,17 @@ extends Node2D
 var calls: Array = []
 ## The NetCallInfo each `note` call received: {text, sender, tick, is_local}.
 var infos: Array = []
-## What `_net_allow` answers for a sender that does not own the door (process-wide; tests reset it).
-static var allow_others: bool = false
 ## The `_net_allow` questions asked on this peer: [method, sender].
 var asked: Array = []
 ## How many calls had run here when `_net_spawned` ran (-1 before it ran).
 var calls_at_spawn: int = -1
+
+
+## Sets what `_net_allow` answers for a sender that does not own the door (process-wide; tests reset
+## it). An Engine meta rather than a `static var`: a script with a static variable can be left "still in
+## use at exit" (an error that fails the stage), depending on which scripts share the runner process.
+static func _set_allow_others(allow: bool) -> void:
+	Engine.set_meta(&"door_allow_others", allow)
 
 
 func _net_spawned(_info: Dictionary) -> void:
@@ -47,7 +52,7 @@ func knock(k: int) -> void:
 
 func _net_allow(method: StringName, sender: int) -> bool:
 	asked.append([String(method), sender])
-	return allow_others
+	return Engine.get_meta(&"door_allow_others", false)
 
 
 func _secret() -> void:

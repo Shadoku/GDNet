@@ -13,6 +13,7 @@ mod configure;
 mod editor;
 mod emulation;
 mod entity_node;
+mod fastread;
 mod hash;
 mod infer;
 mod input;

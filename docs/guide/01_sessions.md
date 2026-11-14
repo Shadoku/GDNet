@@ -178,6 +178,10 @@ dedicated server.
 - Project settings for rooms and interest (pages 9 and 11): `gdnet/levels/empty_timeout_s` (default 30),
   `gdnet/levels/spacing` (default 0 = levels keep their authored place), `gdnet/levels/keep_state`
   (default true), `gdnet/interest/filter_every_ticks` (default 6).
+- Project settings for state (page 3): `gdnet/sync/profiles`, `gdnet/sync/cold_poll_ticks` (default 6),
+  `gdnet/sync/idle_after_ticks` (default 30; 0 turns the idle rule off), `gdnet/sync/export_vars`
+  (default true). `Net.touch(node)` / `NetSession.touch(node)` polls an idle or sleeping entity in the
+  next tick.
 - `NetManager.get_managed_root()`: the node whose subtree it manages (itself, or the node given to
   `Net.manage()`).
 - `NetVersion`: `version()` (the gdnet crate) and `core_version()` (netcore; equal in a consistent build).

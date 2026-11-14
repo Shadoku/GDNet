@@ -28,6 +28,8 @@ use std::rc::Rc;
 pub const DEFAULT_PROFILES_PATH: &str = "res://addons/gdnet/default_profiles.tres";
 pub const SETTING_PROFILES: &str = "gdnet/sync/profiles";
 pub const SETTING_COLD_POLL: &str = "gdnet/sync/cold_poll_ticks";
+/// WP18: polls without a change before an entity is idle (polled at the cold rate); 0 = never.
+pub const SETTING_IDLE_AFTER: &str = "gdnet/sync/idle_after_ticks";
 pub const SETTING_EXPORT_VARS: &str = "gdnet/sync/export_vars";
 pub const SETTING_BUDGET: &str = "gdnet/budget/bytes_per_second";
 
@@ -487,6 +489,13 @@ pub fn cold_poll_ticks() -> u32 {
         })
         .unwrap_or(6)
         .max(1)
+}
+
+/// WP18: `gdnet/sync/idle_after_ticks`, else 30 (read every tick, so a change applies at once).
+pub fn idle_after_ticks() -> u32 {
+    setting(SETTING_IDLE_AFTER)
+        .and_then(|v| v.try_to::<i64>().ok())
+        .map_or(30, |v| v.clamp(0, i64::from(u32::MAX)) as u32)
 }
 
 /// `Net.budget_bytes_per_s`, else `gdnet/budget/bytes_per_second`, else 32,768.

@@ -55,6 +55,10 @@ use std::rc::Rc;
 #[path = "levelstate.rs"]
 pub(crate) mod levelstate;
 
+/// WP18: the hot list, idle and sleeping entities (what `record()` polls).
+#[path = "idle.rs"]
+pub(crate) mod idle;
+
 /// The group every manager joins, so a session can find the managers of its branch.
 pub const MANAGERS_GROUP: &str = "__gdnet_managers";
 /// Nodes in this group (and below them) are never enrolled (`Net.ignore()`).
@@ -156,6 +160,15 @@ struct Entry {
     /// WP16 (level state): the address (path relative to the managed root) of an entity that is part
     /// of its level's scene, recorded when the server loaded the level; None for everything else.
     home: Option<Rc<str>>,
+    /// WP18 (server): the entity's slot in the manager's `activity`, the getters its parts are read
+    /// with (and which are RigidBodies), the bodies' `sleeping_state_changed` connections, and whether
+    /// its scripts read `Net.input`.
+    act: Option<u32>,
+    resolved: Option<Rc<idle::Resolved>>,
+    sleep_conns: Vec<(Gd<Node>, Callable)>,
+    input_driven: bool,
+    /// WP18: the hash of its last resting poll's values (0: none since it was last polled hot).
+    rest_sig: u64,
 }
 
 impl Entry {
@@ -186,6 +199,11 @@ impl Entry {
             notified_owner: owner,
             rejected_ms: 0,
             home: None,
+            act: None,
+            resolved: None,
+            sleep_conns: Vec::new(),
+            input_driven: false,
+            rest_sig: 0,
         }
     }
 }
@@ -293,6 +311,9 @@ pub struct NetManager {
     /// WP6: calls on entities that have no net id yet (spawned this tick, or a client's static content
     /// before the server's create), dispatched once they have one.
     queued_calls: Vec<Queued>,
+    /// WP18 (server): which entities `record()` polls; entities that got an id since the last record.
+    activity: netcore::Activity<InstanceId>,
+    pending_act: Vec<InstanceId>,
 }
 
 /// WP6: a call checked at the call site, on its way out.
@@ -352,6 +373,7 @@ impl INode for NetManager {
             }
             self.connected_signals = false;
         }
+        self.deactivate_all();
         for (iid, _) in std::mem::take(&mut self.entries) {
             if let Ok(mut n) = Gd::<Node>::try_from_instance_id(iid) {
                 if n.has_meta(META_MANAGER) {
@@ -569,6 +591,7 @@ impl NetManager {
     }
 
     fn forget(&mut self, iid: InstanceId) {
+        self.deactivate(iid);
         if let Some(e) = self.entries.remove(&iid) {
             if e.home.is_some() {
                 self.homes_changed = true;
@@ -742,6 +765,7 @@ impl NetManager {
             // A new session: earlier ids mean nothing; remote replicas become static content.
             self.generation = generation;
             self.by_id.clear();
+            self.deactivate_all();
             for e in self.entries.values_mut() {
                 e.id = None;
                 e.parent = None;
@@ -753,6 +777,9 @@ impl NetManager {
         self.online = online;
         self.is_server = is_server;
         self.local_id = local_id;
+        if !is_server {
+            self.pending_act.clear();
+        }
         if !online {
             return;
         }
@@ -869,6 +896,9 @@ impl NetManager {
                     );
                 }
                 self.by_id.insert(create.id, iid);
+                if self.is_server {
+                    self.pending_act.push(iid);
+                }
                 set_net_entity(&node, Some(create.owner), Some(create.id));
                 set_net_entity_authority(&node, create.transfer, create.client_owned);
                 if !adopted {
@@ -1000,6 +1030,7 @@ impl NetManager {
                     old = e.notified_owner;
                     e.notified_owner = owner;
                 }
+                self.owner_moved(iid);
                 if let Ok(node) = Gd::<Node>::try_from_instance_id(iid) {
                     set_net_entity(&node, Some(owner), None);
                     if old != owner {
@@ -1205,6 +1236,7 @@ impl NetManager {
                             if let Some(e) = self.entries.get_mut(&iid) {
                                 e.parent = Some(p);
                             }
+                            self.wake_iid(iid);
                         }
                     }
                 }
@@ -1223,6 +1255,7 @@ impl NetManager {
                 if let Some(e) = self.entries.get_mut(&iid) {
                     e.owner_dirty = false;
                 }
+                self.owner_moved(iid);
             }
         }
         // New entities, in enrolment order (parents first).
@@ -1340,6 +1373,7 @@ impl NetManager {
                     self.by_id.insert(id, iid);
                     if self.is_server {
                         s.bind_mut().interest.track(id, &node, tracked, filter);
+                        self.pending_act.push(iid);
                     }
                     set_net_entity(&node, Some(owner), Some(id));
                     set_net_entity_authority(&node, transfer, client_owned);
@@ -1452,52 +1486,6 @@ impl NetManager {
         a
     }
 
-    /// 2.2 step 5 on the server: reads the hot properties of every spawned entity, and the cold ones
-    /// when due (every `cold` ticks, staggered by id, or right after `mark_cold_dirty`).
-    pub fn record(&mut self, tick: u64, cold: u32, out: &mut Vec<Recorded>) {
-        if !self.online || !self.is_server {
-            return;
-        }
-        let cold = u64::from(cold.max(1));
-        let mut work: Vec<(NetId, Rc<RuntimeProps>, PartNodes, bool)> = Vec::new();
-        for iid in &self.order {
-            let Some(e) = self.entries.get_mut(iid) else {
-                continue;
-            };
-            let (Some(id), Some(rt)) = (e.id, e.props.clone()) else {
-                continue;
-            };
-            // WP7: a `client_owned` entity a client owns is recorded from its owner's state.
-            if e.client_owned && e.owner != netcore::SERVER {
-                continue;
-            }
-            let due = e.cold_force || (tick + u64::from(id)).is_multiple_of(cold);
-            e.cold_force = false;
-            work.push((id, rt, e.nodes.clone(), due));
-        }
-        let _guard = self.base_mut();
-        for (id, rt, nodes, cold_due) in work {
-            for (p, node) in nodes.iter().enumerate() {
-                let Some(node) = node else {
-                    continue;
-                };
-                if !node.is_instance_valid() {
-                    continue;
-                }
-                let hot = &rt.hot[p];
-                let colds = if cold_due { rt.cold[p].as_slice() } else { &[] };
-                if hot.is_empty() && colds.is_empty() {
-                    continue;
-                }
-                let mut vals = Vec::with_capacity(hot.len() + colds.len());
-                for &f in hot.iter().chain(colds) {
-                    vals.push((f, apply::read(node, &rt.fields[p][usize::from(f)])));
-                }
-                out.push((id, p as u16, vals));
-            }
-        }
-    }
-
     /// Applies snapshot values to replicas, snapping (WP5: netcore keeps a replica's `interpolate`
     /// fields for `apply_interp` instead). WP7: entities whose state this peer is the source of keep
     /// their own; on the server these are the owners' states of `client_owned` entities.
@@ -1539,6 +1527,8 @@ impl NetManager {
         if let Some(e) = self.entries.get_mut(&root.instance_id()) {
             e.cold_force = true;
         }
+        // WP18: an idle or sleeping entity is polled in full at the next record.
+        self.wake_iid(root.instance_id());
     }
 
     /// `Net.configure(node, {"priority": p})` on an enrolled entity: applied at once on the server.
@@ -2881,6 +2871,7 @@ impl NetManager {
             .collect();
         let mut entries = Vec::new();
         for iid in iids {
+            self.deactivate(iid);
             if let Some(mut e) = self.entries.remove(&iid) {
                 if let Some(id) = e.id {
                     self.by_id.remove(&id);
@@ -2925,6 +2916,7 @@ impl NetManager {
             if let Some(id) = e.id {
                 self.by_id.insert(id, iid);
                 ids.push(id);
+                self.pending_act.push(iid);
             }
             self.entries.insert(iid, e);
             self.order.push(iid);

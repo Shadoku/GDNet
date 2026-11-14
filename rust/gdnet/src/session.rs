@@ -215,6 +215,9 @@ struct Counters {
     poll_us_window: u64,
     poll_ms_avg: f64,
     record_calls: u64,
+    /// WP18: the last record step's entity counts (hot, idle, sleeping) and entities it polled.
+    activity: (usize, usize, usize),
+    polled_last: usize,
     /// WP4.
     rollbacks: u64,
     replayed_ticks: u64,
@@ -911,6 +914,10 @@ impl NetSession {
         d.set("entities", self.entity_count());
         d.set("poll_ms", c.poll_us_last as f64 / 1000.0);
         d.set("poll_ms_avg", c.poll_ms_avg);
+        d.set("hot_entities", c.activity.0 as i64);
+        d.set("idle_entities", c.activity.1 as i64);
+        d.set("sleeping_entities", c.activity.2 as i64);
+        d.set("polled_entities", c.polled_last as i64);
         d.set("budget_bytes_per_s", i64::from(self.effective_budget()));
         d.set("cold_poll_ticks", i64::from(self.effective_cold_poll()));
         if let Some(core) = self.core.as_ref() {
@@ -1608,19 +1615,41 @@ impl NetSession {
             let t0 = now_us();
             let tick = self.core.as_ref().map_or(0, |c| c.current_tick());
             let cold = self.effective_cold_poll();
+            // WP18: the hot list and this tick's bucket of idle and sleeping entities, per manager;
+            // netcore says which polls found a change, and each manager moves its entities.
+            let idle_after = profiles::idle_after_ticks();
+            crate::manager::idle::flush_input_driven();
             let managers = self.managers();
-            let mut batch = Vec::new();
-            {
-                let _guard = self.base_mut();
-                for (_, mut m) in managers {
-                    m.bind_mut().record(tick, cold, &mut batch);
+            let (mut counts, mut polled_n) = ((0, 0, 0), 0);
+            let (mut batch, mut polled, mut results) = (Vec::new(), Vec::new(), Vec::new());
+            for (_, mut m) in managers {
+                batch.clear();
+                polled.clear();
+                results.clear();
+                {
+                    let _guard = self.base_mut();
+                    m.bind_mut()
+                        .record(tick, cold, idle_after, &mut batch, &mut polled);
                 }
-            }
-            if let Some(core) = self.core.as_mut() {
-                for (id, part, values) in &batch {
-                    core.record_part(*id, *part, values);
+                if let Some(core) = self.core.as_mut() {
+                    let mut k = 0;
+                    for p in &polled {
+                        let mut changed = false;
+                        for (id, part, values) in &batch[k..k + p.parts] {
+                            changed |= core.record_part(*id, *part, values);
+                        }
+                        k += p.parts;
+                        results.push((p.slot, changed, p.rests));
+                    }
                 }
+                let mut b = m.bind_mut();
+                b.observe(&results);
+                let (h, i, s) = b.activity_counts();
+                counts = (counts.0 + h, counts.1 + i, counts.2 + s);
+                polled_n += polled.len();
             }
+            self.stats.activity = counts;
+            self.stats.polled_last = polled_n;
             let us = now_us().saturating_sub(t0);
             self.stats.poll_us_last = us;
             self.stats.poll_us_window += us;

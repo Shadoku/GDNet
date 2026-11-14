@@ -77,7 +77,7 @@ func refresh() -> void:
 	_put("budget", "budget %d%% of %d B/s per peer  deferred: %d ent/s  interacting %d" % [roundi(100.0 * float(d.get("budget_use", 0.0))), d.get("budget_bytes_per_s", 0), d.get("deferred_entities_per_s", 0), d.get("interacting", 0)])
 	_put("calls", "calls out %d/s  in %d/s  refused %d" % [d.get("calls_sent_per_s", 0), d.get("calls_received_per_s", 0), d.get("calls_refused", 0)])
 	_put("prediction", "rollbacks %d/s  replayed %d  inputs repeated %d" % [d.get("rollbacks_per_s", 0), d.get("replayed_ticks", 0), d.get("inputs_repeated", 0)])
-	_put("poll", "poll %.3f ms (avg %.3f)" % [d.get("poll_ms", 0.0), d.get("poll_ms_avg", 0.0)])
+	_put("poll", "poll %.3f ms (avg %.3f)  hot %d  idle %d  asleep %d" % [d.get("poll_ms", 0.0), d.get("poll_ms_avg", 0.0), d.get("hot_entities", 0), d.get("idle_entities", 0), d.get("sleeping_entities", 0)])
 	_put("hashes", "hashes out %d  in %d  divergences %d (%d/s)%s" % [d.get("hashes_sent", 0), d.get("hashes_received", 0), d.get("divergences", 0), d.get("divergences_per_s", 0), "" if d.get("hash_telemetry", true) else "  (off)"])
 	_put("authority", "owner changes %d  rejected writes %d  %s" % [d.get("owner_changes", 0), d.get("writes_rejected", 0), _seats_text(d)])
 	_put("rooms", _rooms_text(d))
