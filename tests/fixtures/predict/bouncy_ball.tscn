@@ -1,0 +1,17 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/fixtures/predict/ball.gd" id="1_script"]
+
+[sub_resource type="CircleShape2D" id="CircleShape2D_ball"]
+radius = 8.0
+
+[sub_resource type="PhysicsMaterial" id="PhysicsMaterial_bouncy"]
+bounce = 0.3
+
+[node name="Ball" type="RigidBody2D"]
+freeze = true
+physics_material_override = SubResource("PhysicsMaterial_bouncy")
+script = ExtResource("1_script")
+
+[node name="Shape" type="CollisionShape2D" parent="."]
+shape = SubResource("CircleShape2D_ball")

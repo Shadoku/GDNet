@@ -29,6 +29,7 @@ mod parts;
 mod physics;
 mod pipe_peer;
 mod poll;
+mod predict_body;
 mod profiles;
 mod replay;
 mod seats;

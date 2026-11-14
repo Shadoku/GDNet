@@ -39,6 +39,93 @@ snapshot rolls it back. Two honest options:
 Handing a touched body to the pushing client for a while, so the push is immediate and still arbitrated by
 the server, is WP15 (cooperative physics ownership, after v1).
 
+## Body prediction: showing a body where it is now
+
+A replica normally shows the server's past (`interpolate`, the default). `body_prediction` chooses what a
+client shows instead (docs/PLAN_NETCODE.md 12.4, D26, D27):
+
+| `body_prediction` | what the replica shows |
+|---|---|
+| `interpolate` (default) | the server's past, between two snapshots: exact, late by half a round trip plus the jitter buffer |
+| `dead_reckoning` | the newest snapshot carried forward to the present by its velocities, gravity and damping |
+| `custom` | the same starting point, advanced by the body script's `_net_predict_body(delta)` |
+
+It is the client's display choice: nothing changes on the wire or on the server, and no script needs
+changing except for `custom`. Set it per body (`NetEntity.body_prediction`, or `Net.configure(body,
+{"body_prediction": "dead_reckoning"})`, which wins over the `NetEntity`), per manager
+(`NetManager.body_prediction`) or per project (`gdnet/physics/body_prediction`). A body whose script defines
+`_net_predict_body` and has no setting of its own uses `custom`, even when its manager or the project says
+otherwise; `custom` on a body without the hook means `dead_reckoning`. Changes apply at the next frame.
+`Net.body_prediction_of(node)` returns the effective choice (`NetEntity.BODY_PREDICTION_INTERPOLATE`,
+`_DEAD_RECKONING`, `_CUSTOM`), and the overlay labels a predicted body with its mode.
+
+```gdscript
+# A thrown grenade: shown where it is, not where it was.
+Net.configure($Grenade, {"body_prediction": "dead_reckoning"})
+```
+
+**What dead reckoning computes.** It takes the newest snapshot's `position`, rotation, `linear_velocity`
+and `angular_velocity` and steps them one physics tick at a time, as Godot's engines do for a body in free
+flight: `v *= max(0, 1 - linear_damp * dt)`, then `v += gravity * gravity_scale * dt`, then `x += v * dt`
+(Jolt adds gravity before damping; the rotation is advanced by `angular_velocity * dt` the same way). The
+time it steps over (the *horizon*) is the client's estimate of the server's present tick minus the
+snapshot's tick: about half the round trip plus the snapshot's age, capped at
+`gdnet/physics/predict_max_ms` (250). Gravity and damping are the space's defaults (the project's
+`physics/2d|3d/default_*`) and the replica's own `gravity_scale` and `linear_damp` / `angular_damp`
+values, which the default profiles do not replicate: keep them in the scene, or add them to the profile
+if a script changes them. `Area2D/3D` gravity and damping overrides are not applied; use `custom` where
+they matter. A body resting or sliding on something (its velocity stopped following gravity) is predicted
+without gravity, so a sliding crate does not sink into the floor, and a body at rest or asleep is not
+predicted at all: a sleeping pile costs nothing.
+
+Over a 100 ms link a thrown ball shown with `dead_reckoning` stays within one tick's travel of the server's
+present position on every frame (gate G13; measured worst 2.7 px against 4.9 px in 2D, 2.8 cm against 5.1
+cm in 3D), where the interpolated one trails by about 30 px (1.8 times its velocity times the one-way
+delay). A predicted player that walks into a dead-reckoned puck meets it 4 to 5 px from where the server
+has it, against 30 px when the puck is interpolated: the predicted pose is also where the frozen body's
+collider is (`tests/integration/test_net_body_prediction*.gd`).
+
+**What it cannot know.** Dead reckoning knows nothing of a collision the server has not reported yet: a
+ball predicted towards a wall passes into it until the snapshot of the bounce arrives, then bends back.
+Each new snapshot is compared with what the prediction showed; the difference becomes an offset that
+decays by `gdnet/physics/correction_decay` (0.85) per 60 Hz frame, so the body bends back instead of
+jumping, and snaps beyond the property's `teleport_distance` (page 5). Differences above
+`gdnet/physics/correction_position` (5 px; 5 cm in 3D) or `correction_angle` (5 degrees) count as
+corrections in `stats()`. Measured: a ball hitting the floor at 775 px/s passed it by about 64 px (less
+than speed times the 250 ms cap, 194 px) and its largest step in a frame was 6 px. A body that starts
+moving jumps ahead once by its velocity times the horizon (the interpolated pose was only late); one
+whose mode changes while it moves blends over.
+
+**`custom`.** Before each call the body's `position`, rotation, `linear_velocity` and `angular_velocity`
+hold the state to advance (the newest snapshot at first); the hook changes them as its own movement code
+would over `delta` seconds, and gdnet shows the result. `Net.dead_reckon(body, delta)` is the built-in
+step, if the hook wants it:
+
+```gdscript
+func _net_predict_body(delta: float) -> void:
+	Net.dead_reckon(self, delta)                       # the default step; optional
+	linear_velocity += -transform.basis.z * throttle * THRUST * delta
+	position += -transform.basis.z * throttle * THRUST * delta * delta * 0.5
+```
+
+The hook is called for each tick of the horizon once (`delta` is one tick) and once per frame with the
+fraction of a tick that is left; a new snapshot starts it again from the snapshot. That is one or two calls
+on most frames and a few more on a frame a snapshot arrives (measured: 3.5 calls a frame at 145 frames
+per second over a 100 ms link). The hook should change only those four properties (it may read anything):
+the fraction's call is not kept.
+
+**Choosing.** Keep `interpolate` for piles and anything that collides all the time: dead reckoning
+overshoots at every contact (D27). Use `dead_reckoning` for thrown and flying things, and `custom` for
+bodies with their own propulsion. A `simulated` physics mode (WP19) runs real local physics instead, and
+ignores `body_prediction`. `stats()` reports `predicted_bodies`, `prediction_corrections(_per_s)` and
+`prediction_horizon_ms`.
+
+**Moving a frozen body every frame.** Replicas use Godot's default `FREEZE_MODE_STATIC`: setting the
+position teleports the collider (it is not swept), and the physics server wakes the bodies it touches,
+exactly as with interpolation, which moves replicas every frame too. A fast predicted body can therefore
+pass through a thin collider between two frames; it is a picture of the server's body, which collides
+for real.
+
 ## Sleeping bodies cost nothing
 
 The server records a hot field only when its *quantised* encoding changes. A body Godot put to sleep does

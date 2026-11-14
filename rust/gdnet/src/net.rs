@@ -331,8 +331,9 @@ impl Net {
     /// Corrects what the entity `node` belongs to replicates (rung 3): `state: ["+prop", "-prop"]`,
     /// `quantize: {prop: "cm"}`, `send: {prop: "hot"}`, `tolerance`, `interpolate`, `teleport_distance`
     /// change the property table of the entity's scene and must be made before that scene's first spawn on this peer, the
-    /// same way on every peer; `priority` applies to this entity at any time. Paths are `prop` or
-    /// `Part:prop`, relative to `node`.
+    /// same way on every peer; `priority` applies to this entity at any time; WP19 `body_prediction`
+    /// (`"default"`, `"interpolate"`, `"dead_reckoning"`, `"custom"`) is this peer's display choice for
+    /// a body replica, any time. Paths are `prop` or `Part:prop`, relative to `node`.
     #[func]
     fn configure(&mut self, node: Gd<Node>, options: VarDictionary) {
         let (root, manager) = match entity_root_of(&node) {
@@ -447,6 +448,8 @@ impl Net {
                         }
                     }
                 }
+                // WP19: the body's prediction on this peer (predict_body.rs).
+                "body_prediction" => crate::predict_body::configure(&root, &v),
                 "radius" => {
                     crate::interest::store_radius(&root, profiles::number(&v).unwrap_or(0.0));
                     crate::interest::apply_live(&root);

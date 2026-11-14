@@ -602,6 +602,11 @@ impl Session {
         self.peers.get(peer).and_then(|p| p.rtt.rtt_ms())
     }
 
+    /// WP19: the smallest recent round trip to `peer` in milliseconds (see `RttEstimator::min_rtt_ms`).
+    pub fn min_rtt_ms(&self, peer: PeerId) -> Option<f64> {
+        self.peers.get(peer).and_then(|p| p.rtt.min_rtt_ms())
+    }
+
     pub fn jitter_ms(&self, peer: PeerId) -> Option<f64> {
         self.peers.get(peer).and_then(|p| p.rtt.jitter_ms())
     }
@@ -3378,6 +3383,11 @@ impl Session {
 
     pub fn interp(&self) -> &Interp {
         &self.interp
+    }
+
+    /// WP19: body prediction reads the newest samples and watches for fresh ones.
+    pub fn interp_mut(&mut self) -> &mut Interp {
+        &mut self.interp
     }
 
     /// One render frame (2.2 step 7): advances the render timeline, decays the offsets and returns

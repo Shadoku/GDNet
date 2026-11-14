@@ -183,6 +183,13 @@ pub struct NetEntity {
     #[var(get = get_visibility_filter, set = set_visibility_filter)]
     #[init(val = Callable::invalid())]
     visibility_filter: Callable,
+    /// WP19 (12.4): what a client shows for this body replica: `default` (a `_net_predict_body` hook
+    /// means `custom`, else the manager's, else `gdnet/physics/body_prediction`), `interpolate` (the
+    /// server's past), `dead_reckoning` (the newest snapshot carried to the present) or `custom` (the
+    /// hook advances it). A client-side display choice; changes apply at the next frame.
+    #[export]
+    #[var(get = get_body_prediction, set = set_body_prediction)]
+    body_prediction: crate::predict_body::BodyPrediction,
     /// The entity's net id once spawned (0 before). Read only.
     #[var(get = get_net_id, no_set)]
     net_id: i64,
@@ -190,6 +197,27 @@ pub struct NetEntity {
 
 #[godot_api]
 impl NetEntity {
+    /// WP19 `body_prediction` values (also `NetManager.body_prediction`, `Net.body_prediction_of`).
+    #[constant]
+    pub const BODY_PREDICTION_DEFAULT: i64 = 0;
+    #[constant]
+    pub const BODY_PREDICTION_INTERPOLATE: i64 = 1;
+    #[constant]
+    pub const BODY_PREDICTION_DEAD_RECKONING: i64 = 2;
+    #[constant]
+    pub const BODY_PREDICTION_CUSTOM: i64 = 3;
+
+    #[func]
+    pub fn get_body_prediction(&self) -> crate::predict_body::BodyPrediction {
+        self.body_prediction
+    }
+
+    #[func]
+    pub fn set_body_prediction(&mut self, m: crate::predict_body::BodyPrediction) {
+        self.body_prediction = m;
+        crate::predict_body::changed();
+    }
+
     #[func]
     pub fn get_net_id(&self) -> i64 {
         self.net_id
