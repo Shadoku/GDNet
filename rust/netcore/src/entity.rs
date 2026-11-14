@@ -148,9 +148,14 @@ pub enum EntityAction {
         id: NetId,
         parent: ParentRef,
     },
+    /// Server to every peer that knows `id`: its owner changed. WP19: with its full state at server
+    /// tick `tick` (as in `SetPhysics`; empty from a peer that has none): a new authority restarts the
+    /// receiver's sample buffers, and unchanged fields are not sent again.
     SetOwner {
         id: NetId,
         owner: PeerId,
+        tick: u64,
+        state: Vec<u8>,
     },
     /// WP7, client to server: the sender asks to own `id` (its transfer rule decides).
     RequestOwner {
@@ -177,11 +182,16 @@ pub enum EntityAction {
         granted: bool,
     },
     /// WP19 (wire format 6), server to every peer that knows `id`: its physics mode and its effective
-    /// `client_owned` flag changed.
+    /// `client_owned` flag changed. `state` is the entity's full state at server tick `tick` (as a
+    /// `Create` carries it, `audience: owner` fields for the owner only): the change resets the
+    /// receiver's sample buffers, and the server sends a field again only when it changes, so the new
+    /// pipeline (interpolation, body prediction, a `simulated` corrector) starts from these values.
     SetPhysics {
         id: NetId,
         physics: crate::correct::PhysicsMode,
         client_owned: bool,
+        tick: u64,
+        state: Vec<u8>,
     },
     /// WP13/WP16, server to a client: `room`, a level, joined the client's set of rooms: load
     /// `scene_path` (under the game's World node, its root at `origin`, else where it was authored)

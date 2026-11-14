@@ -1518,7 +1518,12 @@ impl Session {
         // WP7: the server's gdnet hears of every change too (owner_changed fires on every peer).
         self.entity_events
             .push_back(EntityEvent::SetOwner { id, manager, owner });
-        self.share_known(EntityAction::SetOwner { id, owner }, id, None, now_us);
+        self.share_with_state(id, now_us, |tick, state| EntityAction::SetOwner {
+            id,
+            owner,
+            tick,
+            state,
+        });
         // WP13: an entity its owner holds is always in that owner's scope.
         if refresh {
             for p in [old, owner] {
@@ -1796,13 +1801,22 @@ impl Session {
                     }
                 }
             }
-            EntityAction::SetOwner { id, owner } => {
+            EntityAction::SetOwner {
+                id,
+                owner,
+                tick,
+                state,
+            } => {
                 let manager = self.entities.get(id).map(|r| r.parent.manager);
                 if let Some(manager) = manager {
                     if self.entities.set_owner(id, owner) {
                         self.auth.stats.owner_changes += 1;
                         self.auth.last_sent.remove(&id);
                         self.auth.pending_writes.retain(|k| k.0 != id);
+                        // WP5: a new authority starts with fresh sample buffers (and no owned
+                        // offsets), refilled from the server's state at the change (WP19).
+                        self.interp.reset(id);
+                        self.inject_state(id, tick, &state);
                         self.entity_events
                             .push_back(EntityEvent::SetOwner { id, manager, owner });
                     }
@@ -1858,9 +1872,13 @@ impl Session {
                 id,
                 physics,
                 client_owned,
+                tick,
+                state,
             } => {
                 if self.role == Role::Client {
                     self.apply_physics(id, physics, client_owned);
+                    // The new pipeline starts from the server's full state (see the action).
+                    self.inject_state(id, tick, &state);
                 }
             }
         }
@@ -1886,17 +1904,60 @@ impl Session {
             return true;
         }
         self.apply_physics(id, physics, client_owned);
-        self.share_known(
-            EntityAction::SetPhysics {
-                id,
-                physics,
-                client_owned,
-            },
+        self.share_with_state(id, now_us, |tick, state| EntityAction::SetPhysics {
             id,
-            None,
-            now_us,
-        );
+            physics,
+            client_owned,
+            tick,
+            state,
+        });
         true
+    }
+
+    /// WP19, server: sends the action `make(tick, state)` builds to every joined peer that knows `id`,
+    /// with the entity's full state now (each peer's audience: `audience: owner` fields for the owner
+    /// only), which that peer then holds. For a change that restarts the receivers' sample buffers.
+    fn share_with_state(
+        &mut self,
+        id: NetId,
+        now_us: u64,
+        make: impl Fn(u64, Vec<u8>) -> EntityAction,
+    ) {
+        let tick = self.clock.tick();
+        let owner = self.entities.get(id).map_or(SERVER, |r| r.owner);
+        let targets: Vec<PeerId> = self
+            .peers
+            .joined()
+            .into_iter()
+            .filter(|p| self.knows(*p, id))
+            .collect();
+        for peer in targets {
+            let state = if self.repl.entity(id).is_some() {
+                self.repl.encode_full_for(id, owner == peer)
+            } else {
+                Vec::new()
+            };
+            self.send_entity(peer, make(tick, state), now_us);
+            self.repl.mark_synced(peer, id, owner == peer);
+        }
+    }
+
+    /// WP19, client: the full state a `SetPhysics` or `SetOwner` carried joins the received updates
+    /// (after the buffers were reset), stamped with the server tick it was taken at.
+    fn inject_state(&mut self, id: NetId, tick: u64, state: &[u8]) {
+        let Some(scene) = self.entities.get(id).map(|r| r.scene) else {
+            return;
+        };
+        let values = self.repl.decode_state(scene, state).unwrap_or_default();
+        for (part, field, value) in values {
+            self.repl.inject(StateUpdate {
+                id,
+                part,
+                field,
+                value,
+                tick,
+            });
+        }
     }
 
     /// WP19: applies a physics change to the table and tells gdnet. A change of `client_owned` starts
@@ -4856,7 +4917,15 @@ mod tests {
         );
         // Child (and its destroy) before its parent, then an unrelated root entity.
         feed(&mut p, EntityAction::Create(create(11, under(10, 1))));
-        feed(&mut p, EntityAction::SetOwner { id: 11, owner: 5 });
+        feed(
+            &mut p,
+            EntityAction::SetOwner {
+                id: 11,
+                owner: 5,
+                tick: 0,
+                state: std::vec![],
+            },
+        );
         feed(&mut p, EntityAction::Create(create(20, root(1))));
         assert_eq!(created_ids(&entity_events(&mut p.client)), std::vec![20]);
         assert_eq!(p.client.held_len(), 2);
@@ -5050,7 +5119,12 @@ mod tests {
             ..forged
         })));
         server.receive(2, &bytes, now);
-        bytes = wire::encode(&Message::Entity(EntityAction::SetOwner { id, owner: 2 }));
+        bytes = wire::encode(&Message::Entity(EntityAction::SetOwner {
+            id,
+            owner: 2,
+            tick: 0,
+            state: std::vec![],
+        }));
         server.receive(2, &bytes, now);
         assert_eq!(server.stats().entity_refused, 2);
         // The creator may destroy its own entity; the destroy is relayed.
@@ -5949,6 +6023,69 @@ mod tests {
             t.b.is_interpolated(id, 0, 0),
             "another client interpolates it"
         );
+    }
+
+    #[test]
+    fn a_physics_change_carries_the_full_state_so_the_new_pipeline_starts_from_it() {
+        use crate::correct::PhysicsMode;
+        let mut t = Trio::new();
+        let mut table = props();
+        table.parts[0][0].interpolate = true;
+        for s in [&mut t.server, &mut t.a, &mut t.b] {
+            s.register_props(SCENE, table.clone(), names());
+        }
+        // A simulated body whose values never change after the spawn (a body at constant velocity:
+        // the server never sends them again).
+        let id = t
+            .server
+            .spawn(
+                SCENE,
+                Spawn::new(root(1), "Puck", 2, 3, std::vec![])
+                    .with_values(state(4.0))
+                    .with_physics(PhysicsMode::Simulated),
+                t.now,
+            )
+            .unwrap();
+        t.steps(3);
+        for s in [&mut t.a, &mut t.b] {
+            s.drain_state_updates();
+            assert!(
+                s.interp().track((id, 0, 0)).is_none(),
+                "simulated: not interpolated"
+            );
+        }
+        assert!(t.server.set_physics(id, PhysicsMode::Server, false, t.now));
+        let at = t.server.current_tick();
+        t.steps(2);
+        for s in [&mut t.a, &mut t.b] {
+            s.drain_state_updates();
+            let newest = s
+                .interp()
+                .track((id, 0, 0))
+                .and_then(|tr| tr.newest())
+                .map(|(tick, v)| (tick, v.clone()));
+            assert_eq!(
+                newest,
+                Some((at, Value::Vector2([4.0, 1.0]))),
+                "the interpolation starts from the server's state at the change"
+            );
+        }
+        // To `owner` for a: a sends its own state from now on; b starts from the server's.
+        assert!(t.server.set_physics(id, PhysicsMode::Owner, true, t.now));
+        t.steps(2);
+        t.a.drain_state_updates();
+        t.b.drain_state_updates();
+        assert!(t.a.owns_state(id));
+        assert!(
+            t.a.interp().track((id, 0, 0)).is_none(),
+            "the owner does not interpolate it"
+        );
+        assert!(t
+            .b
+            .interp()
+            .track((id, 0, 0))
+            .and_then(|tr| tr.newest())
+            .is_some());
     }
 
     #[test]

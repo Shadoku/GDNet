@@ -14,11 +14,14 @@ sent in snapshots whenever their quantised value changes, and interpolated on cl
 the body and simulates it with Godot's physics; there is no client-side simulation and no rollback of
 bodies (the plan rules it out: Godot physics is not deterministic).
 
-On every peer that is neither the server nor the owner the body is a **replica**: gdnet sets `freeze =
-true` once, when the replica is created, and turns off physics processing of its parts (page 4). A frozen
-body in the default `FREEZE_MODE_STATIC` is a static collider: other bodies collide with it, it never
-moves by itself, and the interpolated snapshots move it. Its scripts' `_process` still runs (visual code
-keeps working).
+On every peer that does not simulate the body (with the default `physics = server`: every client) the
+body is a **replica**: gdnet sets `freeze = true` when the replica is created, and again whenever an owner
+or mode change moves the simulation away (see "Physics modes" below), and turns off physics processing of
+its parts (page 4). A frozen body in the default `FREEZE_MODE_STATIC` is a static collider: other bodies
+collide with it, it never moves by itself, and the interpolated snapshots move it. Its scripts' `_process`
+still runs (visual code keeps working). On the peer that simulates the body gdnet leaves its `freeze` as
+the game set it: a body the scene or a script froze waits there, as in single-player, until the game sets
+`freeze = false` (a ball held in the air until it is thrown); only a change of who simulates thaws it.
 
 ### What the local player can and cannot push
 
@@ -59,6 +62,17 @@ otherwise; `custom` on a body without the hook means `dead_reckoning`. Changes a
 `Net.body_prediction_of(node)` returns the effective choice (`NetEntity.BODY_PREDICTION_INTERPOLATE`,
 `_DEAD_RECKONING`, `_CUSTOM`), and the overlay labels a predicted body with its mode.
 
+It applies only where the body is a frozen replica, which depends on its physics mode (below): with
+`server`, on every client; with `owner`, on every client but the owner (the server applies the owner's
+states as they arrive and predicts nothing); with `simulated`, nowhere (every peer runs the body, and the
+snapshots correct it instead). Where the peer simulates the body itself, `Net.body_prediction_of` returns
+`NetEntity.BODY_PREDICTION_NONE` and the overlay shows no mode. A mode or owner change moves a body into
+or out of prediction at once: the change carries the entity's full state, so the new role starts from the
+server's values even for fields that do not change (a body at constant velocity), and a moving body
+does not jump (measured at 150 px/s over a 100 ms link: no frame moved by more than its travel plus
+1.6 px, except the entry into `simulated`, where the body slides to the client's predicted present,
+first by 15% of that gap: 5 px).
+
 ```gdscript
 # A thrown grenade: shown where it is, not where it was.
 Net.configure($Grenade, {"body_prediction": "dead_reckoning"})
@@ -88,11 +102,11 @@ collider is (`tests/integration/test_net_body_prediction*.gd`).
 **What it cannot know.** Dead reckoning knows nothing of a collision the server has not reported yet: a
 ball predicted towards a wall passes into it until the snapshot of the bounce arrives, then bends back.
 Each new snapshot is compared with what the prediction showed; the difference becomes an offset that
-decays by `gdnet/physics/correction_decay` (0.85) per 60 Hz frame, so the body bends back instead of
+decays by `gdnet/physics/correction_decay` per 60 Hz frame, so the body bends back instead of
 jumping, and snaps beyond the property's `teleport_distance` (page 5). Differences above
-`gdnet/physics/correction_position` (0.02 m: 2 px in 2D) or `correction_angle` (3 degrees), the same
-settings `simulated` corrections use, count as
-corrections in `stats()`. Measured: a ball hitting the floor at 775 px/s passed it by about 64 px (less
+`gdnet/physics/correction_position` or `correction_angle` count as corrections in `stats()`. These three
+settings are shared with `simulated` corrections and read the same way: see "Correction settings" at the
+end of "Physics modes". Measured: a ball hitting the floor at 775 px/s passed it by about 64 px (less
 than speed times the 250 ms cap, 194 px) and its largest step in a frame was 6 px. A body that starts
 moving jumps ahead once by its velocity times the horizon (the interpolated pose was only late); one
 whose mode changes while it moves blends over.
@@ -118,8 +132,9 @@ the fraction's call is not kept.
 **Choosing.** Keep `interpolate` for piles and anything that collides all the time: dead reckoning
 overshoots at every contact (D27). Use `dead_reckoning` for thrown and flying things, and `custom` for
 bodies with their own propulsion. A `simulated` physics mode (WP19) runs real local physics instead, and
-ignores `body_prediction`. `stats()` reports `predicted_bodies`, `prediction_corrections(_per_s)` and
-`prediction_horizon_ms`.
+ignores `body_prediction`. `stats()` reports `predicted_bodies` (moving bodies predicted in the last
+frame), `prediction_replicas` (the frozen body replicas body prediction may show),
+`prediction_corrections(_per_s)` and `prediction_horizon_ms`.
 
 **Moving a frozen body every frame.** Replicas use Godot's default `FREEZE_MODE_STATIC`: setting the
 position teleports the collider (it is not swept), and the physics server wakes the bodies it touches,
@@ -150,6 +165,14 @@ moves the simulation: the old owner's copy freezes, the new owner's thaws with t
 showing. When a seat drops (page 13), its bodies freeze in place on the server until it rejoins or its
 seat is released. The overlay names the peer simulating an `owner` body (`owner-sim <peer>`).
 
+The other clients see an `owner` body through the server: the server applies the owner's states as they
+arrive, and relays them in its snapshots. With `body_prediction = dead_reckoning` on another client the
+body is shown at the server's present, like a `server` body: measured over 100 ms links, a coasting
+vehicle within 1.4 ticks of the server's copy (9.5 ms on average), and behind its owner's own present by
+half the owner's round trip plus a few ticks (68 to 92 ms; the bound is 50 ms plus three ticks). Dead
+reckoning does not know the owner's input: while the owner drives, the other client trails the server's
+copy by about 50 ms (a `custom` hook can model the thrust, as in the `custom` example above).
+
 **`simulated`.** The client's body runs in the client's *predicted* timeline, the moment its own
 predicted player is at, so a player and the bodies it touches meet where they are: a player pushing a
 crate moves it in the tick of contact, and a player riding a platform rides the live platform. Each
@@ -162,9 +185,11 @@ the bodies are not stepped (Godot cannot step physics on demand): each replayed 
 were recorded at that tick, and the present comes back afterwards, so a replayed push does not count
 twice. The server never corrects its own bodies, and snapshots cost the same in every mode.
 
-Tuning, read at each use: `gdnet/physics/correction_position` (metres, default 0.02; 2 px in 2D at 100
-px per metre), `gdnet/physics/correction_angle` (degrees, default 3), `gdnet/physics/correction_decay`
-(the share of a correction left after one 60 Hz tick, default 0.85) and
+**Correction settings**, shared by `simulated` corrections and body prediction (one reader, so both read
+them the same way), read at each use: `gdnet/physics/correction_position` (metres, default 0.02; 2 px in 2D
+at 100 px per metre, 2 cm in 3D), `gdnet/physics/correction_angle` (degrees, default 3),
+`gdnet/physics/correction_decay` (the share of a correction left after one 60 Hz tick, default 0.85) and, for
+`simulated` only,
 `gdnet/physics/correction_rest_speed` (metres per second, default 0.15: a server sample slower than this
 counts as at rest; keep it above Godot's sleep threshold). `NetSession.stats()` reports
 `sim_corrections` (and `_per_s`), `sim_snaps`, `sim_correcting` and `sim_bodies` on a client.

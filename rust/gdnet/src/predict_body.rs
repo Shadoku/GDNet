@@ -10,8 +10,11 @@
 //!
 //! **Which bodies.** An entity whose root is a `RigidBody2D/3D` and that this client shows as a frozen
 //! replica: [`shown_frozen`] is the one predicate (today: netcore interpolates its `position`, i.e. it
-//! is a replica this peer neither owns nor predicts; WP19 slice A's `simulated` mode extends it).
-//! Replicas register when their `Create` is applied (`NetManager`, next to `freeze_bodies`).
+//! is a replica this peer neither owns nor predicts, and not a `simulated` one, which netcore never
+//! interpolates). The registry follows the physics modes (modes.rs `apply_body_role`): a replica
+//! registers when its bodies are frozen on this client (at its `Create`, or when an owner or mode change
+//! freezes them) and unregisters when this client starts simulating it (its own `owner` body, a
+//! `simulated` one) or it is destroyed.
 //!
 //! **Resolution** ([`resolve`]): the entity's own setting (`Net.configure(node, {"body_prediction":
 //! ...})`, else its `NetEntity.body_prediction`), else `custom` when the root's script defines
@@ -78,12 +81,13 @@
 //! out for a supported body).
 //!
 //! **Settings** (read when used): `gdnet/physics/body_prediction` (`interpolate`), `predict_max_ms`
-//! (250), `correction_position` (metres, 0.02: 2 px in 2D at 100 px per metre), `correction_angle` (3
-//! degrees), `correction_decay` (0.85 per 60 Hz frame). The teleport thresholds are the position and
-//! rotation fields' interpolation ones (`teleport_distance`, WP5). The three `correction_*` names are
-//! shared with `simulated` corrections (modes.rs `tuning`), with the same units and defaults.
+//! (250), and the three settings shared with `simulated` corrections, read by one reader (modes.rs
+//! `tuning`, [`correction_settings`]): `correction_position` (metres, 0.02: 2 px in 2D at 100 px per
+//! metre), `correction_angle` (3 degrees), `correction_decay` (0.85 per 60 Hz frame). The teleport
+//! thresholds are the position and rotation fields' interpolation ones (`teleport_distance`, WP5).
 //!
-//! **Stats**: `predicted_bodies` (moving bodies predicted in the last frame), `prediction_corrections`
+//! **Stats**: `predicted_bodies` (moving bodies predicted in the last frame), `prediction_replicas`
+//! (the frozen body replicas registered, predicted or not), `prediction_corrections`
 //! and `prediction_corrections_per_s` (snapshots that disagreed beyond the thresholds),
 //! `prediction_horizon_ms` (the mean horizon over the last frame's predicted bodies).
 
@@ -103,16 +107,7 @@ use std::collections::HashMap;
 
 pub const SETTING_MODE: &str = "gdnet/physics/body_prediction";
 pub const SETTING_MAX_MS: &str = "gdnet/physics/predict_max_ms";
-pub const SETTING_CORRECTION_POSITION: &str = "gdnet/physics/correction_position";
-pub const SETTING_CORRECTION_ANGLE: &str = "gdnet/physics/correction_angle";
-pub const SETTING_CORRECTION_DECAY: &str = "gdnet/physics/correction_decay";
 pub const DEFAULT_MAX_MS: f64 = 250.0;
-/// Metres (2D reads it at 100 px per metre).
-pub const DEFAULT_CORRECTION_POSITION: f64 = 0.02;
-/// Degrees.
-pub const DEFAULT_CORRECTION_ANGLE: f64 = 3.0;
-/// Per 60 Hz frame.
-pub const DEFAULT_CORRECTION_DECAY: f64 = 0.85;
 /// The root meta `Net.configure(node, {"body_prediction": ...})` stores.
 pub const META_BODY_PREDICTION: &str = "_net_body_prediction";
 /// The hook a body script may define.
@@ -213,16 +208,17 @@ pub fn predict_max_ms() -> f64 {
     number_setting(SETTING_MAX_MS, DEFAULT_MAX_MS).max(0.0)
 }
 
-/// `gdnet/physics/correction_position` (metres, default 0.02; returned in pixels at 100 px per metre,
-/// which 3D reads back as metres), `correction_angle` (default 3 degrees, returned in radians), `correction_decay` (default 0.85 per 60 Hz frame).
-pub fn correction_settings() -> (f64, f64, f64) {
-    (
-        number_setting(SETTING_CORRECTION_POSITION, DEFAULT_CORRECTION_POSITION).max(0.0) * 100.0,
-        number_setting(SETTING_CORRECTION_ANGLE, DEFAULT_CORRECTION_ANGLE)
-            .max(0.0)
-            .to_radians(),
-        number_setting(SETTING_CORRECTION_DECAY, DEFAULT_CORRECTION_DECAY).clamp(0.0, 1.0),
-    )
+/// The shared correction settings, read as `simulated` corrections read them (modes.rs `tuning`, one
+/// reader): (`correction_position` in the body's length unit, i.e. metres times 100 in 2D and metres in
+/// 3D; `correction_angle` in radians; `correction_decay` per 60 Hz frame).
+pub fn correction_settings(three_d: bool) -> (f64, f64, f64) {
+    let scale = if three_d {
+        1.0
+    } else {
+        netcore::interp::PIXELS_PER_METRE
+    };
+    let t = crate::manager::modes::tuning(scale);
+    (t.position, t.angle, t.decay)
 }
 
 /// `Net.configure(node, {"body_prediction": value})` on the entity root `root`.
@@ -274,8 +270,9 @@ pub fn resolve(node: &Gd<Node>) -> BodyPrediction {
     }
 }
 
-/// Whether this client shows entity `id` as a frozen replica gdnet moves (WP19 slice A extends this:
-/// a `simulated` replica is a live body and is not predicted).
+/// Whether this client shows entity `id` as a frozen replica gdnet moves: netcore interpolates its
+/// position, so it is neither owned (an `owner` body's owner simulates it), nor predicted (WP4), nor
+/// `simulated` (a live body the snapshots correct, modes.rs).
 pub fn shown_frozen(core: &netcore::Session, id: NetId, position_field: u16) -> bool {
     core.is_interpolated(id, 0, position_field)
 }
@@ -616,6 +613,18 @@ impl Bodies {
         self.unresolved = true;
     }
 
+    /// The entity stopped being a frozen replica here (its owner or mode changed and this peer
+    /// simulates it now, or it was destroyed): it is neither predicted nor listed any more.
+    pub fn unregister(&mut self, id: NetId) {
+        self.reg.remove(&id);
+        self.active.remove(&id);
+        self.pending.retain(|p| *p != id);
+        self.any_predicted = self
+            .reg
+            .values()
+            .any(|r| r.mode != BodyPrediction::Interpolate);
+    }
+
     /// The effective mode of a registered entity (overlay rows), None when it is not a registered body.
     pub fn mode_of(&self, id: NetId) -> Option<BodyPrediction> {
         self.reg.get(&id).map(|r| r.mode)
@@ -624,6 +633,14 @@ impl Bodies {
     /// `stats()` keys.
     pub fn stats_into(&self, d: &mut VarDictionary) {
         d.set("predicted_bodies", self.predicted_last as i64);
+        // The frozen body replicas registered (the ones body prediction may show).
+        d.set(
+            "prediction_replicas",
+            self.reg
+                .values()
+                .filter(|r| r.root.is_instance_valid())
+                .count() as i64,
+        );
         d.set("prediction_corrections", self.corrections as i64);
         d.set(
             "prediction_corrections_per_s",
@@ -656,6 +673,17 @@ impl NetSession {
     /// interpolation sampled this frame; the predicted bodies' pose fields are taken out of it.
     pub(crate) fn predict_bodies(&mut self, values: &mut Vec<((NetId, u16, u16), Value)>) {
         if self.bodies.reg.is_empty() {
+            // The last registered body left (destroyed, or this peer simulates it now): nothing is
+            // predicted any more, and interpolation stops recording arrivals for it.
+            if self.bodies.predicted_last != 0 || self.bodies.any_predicted {
+                self.bodies.predicted_last = 0;
+                self.bodies.horizon_ms_last = 0.0;
+                self.bodies.any_predicted = false;
+                self.bodies.active.clear();
+                if let Some(core) = self.core.as_mut() {
+                    core.interp_mut().set_watch(false);
+                }
+            }
             return;
         }
         let now = Time::singleton().get_ticks_usec();
@@ -821,7 +849,7 @@ impl NetSession {
             return;
         };
         let cap = predict_max_ms() / 1000.0 * rate;
-        let (corr_pos, corr_angle, decay) = correction_settings();
+        let corr = [correction_settings(false), correction_settings(true)];
         // Hooks may call back into gdnet: run with the session's base guard, the bodies taken out.
         let mut bodies = std::mem::take(&mut self.bodies);
         let mut horizon_sum = 0.0;
@@ -836,10 +864,10 @@ impl NetSession {
                 let Some(act) = bodies.active.get_mut(&g.id) else {
                     continue;
                 };
-                let scale = if r.three_d { 0.01 } else { 1.0 };
+                let (position, angle, decay) = corr[usize::from(r.three_d)];
                 let th = Thresholds {
-                    position: corr_pos * scale,
-                    angle: corr_angle,
+                    position,
+                    angle,
                     teleport: g.teleport,
                     teleport_angle: g.teleport_angle,
                     decay,
@@ -1010,9 +1038,16 @@ impl Net {
     /// WP19: the effective `body_prediction` of the entity `node` belongs to on this peer:
     /// `NetEntity.BODY_PREDICTION_INTERPOLATE`, `_DEAD_RECKONING` or `_CUSTOM` (the entity's setting or
     /// `configure()`, else custom when its script defines `_net_predict_body`, else the manager's, else
-    /// `gdnet/physics/body_prediction`). Only frozen body replicas on a client are predicted.
+    /// `gdnet/physics/body_prediction`). Only frozen body replicas on a client are shown that way: for a
+    /// spawned body entity this peer does not show as one (the server's copies, the owner's own `owner`
+    /// body, every `simulated` replica, a body WP4 predicts) it is `NetEntity.BODY_PREDICTION_NONE`.
     #[func]
     fn body_prediction_of(&self, node: Gd<Node>) -> i64 {
+        if let Some((root, m)) = entity_root_of(&node) {
+            if m.bind().shows_frozen_body(root.instance_id()) == Some(false) {
+                return crate::entity_node::NetEntity::BODY_PREDICTION_NONE;
+            }
+        }
         resolve(&node) as i64
     }
 }

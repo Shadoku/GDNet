@@ -18,7 +18,9 @@
 //! owns; on a client a `client_owned` one it owns, and every `simulated` one. The others are frozen.
 //! The decision is re-applied every tick (`gate_and_track`), so an owner change or a mode change moves
 //! the simulation; a body that thaws gets its velocities back (Godot drops them while it is frozen) and
-//! is woken.
+//! is woken. The first decision on the peer whose game made the node (every entity on the server, a
+//! client's own spawns) never thaws: a body the scene or a script froze stays frozen until the game
+//! unfreezes it, as in single-player (WP19 slice B's thrown balls wait frozen in the air).
 //!
 //! **`simulated`** (client): each live replica has a [`Corrector`] (netcore `correct`). The snapshot
 //! values of its body part's `position`, `rotation` / `quaternion`, `linear_velocity` and
@@ -195,7 +197,8 @@ pub(super) fn body_live(
 }
 
 /// Freezes or thaws the RigidBody parts. A thawed body gets back the velocities its properties hold
-/// (the last replicated or simulated ones) and is woken. The caller holds its base guard.
+/// (the last replicated or simulated ones) and is woken; a frozen 2D body's collider follows its
+/// properties again (see below). The caller holds its base guard.
 fn set_bodies_live(nodes: &[Option<Gd<Node>>], live: bool) {
     for n in nodes.iter().flatten() {
         if !n.is_instance_valid() {
@@ -210,6 +213,12 @@ fn set_bodies_live(nodes: &[Option<Gd<Node>>], live: bool) {
                 b.set_sleeping(false);
             } else if !live && !b.is_freeze_enabled() {
                 b.set_freeze_enabled(true);
+                // Godot 4.6: once a `RigidBody2D` that simulated is frozen, writes to its local
+                // `position` / `rotation` no longer reach the physics server (its collider stays where
+                // it froze, and a later thaw jumps back there) until its global transform is set once.
+                // Interpolation, body prediction and applied owner states write the local properties.
+                let t = b.get_global_transform();
+                b.set_global_transform(t);
             }
         } else if let Ok(mut b) = n.clone().try_cast::<RigidBody3D>() {
             if live && b.is_freeze_enabled() {
@@ -459,8 +468,16 @@ impl NetManager {
         }
     }
 
-    /// Any peer: a `SetPhysics` (the server's own included).
-    pub(super) fn on_set_physics(&mut self, iid: InstanceId, mode: Mode, client_owned: bool) {
+    /// Any peer: a `SetPhysics` (the server's own included). The bodies take their new role at once,
+    /// before the state the change carries is applied, so a `simulated` replica's corrector receives it
+    /// (written to the node, it would put the body back at the server's past).
+    pub(super) fn on_set_physics(
+        &mut self,
+        iid: InstanceId,
+        mode: Mode,
+        client_owned: bool,
+        session: &Gd<NetSession>,
+    ) {
         let Some(e) = self.entries.get_mut(&iid) else {
             return;
         };
@@ -479,11 +496,14 @@ impl NetManager {
         }
         // WP18: a mode change is polled at once (and a client-simulated body is never idle).
         self.owner_moved(iid);
+        self.apply_body_role(iid, session);
     }
 
     /// Freezes or thaws the entity's bodies when who simulates them changed. Called each tick from
-    /// `gate_and_track` and when a replica is created.
-    pub(super) fn apply_body_role(&mut self, iid: InstanceId) {
+    /// `gate_and_track` and when a replica is created. On a client it also keeps body prediction's
+    /// registry (`NetSession::bodies`, predict_body.rs) in step: a frozen replica is registered (it may
+    /// be predicted), a live body (its owner's, every `simulated` one) is not.
+    pub(super) fn apply_body_role(&mut self, iid: InstanceId, session: &Gd<NetSession>) {
         let (is_server, local) = (self.is_server, self.local_id);
         let Some(e) = self.entries.get_mut(&iid) else {
             return;
@@ -496,11 +516,16 @@ impl NetManager {
         if e.body_live == Some(live) {
             return;
         }
+        // The first decision on the peer whose game made the node (the server's entities, a client's
+        // own spawns) leaves a live body's `freeze` as the game set it: a body the scene or a script
+        // froze waits until the game thaws it, as in single-player. gdnet only thaws on a change of who
+        // simulates (an owner or mode change) and on a replica created from a `Create`.
+        let keep = e.body_live.is_none() && live && e.origin != Origin::Remote;
         e.body_live = Some(live);
         let nodes = e.nodes.clone();
         let id = e.id;
         let simulated = !is_server && live && e.physics == Mode::Simulated;
-        {
+        if !keep {
             let _guard = self.base_mut();
             set_bodies_live(&nodes, live);
         }
@@ -510,7 +535,27 @@ impl NetManager {
             } else {
                 self.sim.remove(&id);
             }
+            if !is_server {
+                let rt = self.entries.get(&iid).and_then(|e| e.props.clone());
+                let mut s = session.clone();
+                let mut s = s.bind_mut();
+                match (live, rt) {
+                    (false, Some(rt)) => s.bodies.register(id, &nodes, &rt),
+                    _ => s.bodies.unregister(id),
+                }
+            }
         }
+    }
+
+    /// Whether this peer shows the entity rooted at `iid` as a frozen body replica gdnet moves (body
+    /// prediction's domain): a client's replica whose bodies are frozen here. None when it is not a
+    /// spawned entity with a RigidBody part.
+    pub(crate) fn shows_frozen_body(&self, iid: InstanceId) -> Option<bool> {
+        let e = self.entries.get(&iid).filter(|e| e.id.is_some())?;
+        if e.has_body != Some(true) {
+            return None;
+        }
+        Some(!self.is_server && e.body_live == Some(false) && e.predicted.is_none())
     }
 
     /// Starts correcting a `simulated` replica: its first body part, the fields that carry its pose,

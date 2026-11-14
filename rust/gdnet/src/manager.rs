@@ -1004,18 +1004,9 @@ impl NetManager {
                         apply::write(&n, &f, &v);
                     }
                 }
-                // WP19: a replica's bodies are frozen unless this peer simulates them (modes.rs).
-                self.apply_body_role(iid);
-                if !self.is_server {
-                    // WP19: a body replica may be predicted (predict_body.rs).
-                    if let Some(rt) = &rt {
-                        session
-                            .clone()
-                            .bind_mut()
-                            .bodies
-                            .register(create.id, &nodes, rt);
-                    }
-                }
+                // WP19: a replica's bodies are frozen unless this peer simulates them (modes.rs); a
+                // frozen body replica may be predicted (predict_body.rs registers it there).
+                self.apply_body_role(iid, session);
                 if proposal {
                     let mut s = session.clone();
                     // WP16: the server's interest rules for a client's spawn, before it is shared.
@@ -1038,6 +1029,9 @@ impl NetManager {
                     return;
                 };
                 let scene = self.entries[&iid].scene.clone();
+                // WP19: body prediction and `simulated` corrections forget it.
+                session.clone().bind_mut().bodies.unregister(record.id);
+                self.sim.remove(&record.id);
                 self.forget(iid);
                 if let Ok(node) = Gd::<Node>::try_from_instance_id(iid) {
                     self.despawn_callbacks(&node, &scene);
@@ -1084,11 +1078,9 @@ impl NetManager {
                 let Some(iid) = self.by_id.get(&id).copied() else {
                     return;
                 };
-                // WP5 (and WP7's hook): a new authority starts with fresh interpolation buffers.
-                {
-                    let mut s = session.clone();
-                    s.bind_mut().with_core(|c, _| c.interp_reset(id));
-                }
+                // WP5 (and WP7's hook): a new authority starts with fresh interpolation buffers;
+                // netcore reset them when it applied the change and refilled them from the server's
+                // state at the change (WP19), before this event.
                 self.owned_shown.retain(|k, _| k.0 != id);
                 let mut old = owner;
                 if let Some(e) = self.entries.get_mut(&iid) {
@@ -1111,7 +1103,7 @@ impl NetManager {
                 ..
             } => {
                 if let Some(iid) = self.by_id.get(&id).copied() {
-                    self.on_set_physics(iid, physics, client_owned);
+                    self.on_set_physics(iid, physics, client_owned, session);
                 }
             }
             EntityEvent::OwnerQuery { id, requester, .. } => {
@@ -1764,7 +1756,7 @@ impl NetManager {
                 tick::check_global_input(&nodes);
             }
             // WP19: freeze or thaw its bodies when who simulates them changed.
-            self.apply_body_role(iid);
+            self.apply_body_role(iid, session);
         }
     }
 

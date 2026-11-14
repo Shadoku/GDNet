@@ -723,6 +723,17 @@ mod session_tests {
                     Ok(Message::Field(f)) => {
                         out.insert((f.id, f.part, f.field));
                     }
+                    // WP19: an owner or physics change carries the full state.
+                    Ok(Message::Entity(
+                        EntityAction::SetOwner { id, state, .. }
+                        | EntityAction::SetPhysics { id, state, .. },
+                    )) => {
+                        let scene = self.server.entities().get(id).map(|r| r.scene);
+                        let decoded = scene.and_then(|sc| self.server.decode_state(sc, &state));
+                        for (p, f, _) in decoded.unwrap_or_default() {
+                            out.insert((id, p, f));
+                        }
+                    }
                     _ => {}
                 }
             }

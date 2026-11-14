@@ -924,6 +924,11 @@ impl Replication {
         self.rx.reliable_ticks.retain(|(i, _, _), _| *i != id);
     }
 
+    /// WP19: a state that arrived another way (a `SetPhysics`' full state) joins the received updates.
+    pub fn inject(&mut self, u: StateUpdate) {
+        self.updates.push_back(u);
+    }
+
     pub fn poll_update(&mut self) -> Option<StateUpdate> {
         self.updates.pop_front()
     }

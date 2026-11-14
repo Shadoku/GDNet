@@ -215,6 +215,11 @@ impl NetEntity {
     pub const BODY_PREDICTION_DEAD_RECKONING: i64 = 2;
     #[constant]
     pub const BODY_PREDICTION_CUSTOM: i64 = 3;
+    /// Only returned by `Net.body_prediction_of`: this peer does not show the body as a frozen
+    /// replica (it simulates it: the server's copies, the owner's `owner` body, every `simulated`
+    /// replica), so `body_prediction` does not apply here.
+    #[constant]
+    pub const BODY_PREDICTION_NONE: i64 = -1;
 
     #[func]
     pub fn get_body_prediction(&self) -> crate::predict_body::BodyPrediction {
