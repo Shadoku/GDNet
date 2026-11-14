@@ -447,8 +447,11 @@ func _spawn_many(scene: PackedScene, count: int, asleep: bool) -> Array[Node]:
 	return nodes
 
 
-## The average and the worst `poll_ms` over `ticks` server ticks, running `each_tick` before every one.
-func _poll_ms(ticks: int, each_tick: Callable = Callable()) -> Vector2:
+## The mean, the median and the worst `poll_ms` over `ticks` server ticks (x, y, z), running
+## `each_tick` before every one. The assertions use the median: one tick the scheduler stalled (35 ms,
+## seen while four test processes shared the CPU) moves the mean of a window this short past the limit
+## while saying nothing about the polling's cost.
+func _poll_ms(ticks: int, each_tick: Callable = Callable()) -> Vector3:
 	var samples: Array[float] = []
 	var sampler := func(_t: int) -> void:
 		samples.append(float(net.server_session.stats()["poll_ms"]))
@@ -464,7 +467,12 @@ func _poll_ms(ticks: int, each_tick: Callable = Callable()) -> Vector2:
 	for s in samples:
 		total += s
 		worst = maxf(worst, s)
-	return Vector2(total / samples.size(), worst)
+	var sorted := samples.duplicate()
+	sorted.sort()
+	var n := sorted.size()
+	@warning_ignore("integer_division")
+	var median: float = sorted[n / 2] if n % 2 == 1 else (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+	return Vector3(total / n, median, worst)
 
 
 ## The limit. The plan's target (12.5) is 0.5 ms per tick for 5,000 resting entities. Measured on this
@@ -473,14 +481,14 @@ func _poll_ms(ticks: int, each_tick: Callable = Callable()) -> Vector2:
 ## stage's four processes 0.31-0.42 ms. Nearly all of it is the resting polls themselves (a 24th of the
 ## entities each tick, about 1.5 microseconds apiece: the sleep and freeze flags and 3-6 property reads),
 ## so the cost follows `resting_poll_ticks` (printed at 6, the previous rate: 1.1-1.9 ms). The assertion
-## is 1.0 ms, more than twice the loaded figure and below what the previous rate costs, so it stays green
+## is 1.0 ms on the median tick, more than twice the loaded figure and below what the previous rate costs, so it stays green
 ## under load and fails if resting entities fall back to the cold rate; the figure itself is printed.
 const LIMIT_MS := 1.0
 
 
-## The average resting `poll_ms` at the current settings, over two resting periods, after one period in
-## which each entity's first resting poll records its values once.
-func _rest_ms() -> Vector2:
+## The resting `poll_ms` (mean, median, worst) at the current settings, over two resting periods, after
+## one period in which each entity's first resting poll records its values once.
+func _rest_ms() -> Vector3:
 	var period: int = net.server_session.stats()["resting_poll_ticks"]
 	await _frames(period + 1)
 	return await _poll_ms(2 * period)
@@ -506,9 +514,9 @@ func _bench_bodies(scene: PackedScene, label: String) -> void:
 	await _frames(3)
 	assert_eq(_stat(net.server_session, "hot_entities"), 5000, "every body woke")
 	var moving := await _poll_ms(12)
-	print("BENCHMARK: polling 5000 %s: resting %.3f ms per tick (worst %.3f; %.3f at resting_poll_ticks 6), moving %.3f ms (target %.1f ms)" % [label, rest.x, rest.y, rest6.x, moving.x, TARGET_MS])
-	assert_lt(rest.x, LIMIT_MS, "5,000 resting bodies poll in under %.2f ms per tick" % LIMIT_MS)
-	assert_lt(rest.x, rest6.x, "the resting rate costs less than polling them every cold_poll_ticks")
+	print("BENCHMARK: polling 5000 %s: resting %.3f ms per tick (median %.3f, worst %.3f; median %.3f at resting_poll_ticks 6), moving %.3f ms (target %.1f ms)" % [label, rest.x, rest.y, rest.z, rest6.y, moving.x, TARGET_MS])
+	assert_lt(rest.y, LIMIT_MS, "5,000 resting bodies poll in under %.2f ms per tick (median)" % LIMIT_MS)
+	assert_lt(rest.y, rest6.y, "the resting rate costs less than polling them every cold_poll_ticks (medians)")
 
 
 func test_benchmark_5000_resting_rigid_bodies_2d() -> void:
@@ -532,6 +540,6 @@ func test_benchmark_5000_idle_nodes() -> void:
 	var moving := await _poll_ms(12, func() -> void:
 		for n in nodes:
 			(n as Node2D).position.x += 1.0)
-	print("BENCHMARK: polling 5000 Node2D: idle %.3f ms per tick (worst %.3f; %.3f at resting_poll_ticks 6), moving %.3f ms (target %.1f ms)" % [rest.x, rest.y, rest6.x, moving.x, TARGET_MS])
-	assert_lt(rest.x, LIMIT_MS, "5,000 idle nodes poll in under %.2f ms per tick" % LIMIT_MS)
-	assert_lt(rest.x, rest6.x, "the resting rate costs less than polling them every cold_poll_ticks")
+	print("BENCHMARK: polling 5000 Node2D: idle %.3f ms per tick (median %.3f, worst %.3f; median %.3f at resting_poll_ticks 6), moving %.3f ms (target %.1f ms)" % [rest.x, rest.y, rest.z, rest6.y, moving.x, TARGET_MS])
+	assert_lt(rest.y, LIMIT_MS, "5,000 idle nodes poll in under %.2f ms per tick (median)" % LIMIT_MS)
+	assert_lt(rest.y, rest6.y, "the resting rate costs less than polling them every cold_poll_ticks (medians)")
