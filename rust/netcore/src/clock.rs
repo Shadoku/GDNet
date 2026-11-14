@@ -90,7 +90,12 @@ pub struct RttEstimator {
     srtt_us: Option<f64>,
     rttvar_us: f64,
     samples: u32,
+    /// WP19: the last [`RTT_WINDOW`] samples (a ring), for the lower envelope.
+    recent: [f64; RTT_WINDOW],
 }
+
+/// WP19: samples the lower envelope of the round trip is taken over (4 s at the default 4 pings/s).
+pub const RTT_WINDOW: usize = 16;
 
 impl RttEstimator {
     pub fn sample(&mut self, rtt_us: f64) {
@@ -105,7 +110,22 @@ impl RttEstimator {
                 self.srtt_us = Some(0.875 * s + 0.125 * r);
             }
         }
+        self.recent[self.samples as usize % RTT_WINDOW] = r;
         self.samples += 1;
+    }
+
+    /// WP19: the smallest of the last [`RTT_WINDOW`] samples in milliseconds (the round trip without
+    /// the queueing and frame waits that delayed the others; body prediction pairs it with the leading
+    /// edge of the snapshot arrivals), `None` before the first sample.
+    pub fn min_rtt_ms(&self) -> Option<f64> {
+        let n = (self.samples as usize).min(RTT_WINDOW);
+        (n > 0).then(|| {
+            self.recent[..n]
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min)
+                / 1000.0
+        })
     }
 
     /// Smoothed RTT in milliseconds, `None` before the first sample.
@@ -206,5 +226,21 @@ mod tests {
         assert!((r.rtt_ms().unwrap() - 100.0).abs() < 5.0);
         let j = r.jitter_ms().unwrap();
         assert!((15.0..=25.0).contains(&j), "{j}");
+    }
+
+    /// WP19: the lower envelope of the last samples.
+    #[test]
+    fn min_rtt_is_the_smallest_recent_sample() {
+        let mut r = RttEstimator::default();
+        assert_eq!(r.min_rtt_ms(), None);
+        r.sample(120_000.0);
+        r.sample(100_000.0);
+        r.sample(116_000.0);
+        assert_eq!(r.min_rtt_ms(), Some(100.0));
+        // A small sample ages out after RTT_WINDOW newer ones.
+        for _ in 0..RTT_WINDOW {
+            r.sample(110_000.0);
+        }
+        assert_eq!(r.min_rtt_ms(), Some(110.0));
     }
 }

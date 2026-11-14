@@ -102,11 +102,18 @@ impl NetOverlay {
                     .get("seat")
                     .and_then(|v| v.try_to::<i64>().ok())
                     .unwrap_or(0);
-                let text = if away {
+                let mut text = if away {
                     format!("#{id} seat {seat} away")
                 } else {
                     format!("#{id} owner {owner}")
                 };
+                // WP19: a body replica that is not interpolated says how it is predicted.
+                if let Some(mode) = d.get("body_prediction").map(|v| v.to_string()) {
+                    if !mode.is_empty() && mode != "interpolate" {
+                        text.push(' ');
+                        text.push_str(&mode);
+                    }
+                }
                 placed.push((pos, GString::from(text.as_str()), color));
             }
         }

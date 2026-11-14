@@ -46,7 +46,7 @@
 
 use crate::entity::NetId;
 use crate::props::{PropDesc, Quant, TypeTag, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::vec::Vec;
 
 /// The starting jitter buffer, in ticks (D8).
@@ -188,7 +188,7 @@ pub fn wrap_angle(x: f64) -> f64 {
     r
 }
 
-fn q_mul(a: &Comps, b: &Comps) -> Comps {
+pub(crate) fn q_mul(a: &Comps, b: &Comps) -> Comps {
     let (ax, ay, az, aw) = (a[0], a[1], a[2], a[3]);
     let (bx, by, bz, bw) = (b[0], b[1], b[2], b[3]);
     [
@@ -199,11 +199,11 @@ fn q_mul(a: &Comps, b: &Comps) -> Comps {
     ]
 }
 
-fn q_conj(a: &Comps) -> Comps {
+pub(crate) fn q_conj(a: &Comps) -> Comps {
     [-a[0], -a[1], -a[2], a[3]]
 }
 
-fn q_norm(a: &Comps) -> Comps {
+pub(crate) fn q_norm(a: &Comps) -> Comps {
     let n = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2] + a[3] * a[3]).sqrt();
     if n < 1e-12 {
         return IDENTITY;
@@ -214,7 +214,7 @@ fn q_norm(a: &Comps) -> Comps {
 const IDENTITY: Comps = [0.0, 0.0, 0.0, 1.0];
 
 /// Slerp from `a` to `b` along the shorter arc; `t` may exceed 1 (extrapolation).
-fn slerp(a: &Comps, b: &Comps, t: f64) -> Comps {
+pub(crate) fn slerp(a: &Comps, b: &Comps, t: f64) -> Comps {
     let a = q_norm(a);
     let mut b = q_norm(b);
     let mut dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
@@ -245,7 +245,7 @@ fn slerp(a: &Comps, b: &Comps, t: f64) -> Comps {
 }
 
 /// The rotation angle of a unit quaternion (0..PI).
-fn q_angle(q: &Comps) -> f64 {
+pub(crate) fn q_angle(q: &Comps) -> f64 {
     2.0 * q[3].abs().min(1.0).acos()
 }
 
@@ -455,6 +455,31 @@ impl Track {
 
     pub fn newest_tick(&self) -> Option<u64> {
         self.samples.back().map(|s| s.0)
+    }
+
+    /// WP19: the newest sample as received (no offset); None without one, or with only the seed (tick 0).
+    pub fn newest(&self) -> Option<(u64, &Value)> {
+        self.samples
+            .back()
+            .filter(|s| s.0 > 0)
+            .map(|(t, v)| (*t, v))
+    }
+
+    /// WP19: the sample before the newest one (its older samples may have been shifted by a correction;
+    /// a hold sample counts).
+    pub fn previous(&self) -> Option<(u64, &Value)> {
+        let n = self.samples.len();
+        (n >= 2)
+            .then(|| &self.samples[n - 2])
+            .filter(|s| s.0 > 0)
+            .map(|(t, v)| (*t, v))
+    }
+
+    /// WP19: drops the offset and the last output, so the next frame writes the plain sampled value
+    /// (a field gdnet showed itself goes back to interpolation).
+    pub fn settle(&mut self) {
+        self.offset = None;
+        self.last_out = None;
     }
 
     /// A known value with no tick (a replica's initial state): held until the first sample.
@@ -706,6 +731,12 @@ impl Timeline {
         }
     }
 
+    /// WP19: the server tick of a snapshot that would arrive at `now_us`, at the leading edge of the
+    /// arrivals (continuous; None before the first snapshot).
+    pub fn leading_edge(&self, now_us: u64) -> Option<f64> {
+        self.offset.map(|o| self.local(now_us) + o)
+    }
+
     fn local(&self, now_us: u64) -> f64 {
         now_us as f64 / self.tick_us
     }
@@ -819,6 +850,9 @@ pub struct Interp {
     max_gap: u64,
     default_teleport: f64,
     last_frame: Option<u64>,
+    /// WP19: entities that received a sample since the last `take_fresh`, while `watch` is on.
+    watch: bool,
+    fresh: BTreeSet<NetId>,
 }
 
 impl Interp {
@@ -831,6 +865,29 @@ impl Interp {
             max_gap: max_gap(tick_rate),
             default_teleport: 0.0,
             last_frame: None,
+            watch: false,
+            fresh: BTreeSet::new(),
+        }
+    }
+
+    /// WP19: whether `push` records the entities that received samples (body prediction watches for
+    /// moving bodies this way; off, it costs nothing).
+    pub fn set_watch(&mut self, on: bool) {
+        self.watch = on;
+        if !on {
+            self.fresh.clear();
+        }
+    }
+
+    /// WP19: the entities that received a sample since the last call (while watching).
+    pub fn take_fresh(&mut self) -> BTreeSet<NetId> {
+        std::mem::take(&mut self.fresh)
+    }
+
+    /// WP19: drops the offsets and last outputs of entity `id`'s tracks (see [`Track::settle`]).
+    pub fn settle(&mut self, id: NetId) {
+        for (_, t) in self.tracks.range_mut((id, 0, 0)..=(id, u16::MAX, u16::MAX)) {
+            t.settle();
         }
     }
 
@@ -854,6 +911,9 @@ impl Interp {
     /// A received value of an interpolated field of a replica.
     pub fn push(&mut self, key: FieldKey, desc: &PropDesc, tick: u64, value: Value) -> Pushed {
         let (id, _, _) = key;
+        if self.watch {
+            self.fresh.insert(id);
+        }
         let seen = {
             let e = self.seen.entry(id).or_insert((0, 0));
             if tick > e.0 {
@@ -1444,5 +1504,44 @@ mod tests {
         assert!(i.frame(now).is_empty(), "nothing changed");
         i.reset(9);
         assert_eq!(i.track_count(), 0);
+    }
+
+    /// WP19: body prediction's view of the buffers: the newest raw sample (not the seed), the one before,
+    /// the entities that got samples while watching, settling a track, the leading edge.
+    #[test]
+    fn newest_samples_fresh_entities_and_settling() {
+        let d = pos2();
+        let mut i = Interp::new(60);
+        i.seed((7, 0, 0), &d, Value::Vector2([1.0, 1.0]));
+        assert!(
+            i.track((7, 0, 0)).unwrap().newest().is_none(),
+            "the seed is no sample"
+        );
+        i.push((7, 0, 0), &d, 10, Value::Vector2([0.0, 0.0]));
+        assert!(i.take_fresh().is_empty(), "not watching: nothing recorded");
+        i.set_watch(true);
+        i.push((7, 0, 0), &d, 11, Value::Vector2([2.0, 0.0]));
+        i.push((8, 0, 0), &d, 11, Value::Vector2([2.0, 0.0]));
+        let fresh: Vec<_> = i.take_fresh().into_iter().collect();
+        assert_eq!(fresh, vec![7, 8]);
+        assert!(i.take_fresh().is_empty());
+        let t = i.track((7, 0, 0)).unwrap();
+        assert_eq!(t.newest().map(|(k, v)| (k, v2(v))), Some((11, [2.0, 0.0])));
+        assert_eq!(t.previous().map(|(k, _)| k), Some(10));
+        // A jump starts an offset; settling drops it and the last output, so the value is written again.
+        i.push((7, 0, 0), &d, 12, Value::Vector2([60.0, 0.0]));
+        assert!(i.track((7, 0, 0)).unwrap().offset().is_some());
+        i.timeline.on_snapshot(12, 1_000_000);
+        let _ = i.frame(1_000_000);
+        i.settle(7);
+        assert!(i.track((7, 0, 0)).unwrap().offset().is_none());
+        let out = i.frame(1_000_000);
+        assert!(
+            out.iter().any(|(k, _)| *k == (7, 0, 0)),
+            "written again after settling"
+        );
+        // The leading edge: the arrival offset carried forward by the clock (60 Hz: 16,667 us a tick).
+        let e = i.timeline.leading_edge(1_000_000 + 50_000).unwrap();
+        assert!((e - 15.0).abs() < 1e-6, "{e}");
     }
 }

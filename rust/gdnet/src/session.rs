@@ -194,6 +194,8 @@ pub struct NetSession {
     pub(crate) rejoin_timeout_s: f64,
     /// WP17, server: restored level entities waiting for their owner's seat to be connected.
     pub(crate) seat_claims: Vec<(u32, Gd<Node>)>,
+    /// WP19, client: body replicas and their prediction (predict_body.rs).
+    pub(crate) bodies: crate::predict_body::Bodies,
 }
 
 /// WP8: the group every session joins (the overlay and the meter find sessions through it).
@@ -989,6 +991,7 @@ impl NetSession {
         d.set("offset_corrections", i.corrections as i64);
         d.set("offset_corrections_per_s", c.corrections_per_s as i64);
         d.set("interp_teleports", i.teleports as i64);
+        self.bodies.stats_into(&mut d);
         let cs = self
             .core
             .as_ref()
@@ -1129,6 +1132,11 @@ impl NetSession {
                 let away = seat != 0 && self.core.as_ref().is_some_and(|c| c.peer_of(seat) == 0);
                 d.set("seat", i64::from(seat));
                 d.set("away", away);
+                // WP19: a body replica's prediction mode on this client ("" for anything else).
+                d.set(
+                    "body_prediction",
+                    self.bodies.mode_of(e.id).map_or("", |m| m.name()),
+                );
                 out.push(&d.to_variant());
             }
         }
@@ -2521,6 +2529,7 @@ impl NetSession {
             peer.close();
         }
         self.inbox.clear();
+        self.bodies = Default::default();
         self.applied = None;
         self.base_mut().set_physics_process(false);
         self.base_mut().set_process(false);
@@ -2540,6 +2549,8 @@ impl NetSession {
             let values = core.interp_frame(now_us());
             (values, core.owned_offset_keys())
         };
+        let mut values = values;
+        self.predict_bodies(&mut values);
         if values.is_empty() && owned.is_empty() && !self.owned_active {
             return;
         }

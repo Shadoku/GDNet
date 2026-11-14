@@ -41,6 +41,7 @@ pub mod predict;
 pub mod priority;
 pub mod props;
 pub mod quant;
+pub mod reckon;
 pub mod rooms;
 pub mod savestate;
 pub mod seats;

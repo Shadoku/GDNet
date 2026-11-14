@@ -10,7 +10,8 @@
 //! Keys: `state: ["+prop", "-prop", "+Part:prop"]`, `quantize: {prop: "cm"}`, `send: {prop: "hot"}`,
 //! `tolerance: float | {prop: float}`, `interpolate: bool | {prop: bool}`, WP5 `teleport_distance: float |
 //! {prop: float}`, WP16 `audience: {prop: "owner" | "all"}` (table changes); `priority`, WP16 `radius`
-//! and `visible_to` (per entity, any time: interest.rs); anything else (`lag_compensated`, ...) is
+//! and `visible_to` (per entity, any time: interest.rs), WP19 `body_prediction` (per entity, this peer's
+//! display choice, any time: predict_body.rs); anything else (`lag_compensated`, ...) is
 //! kept for later packages in the root's `_net_config` meta.
 
 use netcore::{Quant, Schedule};

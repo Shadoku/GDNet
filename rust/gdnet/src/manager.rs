@@ -285,6 +285,12 @@ pub struct NetManager {
     /// `gdnet/levels/keep_state` (default true); `on`; `off` (fresh at every load, e.g. an arena).
     #[export]
     keep_state: KeepState,
+    /// WP19 (12.4): the default `body_prediction` of this manager's body replicas on a client
+    /// (`default`: the project setting `gdnet/physics/body_prediction`); an entity's own setting or a
+    /// `_net_predict_body` hook wins.
+    #[export]
+    #[var(get = get_body_prediction, set = set_body_prediction)]
+    body_prediction: crate::predict_body::BodyPrediction,
     /// WP16, server: the addresses of this level's own entities (see `Entry::home`).
     homes: Vec<Rc<str>>,
     /// WP16, server: an entity of `homes` went away since the session last asked.
@@ -416,6 +422,17 @@ impl NetManager {
     #[func]
     fn get_profiles(&self) -> Option<Gd<NetProfiles>> {
         self.profiles.clone()
+    }
+
+    #[func]
+    pub fn get_body_prediction(&self) -> crate::predict_body::BodyPrediction {
+        self.body_prediction
+    }
+
+    #[func]
+    fn set_body_prediction(&mut self, m: crate::predict_body::BodyPrediction) {
+        self.body_prediction = m;
+        crate::predict_body::changed();
     }
 
     #[func]
@@ -954,6 +971,14 @@ impl NetManager {
                 }
                 if !self.is_server {
                     freeze_bodies(&nodes);
+                    // WP19: a body replica may be predicted (predict_body.rs).
+                    if let Some(rt) = &rt {
+                        session
+                            .clone()
+                            .bind_mut()
+                            .bodies
+                            .register(create.id, &nodes, rt);
+                    }
                 }
                 if proposal {
                     let mut s = session.clone();
