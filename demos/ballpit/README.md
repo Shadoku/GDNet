@@ -620,13 +620,12 @@ after the contact; the pusher claimed six balls as they pushed each other, gave 
 and its paddle never rolled back; nobody touching the pile means no claims at all (a `handoff` pile nobody
 touches is a `server` pile, and the client converges on it to within half a quantiser step).
 
-`simulated` is where this demo shows the mode's open problem: a pile of balls stacked two or more deep
-does not settle on a client. In the test (60 balls, two rows, shaken), a second after the server's pile
-fell asleep the worst client ball was still 22 to 31 px from the server's, after about 500 corrections;
-a few balls go on moving and being corrected for 10 s and more (40 to 200 corrections a second), and no
-client ball falls asleep. A single row of balls settles at once (0.28 px, no corrections). docs/PLAN_NETCODE.md
-section 10, the WP19 row, lists it as open. Switching back to `server` heals it at once: the replicas
-freeze and converge to within 0.075 px.
+`simulated` makes every ball live on every peer, and the test for it is the hard case: a pile stacked two
+rows deep (60 balls), shaken. While the balls move, each client's copy slides to the server's answer where
+the two simulations disagree. Once the server's pile rests, the client's resting balls are frozen, carried
+onto the server's poses together and released asleep: the worst client ball ends 0.06 px from the
+server's and every client ball sleeps (the test asserts both). Guide 10, "Resting replicas settle", has
+the timing. Switching back to `server` freezes the replicas and converges the same way.
 
 **Body prediction** (each client's **This client shows them** selector, `set_ball_prediction`). It sets
 `NetManager.body_prediction` on that client's own manager: what its screen shows for the balls it holds

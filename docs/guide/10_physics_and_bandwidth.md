@@ -159,8 +159,8 @@ latency. Then:
 
 - a difference below the correction thresholds is left alone on a resting body (a pile stays asleep) and
   refined quietly on a moving one;
-- above them it becomes a decaying offset on position and rotation, and the velocities are set to the
-  server's;
+- above them, on a moving body, it becomes a decaying offset on position and rotation, and the velocities
+  are set to the server's; a resting body settles instead ("Resting replicas settle" below);
 - beyond the property's `teleport_distance` (page 5) the body snaps.
 
 Corrections move the body through the physics server (`body_set_state`), because setting `position` on an
@@ -183,7 +183,27 @@ claim and body prediction's corrections:
 | `gdnet/physics/correction_rest_speed` | 0.15 (metres per second) | a body slower than this counts as at rest (`simulated`, `handoff`); keep it above Godot's sleep threshold |
 
 `NetSession.stats()` on a client: `sim_bodies` (its live `simulated` bodies), `sim_correcting` (those
-with an offset left), `sim_corrections` and `sim_corrections_per_s`, `sim_snaps`.
+with an offset left), `sim_corrections` and `sim_corrections_per_s`, `sim_snaps`, `sim_settles`.
+
+*Resting replicas settle.* A resting body is not corrected: a nudge would wake it, its neighbours would
+push it back, and a stacked pile would be corrected for ever. Instead, once the server's body has reported
+rest with nothing newer for 0.15 s and the client's body has been still for 0.15 s, the replica is frozen,
+carried to the server's pose in 1 to 15 ticks (0.25 s at most at 60 Hz) and released exactly there, still
+and asleep. The manager's other resting bodies join the round and are released together, so a pile ends
+in the server's arrangement. A body one of this client's predicted entities touched in the last 30 ticks
+is left alone, and a body knocked off again settles after 0.5 s at the earliest. Measured: a replica
+0.021 m off settles in 0.35 s; a pile that settles while a client watches is asleep there 0.8 s after the
+server's; the Ballpit's two-row pile of 60 balls ends 0.06 px from the server's, every ball asleep.
+
+*Pushes and the physics space.* Whether a `CharacterBody`'s `move_and_slide()` meets the floor or a body
+first depends on the physics space's history, and Godot cancels travel under 2 cm toward a wall met first.
+A predicted pusher and the server could therefore part by a fraction of a millimetre and never meet
+again. `gdnet/prediction/quantize_state` (default true) starts every tick of a predicted entity, on the
+server and on its owner, from its positions and velocities as the snapshots carry them (1 mm and 1 mm/s
+in 3D, 0.1 px and 0.1 px/s in 2D; rotations are untouched, and an entity touching a `simulated` body is
+skipped). A 3D `handoff` push in a much-used space went from 23 rollbacks to 3 or 4. Side effect: a
+velocity a game damps by multiplying stops changing once a tick's decrease is under half a step (about
+5 mm/s in 3D); a game that needs it to reach exactly zero turns the setting off.
 
 ## Body prediction: showing a body where it is now
 
@@ -430,15 +450,11 @@ pings) stays at about 88 B/s with 300 shaken balls, 0.5 % of a 16 KB/s budget.
 
 ## Known limits
 
-- **`simulated` piles that do not settle on a client.** Bodies stacked two or more deep can fight their
-  corrections: in the Ballpit a two-row pile of 60 balls left a few client balls 22 to 31 px from the
-  server's, moving and corrected 40 to 200 times a second for 10 s and more, none asleep (a single row
-  settles at once). A pile resting just beyond the correction threshold is corrected for ever. A pile that
-  settles while a client watches takes about 10 s to sleep there (about 1 s on the server); one the client
-  joins at rest sleeps at once. These are open (docs/PLAN_NETCODE.md section 10, WP19); `server` is the
-  fallback per entity.
-- **Pushing can mispredict.** In some physics-space states a predicted player pushing a `handoff` or
-  `simulated` body rolls back 22 to 36 times over a push instead of 2 to 7 (open, WP19).
+- **Pushing a `simulated` body costs rollbacks.** Each side simulates the crate itself, and the two can
+  part (one tumbles, one slides): about 12 rollbacks of the pusher over a push in 2D, against 0 to 4 with
+  `handoff`. Use `handoff` for things players push.
+- **A settling `simulated` replica is frozen** for up to 15 ticks (see "Resting replicas settle" above).
+  The Ballpit with 120 balls, or with balls spawned in `simulated`, has not been measured.
 - **Client-driven bodies on a listen server** (`owner`, held `handoff`) look snapped on the host: a
   server applies a client's states as they arrive and does not interpolate them.
 - **A mode changed at run time is not saved** in level state (page 9); the scene's or manager's value comes

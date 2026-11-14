@@ -191,7 +191,7 @@ dedicated server.
   `gdnet/physics/correction_rest_speed` (0.15 m/s) and `gdnet/physics/handoff_rest_s` (0.5 s), all read
   when used.
 - Other project settings, on their pages: `gdnet/budget/*` (page 10), `gdnet/interpolation/*` (page 5),
-  `gdnet/prediction/max_rollback_ticks` and `gdnet/input/actions` (page 4), `gdnet/debug/*` (page 8),
+  `gdnet/prediction/max_rollback_ticks`, `gdnet/prediction/quantize_state` and `gdnet/input/actions` (page 4), `gdnet/debug/*` (page 8),
   `gdnet/connect/*` (page 12).
 - `NetManager.get_managed_root()`: the node whose subtree it manages (itself, or the node given to
   `Net.manage()`).
