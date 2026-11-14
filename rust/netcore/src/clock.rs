@@ -143,6 +143,26 @@ impl RttEstimator {
     }
 }
 
+/// WP19: the round trips in steps, the last [`RTT_WINDOW`] of them (`Session::min_rtt_steps`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepRtt {
+    recent: [u64; RTT_WINDOW],
+    samples: u64,
+}
+
+impl StepRtt {
+    pub fn sample(&mut self, steps: u64) {
+        self.recent[self.samples as usize % RTT_WINDOW] = steps;
+        self.samples += 1;
+    }
+
+    /// The smallest of the last [`RTT_WINDOW`] samples, `None` before the first.
+    pub fn min(&self) -> Option<u64> {
+        let n = (self.samples as usize).min(RTT_WINDOW);
+        self.recent[..n].iter().copied().min()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +262,20 @@ mod tests {
             r.sample(110_000.0);
         }
         assert_eq!(r.min_rtt_ms(), Some(110.0));
+    }
+
+    /// WP19: the round trip in steps, the same envelope.
+    #[test]
+    fn min_rtt_in_steps_is_the_smallest_recent_sample() {
+        let mut r = StepRtt::default();
+        assert_eq!(r.min(), None);
+        for s in [8, 6, 7] {
+            r.sample(s);
+        }
+        assert_eq!(r.min(), Some(6));
+        for _ in 0..RTT_WINDOW {
+            r.sample(7);
+        }
+        assert_eq!(r.min(), Some(7));
     }
 }

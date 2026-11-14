@@ -235,6 +235,11 @@ pub struct Stats {
 pub struct Session {
     role: Role,
     local_id: PeerId,
+    /// WP19: the steps (`tick` calls) this session made, and per ping it sent the step it went out in
+    /// (by its `sent_us`), for [`Session::min_rtt_steps`].
+    steps: u64,
+    ping_steps: VecDeque<(u64, u64)>,
+    rtt_steps: crate::clock::StepRtt,
     protocol: Protocol,
     clock: TickClock,
     peers: PeerTable,
@@ -470,6 +475,9 @@ impl Session {
         };
         Self {
             role,
+            steps: 0,
+            ping_steps: VecDeque::new(),
+            rtt_steps: Default::default(),
             local_id: if role == Role::Server { SERVER } else { 0 },
             protocol: Protocol::with_profiles(rate, cfg.protocol_salt, cfg.profiles_hash),
             clock: TickClock::new(rate),
@@ -618,6 +626,14 @@ impl Session {
         self.peers.get(peer).and_then(|p| p.rtt.min_rtt_ms())
     }
 
+    /// WP19, client: the smallest recent round trip to the server in this session's steps (one per
+    /// physics tick): from the step a ping went out in to the step its answer was taken in. Measured on
+    /// the clock the snapshots' arrivals are, it has the same waits for the next physics tick at each
+    /// end as a snapshot's path, which a round trip in milliseconds has only on average.
+    pub fn min_rtt_steps(&self) -> Option<u64> {
+        self.rtt_steps.min()
+    }
+
     pub fn jitter_ms(&self, peer: PeerId) -> Option<f64> {
         self.peers.get(peer).and_then(|p| p.rtt.jitter_ms())
     }
@@ -676,6 +692,12 @@ impl Session {
 
     fn ping(&mut self, peer: PeerId, now_us: u64) {
         let tick = self.clock.tick();
+        if self.role == Role::Client {
+            self.ping_steps.push_back((now_us, self.steps));
+            while self.ping_steps.len() > 32 {
+                self.ping_steps.pop_front();
+            }
+        }
         self.send(
             peer,
             &Message::Ping(Ping {
@@ -897,6 +919,12 @@ impl Session {
             }
             Message::Pong(p) => {
                 let rtt = now_us.saturating_sub(p.echo_us) as f64;
+                // A packet is taken in before this step's `tick` call: it counts as the next step.
+                if let Some(i) = self.ping_steps.iter().position(|(us, _)| *us == p.echo_us) {
+                    let sent = self.ping_steps[i].1;
+                    self.ping_steps.drain(..=i);
+                    self.rtt_steps.sample((self.steps + 1).saturating_sub(sent));
+                }
                 if let Some(state) = self.peers.get_mut(peer) {
                     state.rtt.sample(rtt);
                 }
@@ -1058,6 +1086,7 @@ impl Session {
         if self.closed {
             return;
         }
+        self.steps += 1;
         let tick = self.clock.advance();
         for h in self.held.overdue(tick, self.held_timeout) {
             let what = held_description(&h.action, &self.scene_paths);
@@ -5094,6 +5123,9 @@ mod tests {
         let rtt = p.client.rtt_ms(SERVER).unwrap();
         // 100 ms plus up to a tick of release granularity each way plus the reply's tick.
         assert!((100.0..=150.0).contains(&rtt), "{rtt}");
+        // In steps: three ticks each way, plus the release granularity.
+        let steps = p.client.min_rtt_steps().unwrap();
+        assert!((6..=8).contains(&steps), "{steps}");
         let diff = p.client.clock().server_tick_estimate() - p.server.current_tick() as f64;
         assert!(diff.abs() <= 1.5, "{diff}");
     }

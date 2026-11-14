@@ -38,8 +38,11 @@
 //! **The present** is estimated on the client's physics clock (`Engine.get_physics_frames()` plus the
 //! physics interpolation fraction), because the server's bodies change once per physics tick: the
 //! leading edge of the snapshot arrivals in physics ticks (`reckon::Edge`), plus half the smallest
-//! recent round trip (the lower envelope pairs with the leading edge; the smoothed round trip includes
-//! the frame waits of both ends and put the estimate half a tick ahead), aimed at the middle of the
+//! recent round trip counted in the session's steps (`Session::min_rtt_steps`: the lower envelope pairs
+//! with the leading edge, and counted on the clock the arrivals are, it waits for the next physics tick
+//! at each end as a snapshot does; a round trip in milliseconds has those waits only in part, and the
+//! part changed with the phase of the frames from run to run: the estimate lagged by 0.23 to 0.55 of a
+//! tick; before the first step sample the round trip in milliseconds stands in), aimed at the middle of the
 //! server's current tick (`reckon::PRESENT_CENTRE`), so a continuously moving replica is within half a
 //! tick of travel of the server's stepwise present plus the estimate's error. Before the first
 //! observation the render timeline's wall-clock edge stands in.
@@ -740,12 +743,16 @@ impl NetSession {
         // What netcore knows: the newest samples, the present estimate, the render tick.
         let rate = f64::from(core.clock().tick_rate());
         let tick_dt = 1.0 / rate;
-        let rtt_ticks = core
-            .min_rtt_ms(netcore::SERVER)
-            .or_else(|| core.rtt_ms(netcore::SERVER))
-            .unwrap_or(0.0)
-            / 1000.0
-            * rate;
+        let rtt_ticks = core.min_rtt_steps().map_or_else(
+            || {
+                core.min_rtt_ms(netcore::SERVER)
+                    .or_else(|| core.rtt_ms(netcore::SERVER))
+                    .unwrap_or(0.0)
+                    / 1000.0
+                    * rate
+            },
+            |s| s as f64,
+        );
         // The present on the physics clock (the server's bodies change once per physics tick), with the
         // render timeline's wall-clock edge as the fallback before the first observation.
         let engine = Engine::singleton();

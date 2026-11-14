@@ -84,6 +84,12 @@ func test_smooth_at_60_and_144_fps() -> void:
 		print("smooth %d fps (achieved %.1f): per-frame displacement mean %.3f px, sd %.3f px; worst error %.2f px (tick travel %.2f), lead %.2f ticks (%.2f..%.2f)" % [fps, achieved, mean, sqrt(v), e["worst"], e["travel"], e["lead"], e["lead_min"], e["lead_max"]])
 		assert_eq(backwards, 0, "never backwards at %d fps" % fps)
 		assert_lt(e["excess"], 0.05, "at the present at %d fps" % fps)
+		if fps > Engine.physics_ticks_per_second:
+			# Rendered faster than the physics ticks, the frames sample every phase of the server's
+			# stepwise position, so the mean signed error is the estimate's bias: centred, the worst
+			# frame is half a tick off and G13 holds with half a tick to spare. (A round trip in
+			# milliseconds put the estimate 0.23 to 0.55 of a tick behind, changing from run to run.)
+			assert_lt(absf(e["lead"]), 0.2, "the present estimate is centred at %d fps: %.2f ticks" % [fps, e["lead"]])
 		if achieved < fps * 0.85:
 			print("the headless runner reached %.1f of %d frames per second: the variance bound is skipped" % [achieved, fps])
 		else:
