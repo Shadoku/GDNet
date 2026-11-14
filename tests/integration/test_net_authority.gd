@@ -301,6 +301,21 @@ func test_a_view_hides_a_path_from_one_client() -> void:
 	assert_false(net.client_sessions[1].state.has("team/red/plan"), "B never sees it")
 
 
+## WP17 (found by the Cards demo): a statically typed array is a value like any other, on its own and
+## inside an untyped array or a dictionary.
+func test_keyed_state_takes_typed_arrays() -> void:
+	await _start(1)
+	var ss: NetKeyedState = net.server_session.state
+	var hand: Array[String] = ["Ash Wren", "Opal Drake"]
+	var counts: Array[int] = [3, 4]
+	assert_true(ss.set("hand", hand))
+	assert_true(ss.set("nested", {"counts": counts, "list": [counts]}))
+	var sa: NetKeyedState = net.client_sessions[0].state
+	assert_true(await net.wait_until(func() -> bool: return sa.has("hand") and sa.has("nested")), "they arrive")
+	assert_eq(Array(sa.get("hand")), ["Ash Wren", "Opal Drake"])
+	assert_eq(Array(sa.get("nested")["counts"]), [3, 4])
+
+
 func test_g0_keyed_state_without_a_session_is_local_and_sends_nothing() -> void:
 	var before := NetSession.packets_sent_total()
 	var seen := []

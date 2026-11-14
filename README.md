@@ -39,11 +39,13 @@ The escalation ladder (`docs/PLAN_NETCODE.md` section 1); most games stop at run
 
 **First run.** `python3 tools/check.py` builds the extension (`cargo build --release -p gdnet`, several
 minutes the first time), imports, runs the Rust and GDScript tests, lint and a smoke test; it ends with
-`CHECK: PASS`. Then try the two demos, each a tutorial whose README is the walkthrough:
+`CHECK: PASS`. Then try the three demos, each a tutorial whose README is the walkthrough:
 
 * `demos/doors/` (a 2 x 2 chunk overworld walked across without a transition, interiors behind doors,
-  torches with a radius, a chest that stays open) and `demos/ballpit/` (300 colliding `RigidBody2D`
-  balls, priority and the byte budget). Open the demo's `main.tscn` and press *Run Current Scene* (F6);
+  torches with a radius, a chest that stays open), `demos/ballpit/` (300 colliding `RigidBody2D`
+  balls, priority and the byte budget) and `demos/cards/` (a two-seat card game: a table of Controls,
+  intentions as calls, private hands, a dropped player who sits down again, saved games). Open the demo's
+  `main.tscn` and press *Run Current Scene* (F6);
   choose **Offline**, **Host** or **Join**. The title screen is gdnet's connect layer
   (`addons/gdnet/connect/`): with GodotSteam installed (`tools/install_godotsteam.sh`) and Steam running
   it also offers **Host on Steam**, which gives a join code a tester anywhere types into the same field
@@ -52,18 +54,20 @@ minutes the first time), imports, runs the Rust and GDScript tests, lint and a s
   Instances*, set the count to 3, give the first instance the launch argument `-- --server`, run
   `main.tscn` and press **Join** in the other two windows.
 * A headless dedicated server: `godot --headless --path . demos/doors/main.tscn -- --server` (likewise
-  `demos/ballpit/main.tscn`).
+  `demos/ballpit/main.tscn` and `demos/cards/main.tscn`).
 
-**Where things are.** The user guide is `docs/guide/` (`01_sessions.md` to `12_playing_online.md`,
+**Where things are.** The user guide is `docs/guide/` (`01_sessions.md` to `13_seats_and_rejoining.md`,
 one page per topic). The design, work packages, decisions and status are `docs/PLAN_NETCODE.md` (its
 section 10 is the status table, section 11 the known limits); the research behind it is
 `docs/reports/Rust GDExtension multiplayer design.md` and `docs/research_notes/`.
 
 **Status.** v1 is built (WP0-WP8, WP13, WP14, and the review of 2026-11-08), and of v2 (the plan's
-section 12) WP16: interest by radius, `visible_to`, `audience` and `visibility_filter`; several rooms per
-peer, level placement and level state. Next is WP17 (seats and rejoining). Not started: WP9 (lag
-compensation), WP10 (a native renet peer), WP11 (the web build and demo, scheduled with WP17), WP12 (an
-optional deterministic mode), WP17-WP22; WP15 became WP19's `handoff` mode.
+section 12) WP16 (interest by radius, `visible_to`, `audience` and `visibility_filter`; several rooms per
+peer, level placement and level state), WP17 (seats, rejoining within a window, saved sessions; the
+Cards demo) and WP23 (Steam join codes, with the Steam id as the seat key; the real Steam path awaits a
+manual test). Next is WP18 (3D parity and cheap idle entities). Not started: WP9 (lag compensation), WP10
+(a native renet peer), WP11 (the web build, waiting with WP24), WP12 (an optional deterministic mode),
+WP18-WP22, WP24; WP15 became WP19's `handoff` mode.
 
 **Versions.** Godot 4.6 (pinned in `.godot-version`; the extension declares `compatibility_minimum = 4.3`
 and is built against gdext 0.5.5's `api-4-3`), Rust stable (developed on 1.97), gdext (`godot` crate)

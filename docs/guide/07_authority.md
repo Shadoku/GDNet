@@ -34,12 +34,10 @@ Net.owner_changed.connect(func(node, old, new): ...)    # (NetSession.owner_chan
 An owner change moves simulation with it: the new owner starts predicting (fresh history), the old one
 becomes a replica that interpolates (its buffers reset), and the server takes the new owner's input.
 
-A client that disconnects keeps its entities for the rejoin window (WP17, `gdnet/session/rejoin_timeout_s`,
-default 60 s): they stay in the world, owned by its old peer id, and the server simulates them with neutral
-input, so a dropped player stands still. When the same seat key joins again the entities, its player, rooms,
-focus, `visible_to` lists, views and `audience: owner` values move to the new peer id (`owner_changed` fires
-on every peer). When the window ends, or at once with a window of 0, they go back to the server; they stay in
-the world either way. Seats and rejoining have their own page.
+A client that disconnects keeps its entities for the rejoin window (default 60 s): they stay in the world,
+owned by its old peer id, and move to its new peer id when it joins again with the same seat key
+(`owner_changed` fires on every peer); when the window ends they go back to the server. Page 13 covers
+seats, what a rejoin restores, and saved sessions.
 
 ## Nested entities inherit their owner
 
@@ -161,7 +159,7 @@ Net.state.allow("admin/", 7)          # one peer
 ```
 
 `"owner"` reads the writer's peer id, which changes when a client reconnects; `"seat"` reads its seat
-(`Net.my_seat()`), which does not, so prefer it for anything a player keeps across a drop.
+(`Net.my_seat()`, page 13), which does not, so prefer it for anything a player keeps across a drop.
 
 The rules reach the clients, so a client's `set` on a path it may not write fails at once with an error and
 sends nothing. An allowed client write applies on the writer immediately and reaches everyone through the
@@ -177,6 +175,9 @@ Net.state.view("team/red/", func(peer: int) -> bool: return peer in red_team)
 Paths under a view's prefix reach only the peers its filter admits. The server re-evaluates the filter every
 tick: a peer that becomes admitted receives the paths, one that stops being admitted gets them erased. A
 path under several views needs every one of them. Views decide delivery, not secrecy from the server.
+A private hand is a view per seat, `view("hand/2/", func(peer): return Net.seat(peer) == 2)`, which
+keeps admitting the player after a rejoin (the Cards demo). Values may be any call argument, statically
+typed arrays included.
 
 ## Summary of the API
 

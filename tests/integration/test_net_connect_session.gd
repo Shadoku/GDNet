@@ -103,3 +103,43 @@ func test_the_join_field_takes_a_code_and_offline_needs_no_network() -> void:
 	(alone.get_node("Offline") as Button).pressed.emit()
 	assert_eq((alone.get_meta("started") as Array).size(), 1)
 	assert_true((alone.get_meta("started") as Array)[0] is NetPipePeer, "offline is a NetPipePeer server end")
+
+
+## WP17: a Steam player whose game ends and starts again joins with the same Steam id, so it takes its
+## seat back; the host hosts from a saved session state through `NetConnect.state`.
+func test_a_steam_player_who_restarts_gets_its_seat_back() -> void:
+	var saved_on := NetFixture.new(self, 0)
+	saved_on.start_server()
+	saved_on.server_session.state.set("run/floor", 4)
+	var saved := saved_on.server_session.save_state()
+	saved_on.teardown()
+	net = NetFixture.new(self, 1)
+	net.build()
+	net.server_session.rejoin_timeout_s = -1.0
+	var world := {}
+	var host := _connector(world, 1001, net.server_session, net.server)
+	host.state = saved
+	var client := _connector(world, 2002, net.client_sessions[0], net.clients[0])
+	host.host_steam()
+	assert_true(await await_signal(host.hosted, 2.0))
+	assert_eq(net.server_session.state.get("run/floor"), 4, "hosted from the saved state")
+	client.join_steam(host.code())
+	assert_true(await net.wait_connected())
+	assert_eq(net.client_sessions[0].key, "steam:2002", "the Steam id is the seat key")
+	var seat := net.client_sessions[0].my_seat()
+	assert_gt(seat, 0)
+	# The player's game ends (its connector and branch go with it) and starts again.
+	client.free()
+	net.drop_client(0)
+	assert_true(await net.wait_until(func() -> bool: return net.server_session.peer_of(seat) == 0), "the seat is away")
+	var branch := Node.new()
+	branch.name = "ClientA"
+	get_tree().root.add_child(branch)
+	var s := NetSession.new()
+	branch.add_child(s)
+	var again := _connector(world, 2002, s, branch)
+	again.join_steam(host.code())
+	assert_true(await net.wait_until(func() -> bool: return s.is_online() and s.my_seat() > 0), "joined again")
+	assert_eq(s.my_seat(), seat, "the same seat")
+	again.leave()
+	branch.free()

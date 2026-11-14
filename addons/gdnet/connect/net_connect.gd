@@ -22,6 +22,13 @@ extends Node
 ## Where the session runs: by default the `Net` singleton (`Net.host`, `Net.join`, `Net.offline`,
 ## `Net.use_peer`). With `session` set, that `NetSession` (`session.start(peer, session_root)`; tests
 ## under NetFixture). With `start_peer` set, that Callable receives each peer instead (unit tests).
+##
+## Seats (WP17, docs/guide/13_seats_and_rejoining.md): over Steam a session joins with the player's Steam
+## id as its seat key ("steam:<id>"), so a player who restarts the game takes their seat back; ENet and
+## offline keep the session's own key unless `key` is set. A join the server refuses because the key's
+## seat is still connected (it has not yet noticed the old connection drop) is tried again, up to
+## `join_retries` times, `retry_delay_s` apart. `state` (from `Net.save_state()`) is the session state
+## the host_* and offline calls start from.
 
 ## A session started as the host: `code` is the Steam join code, empty for ENet and offline.
 signal hosted(code: String)
@@ -35,6 +42,8 @@ signal status(text: String)
 ## Join code characters: no 0/O, 1/I/L, so a code read aloud or off a screen is typed right.
 const CODE_ALPHABET := "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 const CODE_LENGTH := 6
+## The words of the server's refusal when a key's seat is still connected (netcore's session).
+const SEAT_IN_USE := "already in use"
 ## Lobby data keys.
 const KEY_CODE := "gdnet_code"
 const KEY_GAME := "gdnet_game"
@@ -61,6 +70,16 @@ var clock: Callable = Callable(Time, "get_unix_time_from_system")
 var timeout_s: float = 10.0
 ## Lobby size, the host included.
 var max_players: int = 16
+## The seat key the sessions this object starts use. Empty: the Steam id over Steam ("steam:<id>"), the
+## session's own key (`Net.key`, or the `NetSession`'s) over ENet and offline.
+var key: String = ""
+## The session state `host_enet`, `host_steam` and `offline` start from (`Net.save_state()`'s bytes;
+## empty = a new session).
+var state: PackedByteArray = PackedByteArray()
+## How many times a join refused because its seat is still connected is tried again.
+var join_retries: int = 5
+## Seconds between those tries (on the deltas passed to `advance()`).
+var retry_delay_s: float = 2.0
 ## The Steam app id (`gdnet/connect/steam_app_id`, default 480: Spacewar, Valve's shared test app).
 var app_id: int = DEFAULT_APP_ID
 ## The game's name in lobby data (`gdnet/connect/game_name`, default the project's name).
@@ -75,6 +94,12 @@ var _wanted: String = ""
 var _running: bool = false
 var _steam_checked: bool = false
 var _steam_reason: String = ""
+var _key_used: String = ""
+var _transport: String = ""
+var _is_client: bool = false
+var _rejoin: Callable = Callable()
+var _retries: int = 0
+var _retry_in: float = -1.0
 
 
 func _init() -> void:
@@ -88,6 +113,10 @@ func _init() -> void:
 
 func _process(delta: float) -> void:
 	advance(delta)
+
+
+func _ready() -> void:
+	Net.disconnected.connect(_on_disconnected)
 
 
 func _exit_tree() -> void:
@@ -165,6 +194,37 @@ func code() -> String:
 	return _code
 
 
+## How the running session was started: "enet", "steam" or "offline" ("" when none runs).
+func transport() -> String:
+	return _transport
+
+
+## The seat key the last session this object started joined with: the Steam id key, `key`, or "" when
+## the session kept its own.
+func session_key() -> String:
+	return _key_used
+
+
+## Tell this object that its session ended with `reason` (the session's `disconnected`). It listens to
+## `Net.disconnected` itself; with `session` or `start_peer` set, the owner connects or calls it. A
+## client refused because its seat is still connected joins again after `retry_delay_s`.
+func session_ended(reason: String) -> void:
+	if not _running or not _is_client or not _rejoin.is_valid():
+		return
+	if not reason.contains(SEAT_IN_USE):
+		return
+	var again := _rejoin
+	var tries := _retries
+	leave()
+	if tries >= join_retries:
+		_fail(reason)
+		return
+	_rejoin = again
+	_retries = tries
+	_retry_in = retry_delay_s
+	status.emit("your seat is still held by your last connection; trying again in %d s" % ceili(retry_delay_s))
+
+
 ## True from a host/join call until it failed or `leave()`.
 func is_active() -> bool:
 	return _step != Step.IDLE
@@ -173,9 +233,10 @@ func is_active() -> bool:
 ## Hosts over ENet on `port`.
 func host_enet(port: int) -> Error:
 	leave()
+	_use_key(false)
 	var err: Error
 	if _uses_net():
-		err = Net.host(port)
+		err = Net.host(port, state)
 	else:
 		var peer := ENetMultiplayerPeer.new()
 		err = peer.create_server(port, 32, 3)
@@ -183,14 +244,20 @@ func host_enet(port: int) -> Error:
 			err = _start(peer)
 	if err != OK:
 		return _fail_now(err, "could not host on port %d: %s" % [port, error_string(err)])
-	_started("hosting on port %d" % port)
+	_started("enet", "hosting on port %d" % port)
 	hosted.emit("")
 	return OK
 
 
 ## Joins an ENet host. The session reports the handshake (`connected`) or a refusal (`disconnected`).
 func join_enet(address: String, port: int) -> Error:
+	_retries = 0
+	return _join_enet(address, port)
+
+
+func _join_enet(address: String, port: int) -> Error:
 	leave()
+	_use_key(false)
 	var err: Error
 	if _uses_net():
 		err = Net.join(address, port)
@@ -201,7 +268,9 @@ func join_enet(address: String, port: int) -> Error:
 			err = _start(peer)
 	if err != OK:
 		return _fail_now(err, "could not join %s:%d: %s" % [address, port, error_string(err)])
-	_started("joining %s:%d" % [address, port])
+	_started("enet", "joining %s:%d" % [address, port])
+	_is_client = true
+	_rejoin = _join_enet.bind(address, port)
 	joined.emit()
 	return OK
 
@@ -209,10 +278,11 @@ func join_enet(address: String, port: int) -> Error:
 ## A session without a network (this process hosts and plays as peer 1).
 func offline() -> Error:
 	leave()
-	var err: Error = Net.offline() if _uses_net() else _start(NetPipePeer.new())
+	_use_key(false)
+	var err: Error = Net.offline(state) if _uses_net() else _start(NetPipePeer.new())
 	if err != OK:
 		return _fail_now(err, "could not start offline: %s" % error_string(err))
-	_started("playing offline")
+	_started("offline", "playing offline")
 	hosted.emit("")
 	return OK
 
@@ -230,6 +300,11 @@ func host_steam() -> Error:
 
 ## Joins the Steam game with join code `join_code`; `joined()` fires once the peer to its host is up.
 func join_steam(join_code: String) -> Error:
+	_retries = 0
+	return _join_steam(join_code)
+
+
+func _join_steam(join_code: String) -> Error:
 	leave()
 	var c := normalise_code(join_code)
 	if not is_join_code(c):
@@ -250,6 +325,11 @@ func leave() -> void:
 	_owner = 0
 	_code = ""
 	_wanted = ""
+	_key_used = ""
+	_transport = ""
+	_is_client = false
+	_rejoin = Callable()
+	_retry_in = -1.0
 	if _running:
 		_running = false
 		if start_peer.is_valid():
@@ -266,6 +346,14 @@ func leave() -> void:
 ## own deltas instead of waiting.
 func advance(delta: float) -> void:
 	backend.poll()
+	if _retry_in >= 0.0:
+		_retry_in -= delta
+		if _retry_in <= 0.0:
+			_retry_in = -1.0
+			var again := _rejoin
+			var tries := _retries + 1
+			again.call()
+			_retries = tries
 	if _step == Step.CREATING or _step == Step.SEARCHING or _step == Step.JOINING:
 		_elapsed += delta
 		if _elapsed > timeout_s:
@@ -287,11 +375,32 @@ func _start(peer: MultiplayerPeer) -> Error:
 	if start_peer.is_valid():
 		return start_peer.call(peer)
 	if session != null:
-		return session.start(peer, NodePath() if session_root == null else session_root.get_path())
-	return Net.use_peer(peer)
+		if not session.disconnected.is_connected(session_ended):
+			session.disconnected.connect(session_ended)
+		return session.start(peer, NodePath() if session_root == null else session_root.get_path(), state)
+	return Net.use_peer(peer, state)
 
 
-func _started(text: String) -> void:
+## Sets the seat key for the session about to start: `key`, else over Steam the Steam id.
+func _use_key(steam: bool) -> void:
+	_key_used = key
+	if _key_used.is_empty() and steam:
+		_key_used = "steam:%d" % backend.my_id()
+	if _key_used.is_empty() or start_peer.is_valid():
+		return
+	if session != null:
+		session.key = _key_used
+	else:
+		Net.key = _key_used
+
+
+func _on_disconnected(reason: String) -> void:
+	if _uses_net():
+		session_ended(reason)
+
+
+func _started(how: String, text: String) -> void:
+	_transport = how
 	_running = true
 	_step = Step.RUNNING
 	status.emit(text)
@@ -342,11 +451,12 @@ func _on_lobby_created(lobby_id: int, error: String) -> void:
 	if peer == null:
 		_fail("could not host on Steam: " + backend.last_error)
 		return
+	_use_key(true)
 	var err := _start(peer)
 	if err != OK:
 		_fail("could not start the session: " + error_string(err))
 		return
-	_started("hosting on Steam; join code %s" % _code)
+	_started("steam", "hosting on Steam; join code %s" % _code)
 	hosted.emit(_code)
 
 
@@ -391,12 +501,17 @@ func _on_lobby_joined(lobby_id: int, error: String) -> void:
 	if peer == null:
 		_fail("could not connect to the host over Steam: " + backend.last_error)
 		return
+	var wanted := _wanted
+	_use_key(true)
 	var err := _start(peer)
 	if err != OK:
 		_fail("could not start the session: " + error_string(err))
 		return
 	_owner = owner
-	_started("joined over Steam")
+	_started("steam", "joined over Steam")
+	_is_client = true
+	if not wanted.is_empty():
+		_rejoin = _join_steam.bind(wanted)
 	joined.emit()
 
 

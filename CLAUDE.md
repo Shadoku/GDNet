@@ -10,8 +10,8 @@ packages are in `docs/PLAN_NETCODE.md` (approved 2026-11-08; the status table at
 its end says what is built); the research behind it is
 `docs/reports/Rust GDExtension multiplayer design.md` and `docs/research_notes/`.
 Follow the plan's packages in order and update its status table when one lands.
-Section 12 of the plan (v2, added 2026-11-13) holds the packages after v1 and their order (WP16 is built;
-WP17 is next). Priorities
+Section 12 of the plan (v2, added 2026-11-13) holds the packages after v1 and their order (WP16, WP17 and
+WP23 are built; WP18 is next). Priorities
 (the owner's, plan goal 9): function, flexibility and keeping game code close to its single-player
 version come first; cheat detection and prevention are not a priority inside the extension.
 Nothing depends on the addon yet (the owner, 2026-11-13): keeping v1's behaviour, API or wire format is not
@@ -187,6 +187,10 @@ These are the rules that keep it at seconds:
   gives it its managers, `net.start_server(state)` starts from `save_state()`'s bytes. Use a short
   `rejoin_timeout_s` (a live property) for the release path, and reset `Net.rejoin_timeout_s = -2.0` (back to
   the setting) and `Net.key = ""` in `after_each` when a test sets them.
+  The Cards demo (WP17): `tests/integration/test_cards_demo.gd` runs `demos/cards/` (a `table.tscn` per
+  branch; seat 1 is the host or the first client); it points the dealer's `save_path` at a file of its own
+  per test process and deletes it in `after_each`, and scans each client's packets for the other seat's
+  cards with `_debug_watch`.
 
 ## Design for testability
 
@@ -213,12 +217,14 @@ tests/integration/     tests that instantiate scenes
 rust/                  Cargo workspace: netcore (sans-IO protocol engine, no godot dep),
                        gdnet (the GDExtension); rust/target/ is ignored
 addons/gdnet/          gdnet.gdextension + bin/<platform>/ (built, ignored) + addon assets (WP8: meter.tscn/.gd)
-addons/gdnet/connect/  WP23 connect layer: NetConnect (ENet, Steam join codes, offline), NetSteamBackend, connect_menu.tscn
+addons/gdnet/connect/  WP23 connect layer: NetConnect (ENet, Steam join codes, offline; the Steam id as seat key), NetSteamBackend, connect_menu.tscn
 docs/guide/            the gdnet user guide, one page per topic (01_sessions.md, ...)
 demos/                 instructional demos, each a worked example with a README whose code listings a
                        test diffs against the files (WP13/WP16: doors/ = a 2 x 2 chunk overworld,
                        interiors behind doors, torches with a radius, a chest that keeps its state;
-                       WP14: ballpit/ = hundreds of RigidBody2D balls, priority and the byte budget)
+                       WP14: ballpit/ = hundreds of RigidBody2D balls, priority and the byte budget;
+                       WP17: cards/ = a two-seat card game: Controls outside managers, calls, private
+                       hands in the keyed state, seats and rejoining, saved games)
 check.toml             the check's stages, tiers, budget and cache settings
 tools/check.py         the one command to verify the project (the tdd-project kit's, language-agnostic;
                        reads check.toml; never edit it here without porting the fix to the kit)

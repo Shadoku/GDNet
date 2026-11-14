@@ -238,7 +238,9 @@ func teardown() -> void:
 ## host mode, tearing down in between. Returns false when a fixture failed to connect.
 static func run_both_modes(test: Node, client_count: int, scenario: Callable) -> bool:
 	for mode: HostMode in [HostMode.HOST_PLAYER, HostMode.DEDICATED]:
-		var f := NetFixture.new(test, client_count, mode)
+		# `new()`, not `NetFixture.new()`: a script naming its own class_name in a static function can
+		# be reported as a resource still in use at exit, depending on which scripts the process loaded.
+		var f: NetFixture = new(test, client_count, mode)
 		f.start()
 		var ok: bool = await f.wait_connected()
 		if ok:

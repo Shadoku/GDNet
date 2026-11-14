@@ -43,6 +43,11 @@ connect.leave()                       # leaves the lobby and the session
 | `status(text)` | progress, for a status line |
 | `timeout_s` | seconds to wait for each answer from Steam (default 10) |
 | `max_players` | the lobby's size, host included (default 16) |
+| `key` | the seat key its sessions join with; empty (default): the Steam id over Steam (`"steam:<id>"`), the session's own key over ENet and offline (page 13) |
+| `session_key()` | the key the last session it started used ("" when the session kept its own) |
+| `state` | a saved session state (`Net.save_state()`) that `host_enet`, `host_steam` and `offline` start from (page 13) |
+| `join_retries`, `retry_delay_s` | a join refused because its seat is still connected is tried again this often (default 5), this many seconds apart (default 2) |
+| `transport()` | how the running session started: `"enet"`, `"steam"`, `"offline"` |
 
 Every method returns an `Error` as well; the Steam ones return `OK` when the request went out and report
 the outcome through the signals. `NetConnect.is_join_code(text)` and `NetConnect.parse_address(text,
@@ -52,9 +57,17 @@ By default the session runs on the `Net` singleton (`Net.host`, `Net.join`, `Net
 `Net.use_peer` for the Steam peer). Set `session` (and `session_root`) to start a particular `NetSession`
 instead; the tests do this under `NetFixture`.
 
+**Seats.** Over Steam the seat key is the player's Steam id, so a tester whose game crashed starts it
+again, joins with the same code and is back on their seat with what they had (page 13). Over ENet the key
+is `Net.key`, random per process unless the game sets it (or sets `key` here). When a player comes back
+before the server has noticed that the old connection dropped, the server refuses the join because the
+seat is still connected; the connect layer tries again `join_retries` times, `retry_delay_s` apart, then
+fails with the server's reason. It learns of the refusal from `Net.disconnected` (with `session` set,
+from that session's `disconnected`).
+
 ### The title screen
 
-`addons/gdnet/connect/connect_menu.tscn` (`NetConnectMenu`) is the screen both demos use: **Host** (ENet on
+`addons/gdnet/connect/connect_menu.tscn` (`NetConnectMenu`) is the screen the demos use: **Host** (ENet on
 the menu's `port`), **Host on Steam** (shown only when Steam is available; then the join code and a **Copy**
 button), one field with **Join**, **Offline**, and a status line. The field decides by its shape: six
 characters of the code alphabet join on Steam, anything else is an address (`host` or `host:port`). A host
@@ -189,6 +202,10 @@ table.
 11. Repeat steps 3-7 with `demos/ballpit/main.tscn`. Expected: B's paddle pushes the balls on both screens.
 12. Optional, if A and B are Steam friends: A hosts on Steam; B, in the Steam friends list, chooses "Join
     game" on A while B's game shows the menu. Expected: B joins without typing the code.
+13. Seats: open `demos/cards/main.tscn` on both. A hosts on Steam, B joins with the code; each plays a
+    card. B closes the game (or kills it). Expected: A's table says "Waiting for seat 2...". B starts the
+    game again and joins with the same code. Expected: B is seat 2 again with the same cards in hand, and
+    the game goes on (a "your seat is still held" status line for a few seconds first is normal).
 
 If a step fails with a GodotSteam error such as "Invalid call. Nonexistent function", the method name in
 `addons/gdnet/connect/steam_backend.gd` is wrong for this GodotSteam version: every GodotSteam call is in
@@ -207,7 +224,7 @@ that one file, and its doc comment lists the names it assumes.
   gdnet does not check who joins (12.1); a game that cares checks on the server.
 * After `joined()`, if the Steam connection to the host never comes up, gdnet's session simply stays
   unconnected; watch `Net.connected` and `Net.disconnected` as with ENet.
-* Steam ids are not yet passed to gdnet as rejoin keys; that comes with WP17's seats (plan 12.10).
+* The Steam id is the seat key (`"steam:<id>"`): one Steam account can hold one seat in a game at a time.
 
 ## Later: WebRTC
 

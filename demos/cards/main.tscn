@@ -1,0 +1,37 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://demos/cards/main.gd" id="1_main"]
+[ext_resource type="PackedScene" path="res://demos/cards/table.tscn" id="2_table"]
+[ext_resource type="PackedScene" path="res://addons/gdnet/connect/connect_menu.tscn" id="3_menu"]
+
+[node name="Main" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+script = ExtResource("1_main")
+
+[node name="Table" parent="." instance=ExtResource("2_table")]
+visible = false
+layout_mode = 1
+
+[node name="Seat" type="HBoxContainer" parent="."]
+layout_mode = 0
+offset_left = 16.0
+offset_top = 16.0
+offset_right = 416.0
+offset_bottom = 48.0
+
+[node name="Name" type="LineEdit" parent="Seat"]
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "your name (optional)"
+
+[node name="NewGame" type="Button" parent="Seat"]
+visible = false
+layout_mode = 2
+text = "New game"
+
+[node name="Menu" parent="." instance=ExtResource("3_menu")]
+title = "Cards"
+port = 7351

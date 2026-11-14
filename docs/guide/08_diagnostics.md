@@ -34,7 +34,7 @@ first session in the tree (set `meter.session` to choose one, e.g. a test branch
 | prediction | `rollbacks_per_s`, `replayed_ticks`, `inputs_repeated` (page 4) |
 | poll | `poll_ms`, `poll_ms_avg`: what reading the hot and cold properties cost (page 3, "Dirty tracking") |
 | hashes | `hashes_sent`, `hashes_received`, `divergences`, `divergences_per_s` |
-| authority | `owner_changes`, `writes_rejected` (page 7); WP17: `my_seat`, `seats` (taken, connected or away) and `seats_away` (page 1) |
+| authority | `owner_changes`, `writes_rejected` (page 7); WP17: `my_seat`, `seats` (taken, connected or away) and `seats_away` (page 13) |
 | rooms | `room` (this peer's primary room; on the server the host player's) and `+N` for the other rooms in `my_rooms`, `rooms` (entities per room), `levels`, `travelling` (page 9): `room chunk_0_0 +3  [chunk_0_0 7, ...]  levels 4  travelling 0` |
 
 Interest has no line of its own; its keys are in `stats()` (page 11): `interest_passes`, `interest_ms`,

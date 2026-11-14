@@ -300,7 +300,8 @@ fn check_nested(v: &Variant) -> Result<(), String> {
             "an RID cannot be sent as an argument: RIDs are local to each peer",
         )),
         VariantType::ARRAY => {
-            let a: VarArray = v.to();
+            // `AnyArray`: a typed array (`Array[String]`) is not a `VarArray`.
+            let a: godot::builtin::AnyArray = v.to();
             for x in a.iter_shared() {
                 check_nested(&x)?;
             }

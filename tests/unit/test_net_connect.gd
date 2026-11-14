@@ -309,3 +309,57 @@ func test_a_friends_list_join_request_joins_that_lobby() -> void:
 	assert_eq(_log(client)["joined"], 1)
 	assert_eq(_log(client)["failed"], [])
 	assert_eq(host.code().is_empty(), false)
+
+
+## WP17: over Steam the seat key is the player's Steam id, so a player who restarts the game takes their
+## seat back; ENet and offline leave the session's key alone, and a key the game sets wins everywhere.
+func test_a_steam_session_joins_with_the_steam_id_as_its_seat_key() -> void:
+	var hc := _host_and_client()
+	var host: NetConnect = hc[0]
+	var client: NetConnect = hc[1]
+	assert_eq(host.session_key(), "steam:1001", "the host's key too")
+	client.join_steam(host.code())
+	_run([host, client])
+	assert_eq(_log(client)["joined"], 1)
+	assert_eq(client.session_key(), "steam:2002")
+	var enet := _connect(FakeSteamBackend.new({}, 3003))
+	assert_eq(enet.join_enet("127.0.0.1", 7350), OK)
+	assert_eq(enet.session_key(), "", "ENet keeps gdnet's own key")
+	enet.offline()
+	assert_eq(enet.session_key(), "")
+	enet.key = "slot-3"
+	enet.join_enet("127.0.0.1", 7350)
+	assert_eq(enet.session_key(), "slot-3", "a key the game sets is used on every transport")
+	enet.leave()
+
+
+## WP17 decision (1): a join refused because the key's seat is still connected (the server has not yet
+## noticed the old connection drop) is tried again, `retry_delay_s` apart on the injected time, at most
+## `join_retries` times; any other refusal is not retried.
+func test_a_join_refused_because_the_seat_is_still_held_is_retried() -> void:
+	var c := _connect(FakeSteamBackend.new({}, 3003))
+	c.retry_delay_s = 2.0
+	c.join_retries = 2
+	var held := "refused: this seat key is already in use: seat 2 is held by a connected peer (5); a seat takes one connection at a time"
+	assert_eq(c.join_enet("127.0.0.1", 7350), OK)
+	assert_eq(_log(c)["started"].size(), 1)
+	c.session_ended(held)
+	_run([c], 1.5)
+	assert_eq(_log(c)["started"].size(), 1, "not before the delay")
+	_run([c], 1.0)
+	assert_eq(_log(c)["started"].size(), 2, "tried again")
+	assert_eq(_log(c)["failed"], [])
+	c.session_ended(held)
+	_run([c], 2.5)
+	assert_eq(_log(c)["started"].size(), 3, "a second time")
+	c.session_ended(held)
+	_run([c], 2.5)
+	assert_eq(_log(c)["started"].size(), 3, "no third retry")
+	assert_eq(_log(c)["failed"].size(), 1, "it gives up and says why")
+	assert_true(String(_log(c)["failed"][0]).contains("already in use"), _log(c)["failed"][0])
+	# A new join starts counting again; another refusal is not retried.
+	c.join_enet("127.0.0.1", 7350)
+	c.session_ended("protocol mismatch: the wire format differs")
+	_run([c], 5.0)
+	assert_eq(_log(c)["started"].size(), 4, "a mismatch is not retried")
+	c.leave()
