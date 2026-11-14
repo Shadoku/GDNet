@@ -14,8 +14,14 @@
 //! `client_owned` entity follows (the owner simulates and sends its state, the
 //! server applies and relays it, the others interpolate it).
 //!
+//! **`handoff`** is `owner` with an owner that moves by itself (handoff.rs): the server sends
+//! `client_owned = true` with it, and the holder of the body is its owner.
+//!
 //! **Who has a live body** ([`body_live`]): on the server every body but a `client_owned` one a client
-//! owns; on a client a `client_owned` one it owns, and every `simulated` one. The others are frozen.
+//! owns; on a client a `client_owned` one it owns, and every `simulated` one. The others are frozen. A
+//! client's body that stops being live here in `handoff` (a lost claim, a return) blends from where it
+//! was shown to the new authority's stream; a held one is recorded and posed for replays like a
+//! `simulated` one, and kept at its quantised position and rotation (`snap_held`).
 //! The decision is re-applied every tick (`gate_and_track`), so an owner change or a mode change moves
 //! the simulation; a body that thaws gets its velocities back (Godot drops them while it is frozen) and
 //! is woken. The first decision on the peer whose game made the node (every entity on the server, a
@@ -51,7 +57,8 @@ pub enum PhysicsOption {
     /// The entity's owner simulates (`client_owned` for bodies); the others, the server included,
     /// show it frozen and interpolated.
     Owner = 2,
-    /// Not built yet (WP19 slice C): behaves as `server`, with a one-time warning.
+    /// Whoever interacts with it simulates it: a client whose player or bodies push it claims it, and
+    /// it goes back to the server when it rests (handoff.rs). The others show it frozen.
     Handoff = 3,
     /// Every peer simulates; the server's snapshots correct the clients' bodies.
     Simulated = 4,
@@ -158,10 +165,6 @@ pub fn tuning(scale: f64) -> Tuning {
     t
 }
 
-thread_local! {
-    static WARNED_HANDOFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// The option an entity root declares: its `NetEntity`'s, else the `_net_physics` meta.
 fn declared(root: &Gd<Node>) -> PhysicsOption {
     if let Some(ne) = net_entity_of(root) {
@@ -234,6 +237,27 @@ fn set_bodies_live(nodes: &[Option<Gd<Node>>], live: bool) {
     }
 }
 
+/// Hands a RigidBody node's global transform to the physics server now (a frozen body's collider
+/// otherwise follows a property write only after the tick's `_physics_process` calls).
+pub(super) fn push_transform(n: &Gd<Node>) {
+    if !n.is_instance_valid() {
+        return;
+    }
+    if let Ok(b) = n.clone().try_cast::<RigidBody2D>() {
+        PhysicsServer2D::singleton().body_set_state(
+            b.get_rid(),
+            physics_server_2d::BodyState::TRANSFORM,
+            &b.get_global_transform().to_variant(),
+        );
+    } else if let Ok(b) = n.clone().try_cast::<RigidBody3D>() {
+        PhysicsServer3D::singleton().body_set_state(
+            b.get_rid(),
+            physics_server_3d::BodyState::TRANSFORM,
+            &b.get_global_transform().to_variant(),
+        );
+    }
+}
+
 /// A `simulated` replica's body node.
 #[derive(Clone)]
 enum Body {
@@ -293,6 +317,39 @@ impl Body {
                     lin: [f64::from(v.x), f64::from(v.y), f64::from(v.z)],
                     ang: [f64::from(w.x), f64::from(w.y), f64::from(w.z)],
                 }
+            }
+        }
+    }
+
+    /// Writes the velocities whatever the node's properties hold: an impulse applied since the last
+    /// physics sync is in the physics server but not in the properties, so comparing with them can
+    /// miss it (a replay's impulses would stay). The caller holds its base guard.
+    /// A body still asleep in the physics server took no impulse and is left alone (a write would wake
+    /// it).
+    fn set_velocities(&mut self, p: &Pose) {
+        match self {
+            Body::D2(b) => {
+                let asleep = PhysicsServer2D::singleton()
+                    .body_get_state(b.get_rid(), physics_server_2d::BodyState::SLEEPING)
+                    .try_to::<bool>()
+                    .unwrap_or(false);
+                if asleep {
+                    return;
+                }
+                b.set_linear_velocity(Vector2::new(p.lin[0] as f32, p.lin[1] as f32));
+                b.set_angular_velocity(p.ang[2] as f32);
+            }
+            Body::D3(b) => {
+                let asleep = PhysicsServer3D::singleton()
+                    .body_get_state(b.get_rid(), physics_server_3d::BodyState::SLEEPING)
+                    .try_to::<bool>()
+                    .unwrap_or(false);
+                if asleep {
+                    return;
+                }
+                let v3 = |a: &[f64; 3]| Vector3::new(a[0] as f32, a[1] as f32, a[2] as f32);
+                b.set_linear_velocity(v3(&p.lin));
+                b.set_angular_velocity(v3(&p.ang));
             }
         }
     }
@@ -382,6 +439,9 @@ pub(super) struct SimBody {
     /// Per field of the body part: the pose component it carries.
     fields: Vec<Option<Which>>,
     corr: Corrector,
+    /// WP19: a `handoff` body this client holds: recorded and posed for replays, never corrected (its
+    /// holder receives no state for it).
+    held: bool,
 }
 
 impl SimBody {
@@ -404,6 +464,9 @@ impl SimBody {
     }
 }
 
+/// A held body's pose fields: (entity, part, [(field, value)]).
+pub type HeldPose = (NetId, u16, Vec<(u16, Value)>);
+
 /// Saved simulated bodies around a replay.
 pub struct SavedBodies(Vec<(Body, Pose)>);
 
@@ -422,13 +485,12 @@ impl NetManager {
                 .or(self.physics.mode())
                 .unwrap_or_else(project_mode)
         };
-        if mode == Mode::Handoff && !WARNED_HANDOFF.with(|w| w.replace(true)) {
-            godot_warn!(
-                "gdnet: physics = handoff ({}) is not built yet (WP19 slice C); it behaves as server for now",
-                root.get_path()
-            );
-        }
-        (mode, explicit || mode == Mode::Owner)
+        // `owner` and `handoff` send `client_owned`: the holder's state is accepted and relayed (for
+        // `handoff` the holder is the owner, which moves by itself: handoff.rs).
+        (
+            mode,
+            explicit || mode == Mode::Owner || mode == Mode::Handoff,
+        )
     }
 
     /// Server: the entity rooted at `root` re-resolves its mode (its option, the manager's or the
@@ -482,6 +544,7 @@ impl NetManager {
             return;
         };
         e.physics = mode;
+        self.any_handoff |= mode == Mode::Handoff;
         e.client_owned = client_owned;
         if let Some(id) = e.id {
             self.owned_shown.retain(|k, _| k.0 != id);
@@ -521,17 +584,34 @@ impl NetManager {
         // froze waits until the game thaws it, as in single-player. gdnet only thaws on a change of who
         // simulates (an owner or mode change) and on a replica created from a `Create`.
         let keep = e.body_live.is_none() && live && e.origin != Origin::Remote;
+        // WP19 (handoff): a client's body that stops being simulated here (a lost claim, a return)
+        // blends from where it is shown to the new authority's state instead of jumping.
+        let blend = !is_server && !live && e.body_live == Some(true) && e.physics == Mode::Handoff;
         e.body_live = Some(live);
         let nodes = e.nodes.clone();
         let id = e.id;
-        let simulated = !is_server && live && e.physics == Mode::Simulated;
+        let handoff = e.physics == Mode::Handoff;
+        let simulated = !is_server && live && (e.physics == Mode::Simulated || handoff);
+        if let (true, Some(id), Some(rt)) = (blend, id, e.props.clone()) {
+            let shown = {
+                let _guard = self.base_mut();
+                read_hot_indexed(&rt, &nodes)
+            };
+            let mut s = session.clone();
+            s.bind_mut().with_core(|c, _| {
+                for (p, f, v) in &shown {
+                    c.interp_blend_from(id, *p, *f, v);
+                }
+            });
+        }
         if !keep {
             let _guard = self.base_mut();
             set_bodies_live(&nodes, live);
         }
         if let Some(id) = id {
             if simulated {
-                self.add_sim(iid, id);
+                // A held `handoff` body is recorded for replays like a `simulated` one, never corrected.
+                self.add_sim(iid, id, handoff);
             } else {
                 self.sim.remove(&id);
             }
@@ -560,7 +640,7 @@ impl NetManager {
 
     /// Starts correcting a `simulated` replica: its first body part, the fields that carry its pose,
     /// seeded with what it holds now (the server's values from its `Create` or the last snapshot).
-    fn add_sim(&mut self, iid: InstanceId, id: NetId) {
+    fn add_sim(&mut self, iid: InstanceId, id: NetId, held: bool) {
         let Some(e) = self.entries.get(&iid) else {
             return;
         };
@@ -600,6 +680,7 @@ impl NetManager {
                 part: part as u16,
                 fields,
                 corr,
+                held,
             },
         );
     }
@@ -633,7 +714,7 @@ impl NetManager {
         let mut tunings: [Option<Tuning>; 2] = [None, None];
         let mut started = (0, 0);
         let guard = self.base_mut();
-        for sb in sim.values_mut() {
+        for sb in sim.values_mut().filter(|sb| !sb.held) {
             let k = usize::from(matches!(sb.body, Body::D3(_)));
             let t = *tunings[k].get_or_insert_with(|| tuning(sb.body.scale()));
             let present = sb.body.pose();
@@ -680,10 +761,71 @@ impl NetManager {
         self.sim = sim;
     }
 
+    /// WP19 (handoff), client: the pose fields of each `handoff` body it holds, as (id, part, [(field,
+    /// value)]), for netcore to quantise (`snap_held`).
+    pub fn held_values(&self) -> Vec<HeldPose> {
+        let _guard = self.base();
+        let mut out = Vec::new();
+        for (id, sb) in self.sim.iter().filter(|(_, s)| s.held && s.body.valid()) {
+            let p = sb.body.pose();
+            let d3 = matches!(sb.body, Body::D3(_));
+            let v2 = |a: &[f64; 3]| Value::Vector2([a[0] as f32, a[1] as f32]);
+            let v3 = |a: &[f64; 3]| Value::Vector3([a[0] as f32, a[1] as f32, a[2] as f32]);
+            let vals = sb
+                .fields
+                .iter()
+                .enumerate()
+                .filter_map(|(f, w)| {
+                    let v = match (w.as_ref()?, d3) {
+                        (Which::Pos, false) => v2(&p.pos),
+                        (Which::Pos, true) => v3(&p.pos),
+                        (Which::Rot, false) => Value::Float(correct::angle_of_quat(&p.rot)),
+                        (Which::Rot, true) => Value::Quaternion(p.rot.map(|x| x as f32)),
+                        // Velocities stay as simulated: an impulse this tick's scripts applied is in
+                        // the physics server already, not yet in the node's properties.
+                        (Which::Lin | Which::Ang, _) => return None,
+                    };
+                    Some((f as u16, v))
+                })
+                .collect();
+            out.push((*id, sb.part, vals));
+        }
+        out
+    }
+
+    /// WP19 (handoff), client: puts each held body at its position and rotation as the server will
+    /// receive them (quantised as its fields are sent), so the server's copy, and the copy of this client's player there, meet
+    /// the same body this client's player meets (a difference of a quantiser step decides whether a
+    /// player touches a body, and so whether its prediction holds).
+    pub fn snap_held(&mut self, snapped: Vec<(NetId, Vec<(u16, Value)>)>) {
+        let mut sim = std::mem::take(&mut self.sim);
+        let guard = self.base_mut();
+        for (id, vals) in snapped {
+            let Some(sb) = sim.get_mut(&id).filter(|s| s.held && s.body.valid()) else {
+                continue;
+            };
+            let present = sb.body.pose();
+            let mut p = present;
+            for (f, v) in &vals {
+                match sb.component(*f, v) {
+                    Some(Component::Pos(x)) => p.pos = x,
+                    Some(Component::Rot(q)) => p.rot = q,
+                    Some(Component::Lin(x)) => p.lin = x,
+                    Some(Component::Ang(x)) => p.ang = x,
+                    None => {}
+                }
+            }
+            sb.body.set_pose(&present, &p, false);
+        }
+        drop(guard);
+        self.sim = sim;
+    }
+
     /// (corrections started, snaps, bodies being corrected now, simulated replicas).
     pub fn sim_stats(&self) -> (u64, u64, usize, usize) {
         let busy = self.sim.values().filter(|s| s.corr.is_correcting()).count();
-        (self.sim_counts.0, self.sim_counts.1, busy, self.sim.len())
+        let n = self.sim.values().filter(|s| !s.held).count();
+        (self.sim_counts.0, self.sim_counts.1, busy, n)
     }
 
     /// Before a replay: the simulated bodies' poses.
@@ -713,6 +855,8 @@ impl NetManager {
             if b.valid() {
                 let now = b.pose();
                 b.set_pose(&now, &p, false);
+                // The replayed scripts' impulses are in the physics server only.
+                b.set_velocities(&p);
             }
         }
     }
@@ -725,7 +869,16 @@ impl NetManager {
             .sim
             .values()
             .filter(|s| s.body.valid())
-            .filter_map(|s| s.corr.recorded_pose(tick).map(|p| (s.body.clone(), p)))
+            .filter_map(|s| {
+                // A held `handoff` body is posed at its nearest recorded pose: a replay may reach back
+                // before its claim (it was a frozen replica then) or across a gap in its history.
+                let p = if s.held {
+                    s.corr.recorded_pose_or_nearest(tick)
+                } else {
+                    s.corr.recorded_pose(tick)
+                };
+                p.map(|p| (s.body.clone(), p))
+            })
             .collect();
         if work.is_empty() {
             return;
@@ -734,6 +887,7 @@ impl NetManager {
         for (mut b, p) in work {
             let now = b.pose();
             b.set_pose(&now, &p, false);
+            b.set_velocities(&p);
         }
     }
 

@@ -39,8 +39,8 @@ snapshot rolls it back. Two honest options:
 * **`client_owned` bodies or players** (page 7): the owner simulates, the server trusts. No latency for the
   owner's own entity, but a modified client can put it anywhere.
 
-Handing a touched body to the pushing client for a while, so the push is immediate and still arbitrated by
-the server, is WP15 (cooperative physics ownership, after v1).
+* **`physics = handoff`** (below): the pushing client simulates the body while it pushes it, so the push is
+  immediate on its screen, and the server has the body again once it rests.
 
 ## Body prediction: showing a body where it is now
 
@@ -156,7 +156,7 @@ says what a peer holds.
 |---|---|---|
 | `server` | the server | the body is frozen and interpolated (everything above) |
 | `owner` | the entity's owner (a client, or the server when it owns it) | frozen and interpolated, the server included; the owner's body is live, wakes and sleeps as usual, and moves on the tick of its input |
-| `handoff` | not built yet: behaves as `server`, with a one-time warning | |
+| `handoff` | whoever is pushing it: a client whose player or bodies push it, the server the rest of the time | frozen and interpolated (or predicted), the server included while a client holds it |
 | `simulated` | every peer, the server's result is the reference | the client's body is live; snapshots correct it |
 
 `owner` is `client_owned` for bodies (page 7): `physics = owner` and `client_owned = true` on a body are
@@ -172,6 +172,65 @@ vehicle within 1.4 ticks of the server's copy (9.5 ms on average), and behind it
 half the owner's round trip plus a few ticks (68 to 92 ms; the bound is 50 ms plus three ticks). Dead
 reckoning does not know the owner's input: while the owner drives, the other client trails the server's
 copy by about 50 ms (a `custom` hook can model the thrust, as in the `custom` example above).
+
+**`handoff`.** A body is simulated by whoever is pushing it, and by the server the rest of the time. It is
+the `owner` mode with an owner that changes by itself: the holder is the entity's owner (`owner_changed`
+fires on every peer, `Net.get_owner_of` names it), its body is live, and every other copy is frozen.
+
+*What claims a body.* On a client, its predicted player or a body it simulates (its `owner` bodies, the
+`handoff` bodies it holds) pushing a `handoff` body the server holds. Pushing means: a CharacterBody
+stopped by the body (walking into it from the side or from below, or landing on it); a RigidBody touching
+it while faster than `correction_rest_speed`, or about to hit it within two ticks of its motion (a body hit
+while still frozen stops the one that hits it dead). A player standing still on a body, or a body resting
+on another, does not claim it, and touching never takes a body another client holds. Game code claims a
+body with `Net.claim(node)` (also `NetSession.claim`) for a grab or a carried item; that may take it from
+another client, and the body stays held until `Net.release_owner(node)`. To read contacts gdnet raises
+`max_contacts_reported` to 4 on a body that has 0 and no `contact_monitor`.
+
+*The claim is optimistic.* The claiming client thaws the body in the same tick, so a pushed crate moves on
+the first physics step after the contact (measured over 50 ms links, 2D and 3D: one tick; the server
+shows it 9 to 13 ticks after the contact, another client 13 to 18). The claim carries the body's ownership
+sequence number plus one, and every change of owner raises the number. The server accepts the first claim
+for a number; claims for the same number in the same server tick go to the lowest peer id, and a claim for
+an older number is refused. The loser is told the winner and the state; its copy freezes where it was and
+blends to the winner's (the difference decays like a correction: measured at most 2.2 px per frame beyond
+the body's own motion in 2D, 2.8 cm in 3D, after two players pushed one crate from both sides). On a
+listen server the host's player holds what it touches: a client's claim for a body the host's player
+touched in the last 100 ms is refused. A client whose claim was refused tries again after the rest time at
+the earliest. Overlay rows show the holder (`simulated_by`) and the number (`handoff_seq`).
+
+*The holder's player and the server agree.* The holder stamps each state of the body with the tick whose
+inputs met it, and the server applies it at that tick, so the server's copy of the holder's player meets
+the body where the holder's player met it. At the start of each tick, before anything simulates, the
+holder also puts the body at its quantised position and rotation (what the server receives): a tenth of a
+pixel decides whether a player touches a crate. During a rollback replay a held body is posed where it was
+at each replayed tick, as a `simulated` one is. Measured over 50 ms links: 0 to 6 rollbacks of the pushing
+player over a 1.5 s push and the return in 2D, 2 to 7 in 3D (48 without the stamping and the quantised
+pose). States from anyone but the holder, or from before its claim (late packets of a previous holder),
+are dropped; a claimant's states that arrive with its claim wait for the server's decision.
+
+*Returning.* The holder gives the body back when it has been at rest (asleep, or slower than
+`correction_rest_speed`) for `gdnet/physics/handoff_rest_s` (seconds, default 0.5, about when Godot puts a
+body to sleep; read every tick), or when nothing of the holder's has touched it and none of its players has
+been within the manager's `interaction_radius` of it for that long. A crate pushed and let go is the
+server's again about 0.7 s after the key is released. The server takes a body back at once when its holder
+leaves (whether or not its seat is held, page 13) and when the body leaves the holder's scope; it goes on
+from the holder's state for the server's present tick, still moving if it was. A body the server holds is
+the server's to simulate, so a pile of `handoff` crates nobody touches is a `server` pile: asleep, no
+bytes, no claims.
+
+The other clients show a held body frozen, interpolated or per `body_prediction`. With `dead_reckoning`
+they show the holder's relayed present: the server applies a holder's state at the tick it was stamped
+with, so another client trails the holder by the holder's prediction lead (measured over 50 ms links: 143
+to 159 ms with a lead of 9 ticks; the bound is the lead plus three ticks).
+
+It is for loose shared objects: crates, balls, carried items, things players push. When two players push
+one body from both sides, the one that does not hold it collides with the holder's body as it was (frozen,
+a little in the past); bodies that are always in shared contact are what `simulated` is for.
+`NetSession.stats()` reports `handoff_claims`, `handoff_claims_refused`, `handoff_returns` (claims and
+returns also `_per_s`), `handoff_stale_states` and `handoff_held`: on the server the claims it received,
+refused and the bodies it got back; on a client the claims it made and lost, its releases, and the bodies
+it holds.
 
 **`simulated`.** The client's body runs in the client's *predicted* timeline, the moment its own
 predicted player is at, so a player and the bodies it touches meet where they are: a player pushing a
@@ -189,9 +248,9 @@ twice. The server never corrects its own bodies, and snapshots cost the same in 
 them the same way), read at each use: `gdnet/physics/correction_position` (metres, default 0.02; 2 px in 2D
 at 100 px per metre, 2 cm in 3D), `gdnet/physics/correction_angle` (degrees, default 3),
 `gdnet/physics/correction_decay` (the share of a correction left after one 60 Hz tick, default 0.85) and, for
-`simulated` only,
-`gdnet/physics/correction_rest_speed` (metres per second, default 0.15: a server sample slower than this
-counts as at rest; keep it above Godot's sleep threshold). `NetSession.stats()` reports
+`simulated` and `handoff`,
+`gdnet/physics/correction_rest_speed` (metres per second, default 0.15: a body slower than this counts as at
+rest; keep it above Godot's sleep threshold). `NetSession.stats()` reports
 `sim_corrections` (and `_per_s`), `sim_snaps`, `sim_correcting` and `sim_bodies` on a client.
 
 What it costs and where it shows: a push only the server saw (its player, another client) reaches the

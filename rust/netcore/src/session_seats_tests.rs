@@ -574,3 +574,62 @@ fn an_unknown_session_state_is_refused_clearly() {
         Err(SessionStateError::Corrupt(_))
     ));
 }
+
+/// WP19: a `handoff` body a dropped client held goes back to the server at once, at its last state,
+/// while the client's own entities wait for its seat.
+#[test]
+fn a_handoff_holder_that_drops_gives_the_body_back_at_once_while_its_seat_is_held() {
+    use crate::authority::Transfer;
+    use crate::correct::PhysicsMode;
+    let mut l = Lobby::new(None);
+    l.server.set_rejoin_hold(Hold::Session);
+    l.connect(2, "ka");
+    let body = l
+        .server
+        .spawn(
+            SCENE,
+            Spawn::new(root(), "Crate", SERVER, 1, std::vec![])
+                .with_values(values(1.0, 0))
+                .with_authority(Transfer::Fixed, true)
+                .with_physics(PhysicsMode::Handoff),
+            l.now,
+        )
+        .unwrap();
+    let own = l
+        .server
+        .spawn(
+            SCENE,
+            Spawn::new(root(), "Own", 2, 1, std::vec![]).with_values(values(2.0, 0)),
+            l.now,
+        )
+        .unwrap();
+    l.steps(2);
+    let now = l.now;
+    let c = l.clients.get_mut(&2).unwrap();
+    assert!(c.claim(body, now));
+    c.record_part(body, 0, &[(0, Value::Vector2([30.0, 0.0]))]);
+    l.steps(4);
+    let owner = |l: &Lobby, id: NetId| l.server.entities().get(id).map(|r| (r.owner, r.owner_seq));
+    assert_eq!(owner(&l, body), Some((2, 1)));
+    while l.server.poll_entity_event().is_some() {}
+    l.server.drain_state_updates();
+    l.server.peer_disconnected(2, l.now);
+    assert_eq!(
+        owner(&l, body),
+        Some((SERVER, 2)),
+        "back with the server at once"
+    );
+    assert_eq!(
+        owner(&l, own).map(|o| o.0),
+        Some(2),
+        "its own entity waits for the seat"
+    );
+    assert_eq!(l.server.handoff_stats().returns, 1);
+    let mut ev = Vec::new();
+    while let Some(e) = l.server.poll_entity_event() {
+        ev.push(e);
+    }
+    assert!(ev
+        .iter()
+        .any(|e| matches!(e, EntityEvent::SetOwner { id, owner: SERVER, .. } if *id == body)));
+}

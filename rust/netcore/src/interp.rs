@@ -1006,6 +1006,33 @@ impl Interp {
         true
     }
 
+    /// WP19: a replica field that was shown at `shown` by a body this client simulated until now (a
+    /// lost `handoff` claim, a return): its track gets the offset from its sampled value to `shown`,
+    /// which then decays like a correction's, so the field blends to the new authority's stream
+    /// instead of jumping. False without a track or samples, or beyond the teleport threshold.
+    pub fn blend_from(&mut self, key: FieldKey, shown: &Value) -> bool {
+        let (r, newest) = (self.timeline.render_tick(), self.timeline.newest());
+        let Some(t) = self.tracks.get_mut(&key) else {
+            return false;
+        };
+        let Some(v) = t.value_until(r, newest) else {
+            return false;
+        };
+        let Some((d, m)) = diff(t.params.kind, &v, shown) else {
+            return false;
+        };
+        if m > t.params.teleport || m <= t.params.epsilon * TINY {
+            return false;
+        }
+        t.offset = Some(Offset {
+            params: t.params,
+            value: d,
+        });
+        t.last_out = None;
+        self.timeline.stats.corrections += 1;
+        true
+    }
+
     /// The owned fields with an offset.
     pub fn owned_keys(&self) -> Vec<FieldKey> {
         self.owned.keys().copied().collect()

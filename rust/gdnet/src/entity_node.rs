@@ -195,7 +195,7 @@ pub struct NetEntity {
     net_id: i64,
     /// WP19 (12.4): who simulates this entity's RigidBody parts: `default` (the manager's, else the
     /// project setting `gdnet/physics/mode`, default `server`), `server`, `owner` (the owner simulates,
-    /// as `client_owned`), `handoff` (not built yet: behaves as `server`) or `simulated` (every peer
+    /// as `client_owned`), `handoff` (whoever pushes it simulates it until it rests) or `simulated` (every peer
     /// simulates; the server's snapshots correct the clients). Ignored by an entity without a body. Set
     /// on the server at any time: every peer follows at the next tick. On a client it shows the mode
     /// the server chose.

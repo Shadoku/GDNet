@@ -109,6 +109,12 @@ func _physics_process(delta: float) -> void:
 the client simulates it and its movement reaches everyone through the server. Ownership of a
 `client_owned` entity moves like any other (`set_owner`, `transfer`); whoever owns it is the one trusted.
 
+For bodies, `physics` (page 10) says who simulates them. `physics = owner` is `client_owned` for a body.
+`physics = handoff` makes the owner move by itself: a client whose player or bodies push the body owns it
+(and simulates it) until it rests, then the server owns it again; `Net.claim(node)` takes one for game code
+(a grab, a carried item) and `Net.release_owner(node)` gives it back. Each change raises the body's
+ownership sequence number, which settles two claims at once. `set_owner` and `request_owner` move it too.
+
 ## Rejected writes
 
 A client may only write state it owns (a `client_owned` entity's). When code on a client changes a
@@ -185,6 +191,6 @@ typed arrays included.
 |---|---|
 | `NetEntity` | `owner_peer`, `transfer` (`fixed` / `request` / `take`), `client_owned`, `inherit_owner`, signal `owner_changed(old, new)` |
 | any part | `_net_owner_changed(old, new)`, `_net_grant_owner(requester) -> bool` |
-| `Net` (and `NetSession`) | `set_owner(node, peer)` (server), `request_owner(node) -> NetCall`, `release_owner(node)`, signals `owner_changed(node, old, new)`, `write_rejected(node, sender)`, `state` |
+| `Net` (and `NetSession`) | `set_owner(node, peer)` (server), `request_owner(node) -> NetCall`, `release_owner(node)`, `claim(node) -> bool` (a `handoff` body, page 10), signals `owner_changed(node, old, new)`, `write_rejected(node, sender)`, `state` |
 | `NetKeyedState` | `set`, `get(path, default)`, `erase`, `has`, `keys(prefix)`, `allow(prefix, who)`, `view(prefix, filter)`, signals `changed(path, value)`, `erased(path)`, `write_rejected(path)` |
 | `NetSession.stats()` | `owner_changes`, `writes_rejected`, `writes_sent`, `owner_states_sent`, `owner_states_received`, `ownership_requests_granted`, `ownership_requests_refused`, `keyed_bytes_sent`, `keyed_bytes_received`, `keyed_writes_rejected`, `keyed_entries` |

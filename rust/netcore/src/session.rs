@@ -272,6 +272,8 @@ pub struct Session {
     part_names: BTreeMap<u64, Vec<String>>,
     /// WP4: received state for gdnet (snapshot values minus the hot fields of predicted entities).
     pass_updates: VecDeque<StateUpdate>,
+    /// WP19: claims, holders and holder states of `handoff` bodies (handoff.rs).
+    handoff: crate::handoff::Handoffs,
     /// WP4 owner side: prediction histories and the confirmed mirror.
     prediction: Prediction,
     /// WP4 owner side: the frames this peer sampled, by entity and tick.
@@ -520,6 +522,7 @@ impl Session {
             remote_props: BTreeMap::new(),
             part_names: BTreeMap::new(),
             pass_updates: VecDeque::new(),
+            handoff: crate::handoff::Handoffs::default(),
             prediction: Prediction::new(cfg.max_rollback_ticks),
             owner_inputs: OwnerInputs::new(u64::from(cfg.max_rollback_ticks) + 16),
             input_buffers: BTreeMap::new(),
@@ -713,6 +716,17 @@ impl Session {
         let mut held = false;
         let mut seat_event = None;
         if self.role == Role::Server && self.peers.is_joined(peer) {
+            // WP19: the `handoff` bodies it held go back to the server at once, at their last state,
+            // whether or not its seat is held.
+            let holding: Vec<NetId> = self
+                .entities
+                .iter()
+                .filter(|r| r.owner == peer && r.physics == crate::correct::PhysicsMode::Handoff)
+                .map(|r| r.id)
+                .collect();
+            for id in holding {
+                self.return_handoff(id, now_us);
+            }
             // WP17: a seated peer's seat is held for the rejoin window: its entities, player, rooms,
             // `visible_to` lists and view decisions stay under its old id until it rejoins or the
             // window ends.
@@ -1084,6 +1098,9 @@ impl Session {
             self.expire_seats(tick, now_us);
         }
         self.input_tick(tick);
+        if self.role == Role::Server {
+            self.handoff_tick(tick, now_us);
+        }
         self.expire_queries(tick, now_us);
         self.expire_calls(now_us);
         self.flush_emulated(now_us);
@@ -1225,6 +1242,7 @@ fn held_description(a: &EntityAction, paths: &BTreeMap<u64, String>) -> String {
             std::format!("an ownership decision on entity {id}")
         }
         EntityAction::SetPhysics { id, .. } => std::format!("the physics mode of entity {id}"),
+        EntityAction::Claim { id, .. } => std::format!("the claim of entity {id}"),
         EntityAction::Scene { path, .. } => std::format!("the scene {path}"),
         EntityAction::Travel { room, .. } => std::format!("the travel to room {room}"),
         EntityAction::TravelAck { .. } => String::from("a travel acknowledgement"),
@@ -1413,6 +1431,7 @@ impl Session {
             transfer,
             client_owned,
             physics,
+            owner_seq: 0,
         };
         self.entities.insert(&create);
         if self.role == Role::Client {
@@ -1497,6 +1516,13 @@ impl Session {
             return true;
         }
         self.entities.set_owner(id, owner);
+        // WP19: every change of owner raises the ownership sequence number (handoff.rs).
+        let seq = self
+            .entities
+            .get(id)
+            .map_or(0, |r| r.owner_seq.wrapping_add(1));
+        self.entities.set_owner_seq(id, seq);
+        self.handoff.forget_holder(id);
         // A new owner starts a new input stream and a new owner-state stream.
         self.input_buffers.remove(&id);
         self.server_inputs.remove(&id);
@@ -1521,6 +1547,7 @@ impl Session {
         self.share_with_state(id, now_us, |tick, state| EntityAction::SetOwner {
             id,
             owner,
+            seq,
             tick,
             state,
         });
@@ -1679,7 +1706,8 @@ impl Session {
                     // WP7: checked when applied (the entity and its owner may change meanwhile).
                     EntityAction::RequestOwner { .. }
                     | EntityAction::ReleaseOwner { .. }
-                    | EntityAction::OwnerAnswer { .. } => true,
+                    | EntityAction::OwnerAnswer { .. }
+                    | EntityAction::Claim { .. } => true,
                     // WP6: admitted by `on_call` (sender set from the transport).
                     EntityAction::Call(_) => true,
                 }
@@ -1804,10 +1832,22 @@ impl Session {
             EntityAction::SetOwner {
                 id,
                 owner,
+                seq,
                 tick,
                 state,
             } => {
-                let manager = self.entities.get(id).map(|r| r.parent.manager);
+                let current = self.entities.get(id).map(|r| (r.parent.manager, r.owner));
+                // WP19: the sequence number, and the answer to a claim this side made (the server
+                // answers each claim with a `SetOwner`: the change it made, or the holder it kept).
+                self.entities.set_owner_seq(id, seq);
+                if let Some((_, release)) = self.handoff.claimed.remove(&id) {
+                    let wanted = if release { SERVER } else { self.local_id };
+                    if owner != wanted {
+                        self.handoff.stats.refused += 1;
+                    }
+                }
+                // A refusal may name the owner this side already shows (the holder it had seen).
+                let manager = current.filter(|c| c.1 != owner).map(|c| c.0);
                 if let Some(manager) = manager {
                     if self.entities.set_owner(id, owner) {
                         self.auth.stats.owner_changes += 1;
@@ -1879,6 +1919,27 @@ impl Session {
                     self.apply_physics(id, physics, client_owned);
                     // The new pipeline starts from the server's full state (see the action).
                     self.inject_state(id, tick, &state);
+                }
+            }
+            EntityAction::Claim {
+                id,
+                seq,
+                release,
+                tick,
+                state,
+            } => {
+                if self.role == Role::Server && self.entities.contains(id) {
+                    let claim = crate::handoff::Claim {
+                        peer: from,
+                        seq,
+                        tick,
+                        release,
+                    };
+                    self.handoff
+                        .pending
+                        .entry(id)
+                        .or_default()
+                        .push((claim, state));
                 }
             }
         }
@@ -2997,6 +3058,47 @@ impl Session {
             else {
                 continue;
             };
+            // WP19: a `handoff` body's states come from its holder only, from its claim on, and wait
+            // for their tick (handoff.rs); the others are dropped without a reply.
+            let handoff = self
+                .entities
+                .get(id)
+                .is_some_and(|r| r.physics == crate::correct::PhysicsMode::Handoff);
+            if handoff && !reliable {
+                // A claimant's states that arrive before the server decided its claim wait beside
+                // it: they join the queue if it wins (handoff_tick).
+                let claiming = owner != peer
+                    && self.handoff.pending.get(&id).is_some_and(|c| {
+                        c.iter()
+                            .any(|(c, _)| c.peer == peer && !c.release && m.tick >= c.tick)
+                    });
+                if claiming {
+                    self.handoff
+                        .early
+                        .entry((id, peer))
+                        .or_default()
+                        .push((m.tick, bytes));
+                    continue;
+                }
+                let since = self.handoff.held_since.get(&id).copied().unwrap_or(0);
+                let queued = crate::handoff::accepts_state(owner, since, peer, m.tick)
+                    && self
+                        .handoff
+                        .queues
+                        .entry(id)
+                        .or_default()
+                        .push(m.tick, bytes);
+                if queued {
+                    self.auth.stats.owner_states_received += 1;
+                    // Received before this step's tick: the next server tick is `tick + 1`.
+                    if m.tick <= tick {
+                        self.handoff.stats.late_states += 1;
+                    }
+                } else {
+                    self.handoff.stats.stale_states += 1;
+                }
+                continue;
+            }
             if client_owned && owner == peer {
                 if !reliable && self.auth.owner_tick.get(&id).is_some_and(|t| *t >= m.tick) {
                     continue;
@@ -3144,21 +3246,42 @@ impl Session {
     /// last few ticks (or is due for its keyframe), packed into unreliable owner-state messages; then
     /// the queued writes, reliably.
     fn send_owner_states(&mut self, now_us: u64) {
-        let tick = self.clock.tick();
-        let rate = u64::from(self.tick_rate());
+        // WP19: claims and releases of `handoff` bodies first, with this side's state of each.
+        self.flush_claims(now_us);
         let local = self.local_id;
-        let owned: Vec<NetId> = self
+        let (held, owned): (Vec<_>, Vec<_>) = self
             .entities
             .iter()
             .filter(|r| r.client_owned && r.owner == local)
-            .map(|r| r.id)
-            .collect();
+            .map(|r| (r.id, r.physics == crate::correct::PhysicsMode::Handoff))
+            .partition(|(_, h)| *h);
+        let tick = self.clock.tick();
+        self.send_states(owned.into_iter().map(|(id, _)| id).collect(), tick, now_us);
+        // WP19: a held `handoff` body's states carry the predicted tick whose inputs met them: the
+        // server applies each at that tick, beside the inputs of the same tick.
+        let predicted = self.predicted_tick();
+        self.send_states(
+            held.into_iter().map(|(id, _)| id).collect(),
+            predicted,
+            now_us,
+        );
+        if !self.auth.write_queue.is_empty() {
+            let entities = core::mem::take(&mut self.auth.write_queue);
+            self.send(SERVER, &Message::Write(StateMsg { tick, entities }), now_us);
+        }
+    }
+
+    /// The owner states of `ids` that changed in the last few ticks (or are due for their keyframe),
+    /// in unreliable messages stamped `stamp`.
+    fn send_states(&mut self, ids: Vec<NetId>, stamp: u64, now_us: u64) {
+        let tick = self.clock.tick();
+        let rate = u64::from(self.tick_rate());
         let mut msg = StateMsg {
-            tick,
+            tick: stamp,
             entities: Vec::new(),
         };
         let mut size = 0usize;
-        for id in owned {
+        for id in ids {
             let Some(changed) = self.repl.last_change(id) else {
                 continue;
             };
@@ -3176,7 +3299,7 @@ impl Session {
                 let full = core::mem::replace(
                     &mut msg,
                     StateMsg {
-                        tick,
+                        tick: stamp,
                         entities: Vec::new(),
                     },
                 );
@@ -3192,10 +3315,276 @@ impl Session {
             self.auth.stats.owner_states_sent += 1;
             self.send(SERVER, &Message::OwnerState(msg), now_us);
         }
-        if !self.auth.write_queue.is_empty() {
-            let entities = core::mem::take(&mut self.auth.write_queue);
-            self.send(SERVER, &Message::Write(StateMsg { tick, entities }), now_us);
+    }
+}
+
+/// The `handoff` physics mode (WP19, docs/PLAN_NETCODE.md 12.4; see [`crate::handoff`]): claims,
+/// releases, the server's arbitration, holder states applied at their tick, returns.
+impl Session {
+    pub fn handoff_stats(&self) -> crate::handoff::HandoffStats {
+        self.handoff.stats
+    }
+
+    /// The ownership sequence number of `id` as this side knows it.
+    pub fn owner_seq(&self, id: NetId) -> Option<u32> {
+        self.entities.get(id).map(|r| r.owner_seq)
+    }
+
+    fn is_handoff(&self, id: NetId) -> bool {
+        self.entities
+            .get(id)
+            .is_some_and(|r| r.physics == crate::correct::PhysicsMode::Handoff)
+    }
+
+    /// Claims the `handoff` body `id` for this side. A client's claim is optimistic: its table names it
+    /// the owner at once (with a local `SetOwner` event, so gdnet thaws the body now) and the claim goes
+    /// out with the next packets, carrying the number it saw plus one and this side's state; the
+    /// server's `SetOwner` confirms or overrides it. The server takes the body at once. False when `id`
+    /// is not a `handoff` body, this side holds it already, or the session is not connected.
+    pub fn claim(&mut self, id: NetId, now_us: u64) -> bool {
+        if !self.is_connected() || !self.is_handoff(id) {
+            return false;
         }
+        let Some((owner, seq)) = self.entities.get(id).map(|r| (r.owner, r.owner_seq)) else {
+            return false;
+        };
+        if owner == self.local_id {
+            return false;
+        }
+        self.handoff.stats.claims += 1;
+        match self.role {
+            Role::Server => {
+                self.take_back(id, now_us);
+            }
+            Role::Client => {
+                let next = seq.wrapping_add(1);
+                self.handoff.claimed.insert(id, (next, false));
+                self.handoff.out.push((id, next, false));
+                self.local_owner(id, self.local_id);
+            }
+        }
+        true
+    }
+
+    /// Gives the `handoff` body `id` back to the server. A client must hold it (optimistic, as
+    /// [`Session::claim`]); on the server it takes the body from its holder. False when there is
+    /// nothing to give back.
+    pub fn release_handoff(&mut self, id: NetId, now_us: u64) -> bool {
+        if !self.is_connected() || !self.is_handoff(id) {
+            return false;
+        }
+        let Some((owner, seq)) = self.entities.get(id).map(|r| (r.owner, r.owner_seq)) else {
+            return false;
+        };
+        match self.role {
+            Role::Server => owner != SERVER && self.return_handoff(id, now_us),
+            Role::Client => {
+                if owner != self.local_id {
+                    return false;
+                }
+                let next = seq.wrapping_add(1);
+                self.handoff.claimed.insert(id, (next, true));
+                self.handoff.out.push((id, next, true));
+                self.handoff.stats.returns += 1;
+                self.local_owner(id, SERVER);
+                true
+            }
+        }
+    }
+
+    /// Server: its own player (a listen server) touched the `handoff` body `id` this tick; while it
+    /// holds the body, clients' claims are refused for [`crate::handoff::SERVER_TOUCH_GUARD_TICKS`].
+    pub fn handoff_touched(&mut self, id: NetId) {
+        if self.role == Role::Server {
+            let tick = self.clock.tick();
+            self.handoff.touched.insert(id, tick);
+        }
+    }
+
+    /// Client: the optimistic change of a claim or release.
+    fn local_owner(&mut self, id: NetId, owner: PeerId) {
+        let Some(manager) = self.entities.get(id).map(|r| r.parent.manager) else {
+            return;
+        };
+        self.entities.set_owner(id, owner);
+        self.auth.last_sent.remove(&id);
+        self.auth.pending_writes.retain(|k| k.0 != id);
+        self.interp.reset(id);
+        self.entity_events
+            .push_back(EntityEvent::SetOwner { id, manager, owner });
+    }
+
+    /// Client: sends the queued claims and releases, each with this side's state of the body.
+    fn flush_claims(&mut self, now_us: u64) {
+        if self.handoff.out.is_empty() {
+            return;
+        }
+        let tick = self.predicted_tick();
+        for (id, seq, release) in core::mem::take(&mut self.handoff.out) {
+            let state = if self.repl.entity(id).is_some() {
+                self.repl.encode_full(id)
+            } else {
+                Vec::new()
+            };
+            let claim = EntityAction::Claim {
+                id,
+                seq,
+                release,
+                tick,
+                state,
+            };
+            self.send(SERVER, &Message::Entity(claim), now_us);
+        }
+    }
+
+    /// Server: the holder of `id` changes now: its states due by this tick apply, the ones stamped
+    /// for later ticks (the holder ran ahead by its prediction lead) are dropped, so the body goes on
+    /// from the holder's state for the server's present tick, without a jump.
+    fn flush_holder_states(&mut self, id: NetId) {
+        let now = self.clock.tick();
+        let due = self
+            .handoff
+            .queues
+            .get_mut(&id)
+            .map(|q| q.due(now))
+            .unwrap_or_default();
+        for bytes in due {
+            self.apply_holder_state(id, &bytes);
+        }
+        self.handoff.queues.remove(&id);
+    }
+
+    /// Server, each tick: the holder states due now, then this tick's claims.
+    fn handoff_tick(&mut self, tick: u64, now_us: u64) {
+        let ids: Vec<NetId> = self.handoff.queues.keys().copied().collect();
+        for id in ids {
+            let due = self
+                .handoff
+                .queues
+                .get_mut(&id)
+                .map(|q| q.due(tick))
+                .unwrap_or_default();
+            for bytes in due {
+                self.apply_holder_state(id, &bytes);
+            }
+        }
+        self.handoff
+            .touched
+            .retain(|_, t| tick.saturating_sub(*t) <= crate::handoff::SERVER_TOUCH_GUARD_TICKS);
+        let pending = core::mem::take(&mut self.handoff.pending);
+        for (id, claims) in pending {
+            let Some((holder, seq, physics)) = self
+                .entities
+                .get(id)
+                .map(|r| (r.owner, r.owner_seq, r.physics))
+            else {
+                continue;
+            };
+            let list: Vec<crate::handoff::Claim> = claims.iter().map(|c| c.0).collect();
+            let touched = self.handoff.touched.get(&id).copied();
+            let out = if physics == crate::correct::PhysicsMode::Handoff {
+                crate::handoff::arbitrate(holder, seq, &list, touched, tick)
+            } else {
+                crate::handoff::Outcome {
+                    holder,
+                    seq,
+                    winner: None,
+                    verdicts: std::vec![crate::handoff::Verdict::Refuse; list.len()],
+                }
+            };
+            self.handoff.stats.claims += list.iter().filter(|c| !c.release).count() as u64;
+            if let Some(w) = out.winner {
+                let (c, state) = &claims[w];
+                if c.release {
+                    // The release's state counts as the holder's state of its tick.
+                    self.handoff
+                        .queues
+                        .entry(id)
+                        .or_default()
+                        .push(c.tick, state.clone());
+                }
+                self.flush_holder_states(id);
+                if c.release {
+                    self.handoff.stats.returns += 1;
+                    self.change_owner(id, SERVER, false, now_us);
+                } else {
+                    self.change_owner(id, c.peer, true, now_us);
+                    self.handoff.held_since.insert(id, c.tick);
+                    let mut early = self.handoff.early.remove(&(id, c.peer)).unwrap_or_default();
+                    early.sort_by_key(|e| e.0);
+                    let q = self.handoff.queues.entry(id).or_default();
+                    q.push(c.tick, state.clone());
+                    for (t, bytes) in early {
+                        q.push(t, bytes);
+                    }
+                }
+            }
+            self.handoff.early.retain(|k, _| k.0 != id);
+            for (i, v) in out.verdicts.iter().enumerate() {
+                if *v == crate::handoff::Verdict::Refuse {
+                    self.handoff.stats.refused += 1;
+                    self.answer_claim(claims[i].0.peer, id, now_us);
+                }
+            }
+        }
+    }
+
+    /// Server: a client's holder state of `id`, applied now: recorded, relayed, handed to gdnet.
+    fn apply_holder_state(&mut self, id: NetId, bytes: &[u8]) {
+        let Some(scene) = self.entities.get(id).map(|r| r.scene) else {
+            return;
+        };
+        let tick = self.clock.tick();
+        for (part, field, value) in self.record_encoded(id, scene, bytes) {
+            self.pass_updates.push_back(StateUpdate {
+                id,
+                part,
+                field,
+                value,
+                tick,
+            });
+        }
+    }
+
+    /// Server: a refused claimant learns the holder, the number and the state.
+    fn answer_claim(&mut self, peer: PeerId, id: NetId, now_us: u64) {
+        if !self.peers.is_joined(peer) || !self.knows(peer, id) {
+            return;
+        }
+        let Some((owner, seq)) = self.entities.get(id).map(|r| (r.owner, r.owner_seq)) else {
+            return;
+        };
+        let state = if self.repl.entity(id).is_some() {
+            self.repl.encode_full_for(id, owner == peer)
+        } else {
+            Vec::new()
+        };
+        let tick = self.clock.tick();
+        self.send_entity(
+            peer,
+            EntityAction::SetOwner {
+                id,
+                owner,
+                seq,
+                tick,
+                state,
+            },
+            now_us,
+        );
+        self.repl.mark_synced(peer, id, owner == peer);
+    }
+
+    /// Server: takes `id` from its client holder, at the holder's last state.
+    fn take_back(&mut self, id: NetId, now_us: u64) -> bool {
+        self.flush_holder_states(id);
+        self.change_owner(id, SERVER, false, now_us)
+    }
+
+    /// Server: `id` goes back to the server at the holder's last state (it left, its seat was dropped,
+    /// the body left its scope, or game code released it).
+    fn return_handoff(&mut self, id: NetId, now_us: u64) -> bool {
+        self.handoff.stats.returns += 1;
+        self.take_back(id, now_us)
     }
 }
 
@@ -3619,6 +4008,22 @@ impl Session {
             .map(|o| o.apply(sim))
     }
 
+    /// WP19: `value` of entity `id`'s field `(part, field)` as the peers receive it (quantised by its
+    /// descriptor); None for an unknown entity or field.
+    pub fn quantized(&self, id: NetId, part: u16, field: u16, value: &Value) -> Option<Value> {
+        let scene = self.entities.get(id)?.scene;
+        let d = self.repl.table(scene)?.get(part, field)?;
+        crate::quant::round_trip(d.ty, d.quant, value)
+    }
+
+    /// WP19: the replica field `(id, part, field)` blends from `shown` (see [`Interp::blend_from`]).
+    pub fn interp_blend_from(&mut self, id: NetId, part: u16, field: u16, shown: &Value) -> bool {
+        if self.interpolated_desc(id, part, field).is_none() {
+            return false;
+        }
+        self.interp.blend_from((id, part, field), shown)
+    }
+
     /// Forgets the samples and offsets of `id` (its authority changed: WP7 calls this too).
     pub fn interp_reset(&mut self, id: NetId) {
         self.interp.reset(id);
@@ -3990,7 +4395,9 @@ impl Session {
         let Some(root) = self.entities.root_of(id) else {
             return false;
         };
-        root.owner == peer
+        // WP19: a `handoff` body follows the ordinary scope rule while a client holds it (it goes back
+        // to the server when it leaves the holder's scope).
+        (root.owner == peer && root.physics != crate::correct::PhysicsMode::Handoff)
             || (self
                 .scope
                 .rooms
@@ -4127,6 +4534,15 @@ impl Session {
     fn leave_scope(&mut self, peer: PeerId, leave: Vec<NetId>, now_us: u64) {
         if leave.is_empty() {
             return;
+        }
+        // WP19: a `handoff` body leaving its holder's scope goes back to the server.
+        for id in &leave {
+            let held = self.entities.get(*id).is_some_and(|r| {
+                r.owner == peer && r.physics == crate::correct::PhysicsMode::Handoff
+            });
+            if held {
+                self.return_handoff(*id, now_us);
+            }
         }
         self.scope.stats.left += leave.len() as u64;
         if let Some(k) = self.scope.known.get_mut(&peer) {
@@ -4922,6 +5338,7 @@ mod tests {
             EntityAction::SetOwner {
                 id: 11,
                 owner: 5,
+                seq: 1,
                 tick: 0,
                 state: std::vec![],
             },
@@ -5122,6 +5539,7 @@ mod tests {
         bytes = wire::encode(&Message::Entity(EntityAction::SetOwner {
             id,
             owner: 2,
+            seq: 1,
             tick: 0,
             state: std::vec![],
         }));
@@ -6812,5 +7230,209 @@ mod tests {
             p.client.entities().get(npc).map(|r| r.parent.manager),
             Some(1)
         );
+    }
+
+    // ---- WP19: handoff -------------------------------------------------------------------------
+
+    impl Trio {
+        fn spawn_handoff(&mut self) -> NetId {
+            let id = self
+                .server
+                .spawn(
+                    SCENE,
+                    Spawn::new(root(1), "Crate", SERVER, 3, std::vec![])
+                        .with_values(state(1.0))
+                        .with_authority(Transfer::Fixed, true)
+                        .with_physics(crate::correct::PhysicsMode::Handoff),
+                    self.now,
+                )
+                .unwrap();
+            self.steps(2);
+            for s in [&mut self.server, &mut self.a, &mut self.b] {
+                entity_events(s);
+                s.drain_state_updates();
+            }
+            id
+        }
+
+        fn seqs(&self, id: NetId) -> [u32; 3] {
+            [&self.server, &self.a, &self.b].map(|s| s.owner_seq(id).unwrap_or(u32::MAX))
+        }
+    }
+
+    fn owner_state(id: NetId, tick: u64, bytes: Vec<u8>) -> Vec<u8> {
+        wire::encode(&Message::OwnerState(crate::authority::StateMsg {
+            tick,
+            entities: std::vec![(id, bytes)],
+        }))
+    }
+
+    #[test]
+    fn handoff_claims_in_one_tick_agree_on_the_lowest_peer_and_the_loser_is_answered() {
+        let mut t = Trio::new();
+        let id = t.spawn_handoff();
+        assert_eq!(t.owner(id), [SERVER; 3]);
+        assert_eq!(t.seqs(id), [0; 3]);
+        // B claims first in the same tick: the claims reach the server together.
+        assert!(t.b.claim(id, t.now));
+        assert!(t.a.claim(id, t.now));
+        assert!(!t.a.claim(id, t.now), "a holds it already (optimistically)");
+        // Optimistic: each claimant names itself at once and tells gdnet.
+        assert_eq!(owner_sets(&entity_events(&mut t.a)), [(id, 2)]);
+        assert_eq!(owner_sets(&entity_events(&mut t.b)), [(id, 3)]);
+        assert!(t.a.owns_state(id) && t.b.owns_state(id));
+        t.steps(3);
+        assert_eq!(t.owner(id), [2; 3], "the lowest peer id wins the tie");
+        assert_eq!(t.seqs(id), [1; 3], "one change: sequence 1 everywhere");
+        assert_eq!(
+            owner_sets(&entity_events(&mut t.b)),
+            [(id, 2)],
+            "the loser freezes"
+        );
+        assert!(
+            owner_sets(&entity_events(&mut t.a)).is_empty(),
+            "the winner already had it"
+        );
+        assert_eq!(t.server.handoff_stats().claims, 2);
+        assert_eq!(t.server.handoff_stats().refused, 1);
+        assert_eq!(t.b.handoff_stats().refused, 1);
+        assert_eq!(t.a.handoff_stats().refused, 0);
+        // A claim for an old number is refused: B claims it from A (game code may) with the number it
+        // saw, but A already gave it back.
+        // The holder's states reach the server and apply at their ticks.
+        t.a.record_part(id, 0, &[(0, Value::Vector2([5.0, 1.0]))]);
+        t.steps(12);
+        assert!(t
+            .server
+            .drain_state_updates()
+            .iter()
+            .any(|u| u.id == id && u.value == Value::Vector2([5.0, 1.0])));
+        // A releases with a state of a tick the server has not reached yet (A runs ahead by its lead):
+        // the server goes on from its present state, the future one is dropped.
+        t.a.record_part(id, 0, &[(0, Value::Vector2([6.0, 1.0]))]);
+        assert!(t.a.release_handoff(id, t.now));
+        assert!(t.b.claim(id, t.now));
+        t.steps(3);
+        assert_eq!(
+            t.owner(id),
+            [SERVER; 3],
+            "the release came first (lowest rank)"
+        );
+        assert_eq!(t.seqs(id), [2; 3]);
+        assert_eq!(t.b.handoff_stats().refused, 2);
+        assert!(t
+            .server
+            .drain_state_updates()
+            .iter()
+            .all(|u| u.value != Value::Vector2([6.0, 1.0])));
+    }
+
+    #[test]
+    fn a_claimants_states_sent_with_its_claim_apply_once_it_wins() {
+        let mut t = Trio::new();
+        let id = t.spawn_handoff();
+        assert!(t.a.claim(id, t.now));
+        // Two ticks of the claimant (its claim, then a state of the next tick) reach the server in
+        // one batch, before the server decided the claim.
+        for x in [4.0, 5.0] {
+            t.now += TICK_US;
+            t.a.record_part(id, 0, &[(0, Value::Vector2([x, 1.0]))]);
+            t.a.tick(t.now);
+            t.a.send_snapshots(t.now);
+        }
+        for o in t.a.outgoing() {
+            t.server.receive(2, &o.bytes, t.now);
+        }
+        t.steps(14);
+        assert_eq!(t.owner(id), [2; 3]);
+        assert!(t
+            .server
+            .drain_state_updates()
+            .iter()
+            .any(|u| u.id == id && u.value == Value::Vector2([5.0, 1.0])));
+        assert_eq!(t.server.handoff_stats().stale_states, 0, "none dropped");
+    }
+
+    #[test]
+    fn a_body_the_servers_player_touches_stays_with_the_server() {
+        let mut t = Trio::new();
+        let id = t.spawn_handoff();
+        t.server.handoff_touched(id);
+        assert!(t.a.claim(id, t.now));
+        t.steps(3);
+        assert_eq!(
+            t.owner(id),
+            [SERVER; 3],
+            "the claimant is answered with the server"
+        );
+        assert_eq!(t.seqs(id), [0; 3]);
+        assert_eq!(t.a.handoff_stats().refused, 1);
+        assert!(!t.a.owns_state(id));
+        // Once the guard is over, the claim goes through.
+        t.steps(crate::handoff::SERVER_TOUCH_GUARD_TICKS as usize);
+        assert!(t.a.claim(id, t.now));
+        t.steps(3);
+        assert_eq!(t.owner(id), [2; 3]);
+        assert_eq!(t.seqs(id), [1; 3]);
+    }
+
+    #[test]
+    fn holder_states_apply_at_their_tick_and_stale_ones_are_dropped() {
+        let mut t = Trio::new();
+        let id = t.spawn_handoff();
+        assert!(t.a.claim(id, t.now));
+        t.steps(3);
+        assert_eq!(t.owner(id), [2; 3]);
+        t.server.drain_state_updates();
+        let enc = |s: &Session, x: f32| {
+            let scene = s.entities().get(id).unwrap().scene;
+            s.replication()
+                .encode_values(id, scene, &[(0, 0, Value::Vector2([x, 1.0]))])
+        };
+        let bytes = enc(&t.server, 7.0);
+        let since = t.server.handoff.held_since[&id];
+        assert!(
+            since >= t.server.current_tick(),
+            "a claim carries the claimant's predicted tick"
+        );
+        // A state from before the claim, and one from the other client, are dropped.
+        let stale0 = t.server.handoff_stats().stale_states;
+        t.server
+            .receive(2, &owner_state(id, since - 1, bytes.clone()), t.now);
+        t.server
+            .receive(3, &owner_state(id, since + 5, bytes.clone()), t.now);
+        assert_eq!(t.server.handoff_stats().stale_states, stale0 + 2);
+        // The holder's state of tick `since + 1` applies at server tick `since + 1`.
+        t.server
+            .receive(2, &owner_state(id, since + 1, bytes), t.now);
+        let mut applied_at = None;
+        for _ in 0..40 {
+            t.server.tick(t.now);
+            let got = t
+                .server
+                .drain_state_updates()
+                .iter()
+                .any(|u| u.id == id && u.value == Value::Vector2([7.0, 1.0]));
+            if got {
+                applied_at = Some(t.server.current_tick());
+                break;
+            }
+        }
+        assert_eq!(applied_at, Some(since + 1), "applied at its tick");
+        // The server takes it back; the old holder's late state is dropped.
+        assert!(t.server.claim(id, t.now));
+        t.steps(2);
+        assert_eq!(t.owner(id), [SERVER; 3]);
+        let late = enc(&t.server, 9.0);
+        let stale1 = t.server.handoff_stats().stale_states;
+        let tick = t.server.current_tick();
+        t.server.receive(2, &owner_state(id, tick + 1, late), t.now);
+        assert_eq!(t.server.handoff_stats().stale_states, stale1 + 1);
+        t.steps(3);
+        assert!(t
+            .server
+            .drain_state_updates()
+            .iter()
+            .all(|u| u.value != Value::Vector2([9.0, 1.0])));
     }
 }

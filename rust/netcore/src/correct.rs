@@ -47,7 +47,8 @@ pub enum PhysicsMode {
     /// The entity's owner simulates; every other peer, the server included, has it frozen and
     /// interpolated (the `client_owned` mechanism, D21).
     Owner,
-    /// Accepted; WP19 slice C builds it. Until then it behaves as `Server`.
+    /// Whoever interacts with it simulates it: a client that pushes it holds it (as its owner) until it
+    /// rests, then the server has it again (handoff.rs).
     Handoff,
     /// Every peer simulates locally; the server's snapshots correct the replicas.
     Simulated,
@@ -345,6 +346,18 @@ impl Corrector {
     /// The pose recorded for predicted tick `tick`, if the history holds it.
     pub fn recorded_pose(&self, tick: u64) -> Option<Pose> {
         self.recorded(tick).map(|(_, m, _)| m.pose)
+    }
+
+    /// WP19 (handoff): the pose recorded for `tick`, else the newest one before it (a gap: the lead
+    /// grew), else the oldest one (a tick before the history began: a body this side simulates since
+    /// a claim was a frozen replica then, where its first recorded pose has it).
+    pub fn recorded_pose_or_nearest(&self, tick: u64) -> Option<Pose> {
+        self.history
+            .iter()
+            .rev()
+            .find(|(t, _, _)| *t <= tick)
+            .or_else(|| self.history.front())
+            .map(|(_, m, _)| m.pose)
     }
 
     /// Whether a pending offset is still being applied.
@@ -960,5 +973,24 @@ mod tests {
         assert!(norm(&sub(&v, &back)) < 1e-12);
         assert!((angle_of_quat(&quat_of_angle(1.25)) - 1.25).abs() < 1e-12);
         assert_eq!(rot_log(&IDENTITY), [0.0; 3]);
+    }
+
+    #[test]
+    fn the_nearest_recorded_pose_covers_gaps_and_ticks_before_the_history() {
+        let mut c = Corrector::new();
+        assert_eq!(c.recorded_pose_or_nearest(5), None);
+        c.record(10, at(1.0, 0.0), DT);
+        c.record(11, at(2.0, 0.0), DT);
+        c.record(14, at(5.0, 0.0), DT);
+        let x = |t: u64| c.recorded_pose_or_nearest(t).map(|p| p.pos[0]);
+        assert_eq!(x(11), Some(2.0));
+        assert_eq!(x(13), Some(2.0), "a gap: the newest pose before it");
+        assert_eq!(x(3), Some(1.0), "before the history: the oldest pose");
+        assert_eq!(x(20), Some(5.0));
+        assert_eq!(
+            c.recorded_pose(13),
+            None,
+            "the exact lookup still says none"
+        );
     }
 }

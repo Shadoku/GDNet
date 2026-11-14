@@ -411,6 +411,14 @@ pub fn default_value(ty: TypeTag) -> Value {
     }
 }
 
+/// WP19: `value` as it arrives after encoding with `ty` and `q` (what the peers receive).
+pub fn round_trip(ty: TypeTag, q: Quant, value: &Value) -> Option<Value> {
+    let mut w = BitWriter::new();
+    encode(&mut w, ty, q, value);
+    let bytes = w.into_bytes();
+    decode(&mut BitReader::new(&bytes), ty, q)
+}
+
 /// Encodes `value` as a property of type `ty` packed with `q`. A value of another shape encodes the
 /// type's zero value (it decodes as that).
 pub fn encode(w: &mut BitWriter, ty: TypeTag, q: Quant, value: &Value) {

@@ -1,0 +1,17 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/fixtures/handoff/pusher.gd" id="1_pusher"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_pusher"]
+size = Vector2(16, 24)
+
+[node name="Pusher" type="CharacterBody2D"]
+collision_layer = 0
+collision_mask = 3
+script = ExtResource("1_pusher")
+
+[node name="Shape" type="CollisionShape2D" parent="."]
+shape = SubResource("RectangleShape2D_pusher")
+
+[node name="NetEntity" type="NetEntity" parent="."]
+inherit_profile = true

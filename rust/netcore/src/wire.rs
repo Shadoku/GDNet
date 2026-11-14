@@ -534,6 +534,7 @@ mod tests {
             EntityAction::SetOwner {
                 id: 1,
                 owner: 9,
+                seq: 3,
                 tick: 4,
                 state: std::vec![7],
             },
@@ -565,6 +566,13 @@ mod tests {
                 client_owned: true,
                 tick: 77,
                 state: std::vec![1, 2, 3],
+            },
+            EntityAction::Claim {
+                id: 2,
+                seq: 5,
+                release: true,
+                tick: 80,
+                state: std::vec![4, 5],
             },
         ] {
             let msg = Message::Entity(action);

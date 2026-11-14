@@ -1,7 +1,7 @@
 extends TestCase
 ## WP19 slice A (docs/PLAN_NETCODE.md 12.4): the `physics` option and the `owner` mode, in 2D. The
 ## option resolves entity, then manager, then project; `configure()` sets it; a change on the server
-## reaches every peer; `handoff` is accepted and behaves as `server`. `owner` is `client_owned` for
+## reaches every peer; an untouched `handoff` body is the server's. `owner` is `client_owned` for
 ## bodies (D21): the owner's body is live and moves on the tick of its input, everyone else's copy is
 ## frozen and follows; ownership changes move the simulation; a dropped seat's body freezes in place.
 ##
@@ -144,7 +144,8 @@ func test_option_resolves_entity_manager_project_and_changes_reach_every_peer() 
 	for c in net.clients:
 		assert_false((c.get_node("World/ByConfigure") as RigidBody2D).freeze, "now live on %s" % c.name)
 		assert_true((c.get_node("World/ByManager") as RigidBody2D).freeze, "now frozen on %s" % c.name)
-	# `handoff` is accepted and behaves as `server` for now (a one-time warning).
+	# `handoff`: a body nobody touches is simulated by the server and frozen on the clients
+	# (test_net_physics_handoff.gd covers the rest).
 	Net.set_physics(by_manager, NetEntity.PHYSICS_HANDOFF)
 	assert_true(await net.wait_until(func() -> bool: return net.clients.all(func(c: Node) -> bool: return Net.physics_of(c.get_node("World/ByManager")) == "handoff")), "handoff reached the clients")
 	await _frames(2)

@@ -251,6 +251,9 @@ struct Counters {
     /// WP19: corrections of simulated replicas per second.
     window_start_sim_corrections: u64,
     sim_corrections_per_s: u64,
+    /// WP19: handoff claims and returns per second.
+    window_start_handoff: [u64; 2],
+    handoff_per_s: [u64; 2],
 }
 
 #[godot_api]
@@ -1047,6 +1050,22 @@ impl NetSession {
             d.set("owner_states_received", a.owner_states_received as i64);
             d.set("ownership_requests_granted", a.requests_granted as i64);
             d.set("ownership_requests_refused", a.requests_refused as i64);
+            // WP19: handoff (server: claims received, refused, returns to the server, holder states
+            // dropped; client: claims sent, claims lost, releases sent, bodies held now).
+            let h = core.handoff_stats();
+            d.set("handoff_claims", h.claims as i64);
+            d.set("handoff_claims_refused", h.refused as i64);
+            d.set("handoff_returns", h.returns as i64);
+            d.set("handoff_stale_states", h.stale_states as i64);
+            d.set("handoff_late_states", h.late_states as i64);
+            d.set("handoff_claims_per_s", c.handoff_per_s[0] as i64);
+            d.set("handoff_returns_per_s", c.handoff_per_s[1] as i64);
+            let held: usize = self
+                .managers()
+                .iter()
+                .map(|(_, m)| m.bind().handoff_held())
+                .sum();
+            d.set("handoff_held", held as i64);
             let k = core.keyed().stats;
             d.set("keyed_bytes_sent", k.bytes_sent as i64);
             d.set("keyed_bytes_received", k.bytes_received as i64);
@@ -1170,11 +1189,20 @@ impl NetSession {
                 d.set("physics", e.physics);
                 let by = match e.physics {
                     "owner" if e.client_owned => i64::from(e.owner),
+                    "handoff" => i64::from(e.owner),
                     "" => 0,
                     "simulated" => -1,
                     _ => 1,
                 };
                 d.set("simulated_by", by);
+                // WP19: the ownership sequence number (handoff's claims carry it).
+                d.set(
+                    "handoff_seq",
+                    self.core
+                        .as_ref()
+                        .and_then(|c| c.owner_seq(e.id))
+                        .map_or(0, i64::from),
+                );
                 out.push(&d.to_variant());
             }
         }
@@ -1590,6 +1618,11 @@ impl NetSession {
             // WP17: restored entities whose owner's seat is connected go to it.
             self.process_seat_claims();
         }
+        // WP19: the `handoff` bodies this client holds go to their quantised pose before anything
+        // simulates (replays included), so this tick's scripts meet them where the server will.
+        if !self.is_server() && self.is_connected() {
+            self.snap_held();
+        }
         self.input_step();
         self.keyed_step();
         let (events, tick) = {
@@ -1663,6 +1696,11 @@ impl NetSession {
         self.refresh_live_settings();
         // WP16: the tick of nodes travel moved during the physics pass (travel.rs).
         self.catch_up_moved();
+        // WP19: `handoff` claims by contact and the holder's returns, after the physics step and
+        // before this tick's states are recorded (a body claimed now is sent from this tick on).
+        if self.is_connected() {
+            self.handoff_pass();
+        }
         if self.is_server() && self.is_connected() {
             let t0 = now_us();
             let tick = self.core.as_ref().map_or(0, |c| c.current_tick());
@@ -1772,6 +1810,73 @@ impl NetSession {
         self.flush(outgoing);
         self.roll_stats_window();
         self.feed_debugger();
+    }
+
+    /// WP19: each held `handoff` body at its pose as the server receives it (modes.rs `snap_held`).
+    fn snap_held(&mut self) {
+        let managers = self.managers();
+        for (_, mut m) in managers {
+            let vals = m.bind().held_values();
+            if vals.is_empty() {
+                continue;
+            }
+            let Some(core) = self.core.as_ref() else {
+                return;
+            };
+            let snapped: Vec<(NetId, Vec<(u16, netcore::Value)>)> = vals
+                .into_iter()
+                .map(|(id, part, fields)| {
+                    let q = fields
+                        .into_iter()
+                        .filter_map(|(f, v)| core.quantized(id, part, f, &v).map(|q| (f, q)))
+                        .collect();
+                    (id, q)
+                })
+                .collect();
+            let _guard = self.base_mut();
+            m.bind_mut().snap_held(snapped);
+        }
+    }
+
+    /// WP19: the handoff pass (handoff.rs): claims, releases and the server player's touches go to
+    /// netcore; a client's own claims and releases take effect on its bodies at once.
+    fn handoff_pass(&mut self) {
+        let managers = self.managers();
+        let results = {
+            let _guard = self.base_mut();
+            crate::manager::handoff::pass(&managers, 1.0 / f64::from(tick_rate()))
+        };
+        if results.is_empty() {
+            return;
+        }
+        let local = self.core.as_ref().map_or(0, |c| c.local_id());
+        let mut applied: Vec<(Gd<NetManager>, NetId, u32)> = Vec::new();
+        if let Some(core) = self.core.as_mut() {
+            let now = now_us();
+            for (m, step) in &results {
+                for id in &step.touched {
+                    core.handoff_touched(*id);
+                }
+                for id in &step.claims {
+                    if core.claim(*id, now) {
+                        applied.push((m.clone(), *id, local));
+                    }
+                }
+                for id in &step.releases {
+                    if core.release_handoff(*id, now) {
+                        applied.push((m.clone(), *id, netcore::SERVER));
+                    }
+                }
+            }
+        }
+        if applied.is_empty() {
+            return;
+        }
+        let me = self.to_gd();
+        let _guard = self.base_mut();
+        for (mut m, id, owner) in applied {
+            m.bind_mut().handoff_local(id, owner, &me);
+        }
     }
 
     /// WP8: the meter's and the editor tab's figures beyond the counters above.
@@ -1990,6 +2095,17 @@ impl NetSession {
             let c = &mut self.stats;
             c.sim_corrections_per_s = sc - c.window_start_sim_corrections;
             c.window_start_sim_corrections = sc;
+            let h = self
+                .core
+                .as_ref()
+                .map(|core| core.handoff_stats())
+                .unwrap_or_default();
+            let c = &mut self.stats;
+            let now = [h.claims, h.returns];
+            for (i, n) in now.iter().enumerate() {
+                c.handoff_per_s[i] = n - c.window_start_handoff[i];
+            }
+            c.window_start_handoff = now;
             c.poll_ms_avg = c.poll_us_window as f64 / 1000.0 / f64::from(c.window_ticks);
             c.poll_us_window = 0;
             c.window_ticks = 0;

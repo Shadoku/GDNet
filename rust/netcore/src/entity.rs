@@ -107,6 +107,8 @@ pub struct EntityRecord {
     pub client_owned: bool,
     /// WP19: who simulates its bodies (`client_owned` is set for `owner`).
     pub physics: crate::correct::PhysicsMode,
+    /// WP19 (handoff): the ownership sequence number, raised by every change of owner (handoff.rs).
+    pub owner_seq: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -125,6 +127,8 @@ pub struct CreateAction {
     pub client_owned: bool,
     /// WP19 (wire format 6): who simulates the entity's bodies.
     pub physics: crate::correct::PhysicsMode,
+    /// WP19 (handoff): the entity's ownership sequence number.
+    pub owner_seq: u32,
 }
 
 /// `EntityAction` (2.4): one reliable ordered message per action.
@@ -154,6 +158,8 @@ pub enum EntityAction {
     SetOwner {
         id: NetId,
         owner: PeerId,
+        /// WP19 (handoff): the ownership sequence number after the change.
+        seq: u32,
         tick: u64,
         state: Vec<u8>,
     },
@@ -218,6 +224,17 @@ pub enum EntityAction {
     Scope {
         leave: Vec<NetId>,
     },
+    /// WP19 (handoff), client to server: the sender claims the `handoff` body `id` (`release` false)
+    /// or gives it back to the server (`release` true, from its holder). `seq` is the ownership
+    /// sequence number the sender saw plus one; `state` the entity's full state as the sender simulated
+    /// it at its predicted tick `tick`. The server answers with a `SetOwner` (handoff.rs).
+    Claim {
+        id: NetId,
+        seq: u32,
+        release: bool,
+        tick: u64,
+        state: Vec<u8>,
+    },
     /// WP6: a received call (it travels as its own message, kind 11, never as an `EntityAction`). It is
     /// kept here so a call waits behind its entity's pending `Create` in the same held queue, in order.
     #[serde(skip)]
@@ -236,6 +253,7 @@ impl EntityAction {
             EntityAction::Create(c) => Some(c.id),
             EntityAction::Destroy { id }
             | EntityAction::SetOwner { id, .. }
+            | EntityAction::Claim { id, .. }
             | EntityAction::Reparent { id, .. }
             | EntityAction::RequestOwner { id }
             | EntityAction::ReleaseOwner { id }
@@ -259,6 +277,7 @@ impl EntityAction {
             EntityAction::Create(c) => (None, parent(&c.parent)),
             EntityAction::Destroy { id }
             | EntityAction::SetOwner { id, .. }
+            | EntityAction::Claim { id, .. }
             | EntityAction::RequestOwner { id }
             | EntityAction::ReleaseOwner { id }
             | EntityAction::OwnerQuery { id, .. }
@@ -321,6 +340,7 @@ impl EntityTable {
                 transfer: c.transfer,
                 client_owned: c.client_owned,
                 physics: c.physics,
+                owner_seq: c.owner_seq,
             },
         );
         true
@@ -436,6 +456,13 @@ impl EntityTable {
         }
     }
 
+    /// WP19 (handoff): sets the ownership sequence number of `id`.
+    pub fn set_owner_seq(&mut self, id: NetId, seq: u32) {
+        if let Some(r) = self.records.get_mut(&id) {
+            r.owner_seq = seq;
+        }
+    }
+
     /// WP19: sets the physics mode and the effective `client_owned` flag of `id`; false when unknown.
     pub fn set_physics(
         &mut self,
@@ -492,6 +519,7 @@ impl EntityTable {
             transfer: r.transfer,
             client_owned: r.client_owned,
             physics: r.physics,
+            owner_seq: r.owner_seq,
         }
     }
 

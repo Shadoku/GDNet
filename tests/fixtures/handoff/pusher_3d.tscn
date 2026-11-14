@@ -1,0 +1,18 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/fixtures/handoff/pusher_3d.gd" id="1_pusher"]
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_body"]
+size = Vector3(0.5, 1, 0.5)
+
+[node name="Pusher3D" type="CharacterBody3D"]
+collision_layer = 0
+collision_mask = 1
+script = ExtResource("1_pusher")
+
+[node name="Shape" type="CollisionShape3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5, 0)
+shape = SubResource("BoxShape3D_body")
+
+[node name="NetEntity" type="NetEntity" parent="."]
+inherit_profile = true

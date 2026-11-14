@@ -31,6 +31,7 @@ pub mod correct;
 pub mod delta;
 pub mod emul;
 pub mod entity;
+pub mod handoff;
 pub mod hash;
 pub mod input;
 pub mod interest;

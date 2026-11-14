@@ -63,6 +63,10 @@ pub(crate) mod idle;
 #[path = "modes.rs"]
 pub(crate) mod modes;
 
+/// WP19: the `handoff` mode (claims by contact, the holder's returns, `Net.claim`).
+#[path = "handoff.rs"]
+pub(crate) mod handoff;
+
 /// The group every manager joins, so a session can find the managers of its branch.
 pub const MANAGERS_GROUP: &str = "__gdnet_managers";
 /// Nodes in this group (and below them) are never enrolled (`Net.ignore()`).
@@ -311,6 +315,12 @@ pub struct NetManager {
     /// WP19, client: the `simulated` replicas being corrected, and (corrections, snaps) so far.
     sim: HashMap<NetId, modes::SimBody>,
     sim_counts: (u64, u64),
+    /// WP19, client: the holding timers of the `handoff` bodies it holds (handoff.rs).
+    holding: HashMap<NetId, netcore::handoff::Holding>,
+    /// WP19, client: the physics frame of its last claim by contact per body (one per rest time).
+    last_claim: HashMap<NetId, u64>,
+    /// WP19: an entity here has been a `handoff` body (the handoff pass skips managers without one).
+    any_handoff: bool,
     /// WP16, server: the addresses of this level's own entities (see `Entry::home`).
     homes: Vec<Rc<str>>,
     /// WP16, server: an entity of `homes` went away since the session last asked.
@@ -936,6 +946,7 @@ impl NetManager {
                         e.client_owned = create.client_owned;
                         e.transfer = create.transfer;
                         e.physics = create.physics;
+                        self.any_handoff |= create.physics == netcore::PhysicsMode::Handoff;
                     }
                 } else {
                     let mut entry = Entry::new(scene.clone(), create.owner, Origin::Remote);
@@ -944,6 +955,7 @@ impl NetManager {
                     entry.client_owned = create.client_owned;
                     entry.transfer = create.transfer;
                     entry.physics = create.physics;
+                    self.any_handoff |= create.physics == netcore::PhysicsMode::Handoff;
                     self.entries.insert(iid, entry);
                     self.order.push(iid);
                     let mut n = node.clone();
@@ -957,7 +969,10 @@ impl NetManager {
                     self.pending_act.push(iid);
                 }
                 set_net_entity(&node, Some(create.owner), Some(create.id));
-                set_net_entity_authority(&node, create.transfer, create.client_owned);
+                // WP19: a `handoff` body's `client_owned` is the mode's, not the game's.
+                let declared =
+                    create.client_owned && create.physics != netcore::PhysicsMode::Handoff;
+                set_net_entity_authority(&node, create.transfer, declared);
                 if !adopted {
                     let _guard = self.base_mut();
                     parent.add_child(&node);
@@ -1223,6 +1238,12 @@ impl NetManager {
 
     /// WP7: `Net.release_owner(node)`: gives the entity back to the server.
     pub fn release_owner(&mut self, root: &Gd<Node>) -> bool {
+        // WP19: a `handoff` body goes back with its sequence number and this side's state.
+        if self.online {
+            if let Some(released) = self.release_handoff(root) {
+                return released;
+            }
+        }
         let Some(e) = self.entries.get(&root.instance_id()) else {
             return false;
         };
@@ -1442,6 +1463,7 @@ impl NetManager {
                         e.client_owned = client_owned;
                         e.transfer = transfer;
                         e.physics = physics;
+                        self.any_handoff |= physics == netcore::PhysicsMode::Handoff;
                         e.has_body = Some(body);
                     }
                     self.by_id.insert(id, iid);
@@ -1572,6 +1594,8 @@ impl NetManager {
     /// their own; on the server these are the owners' states of `client_owned` entities.
     pub fn apply_states(&mut self, updates: Vec<StateUpdate>) {
         let mut writes = Vec::new();
+        // WP19: frozen `handoff` bodies on the server whose collider must follow at once.
+        let mut push: Vec<Gd<Node>> = Vec::new();
         for u in updates {
             // WP19: a `simulated` replica's pose corrects its live body instead (modes.rs).
             if !self.sim.is_empty() && self.sim_sample(&u) {
@@ -1580,7 +1604,12 @@ impl NetManager {
             let Some(e) = self.by_id.get(&u.id).and_then(|i| self.entries.get(i)) else {
                 continue;
             };
-            if self.state_is_local(e) {
+            // WP19: a `handoff` body coming back to the server is still frozen in this tick: its
+            // holder's last states are written before it thaws (with their velocities).
+            let returning = self.is_server
+                && e.physics == netcore::PhysicsMode::Handoff
+                && e.body_live == Some(false);
+            if self.state_is_local(e) && !returning {
                 continue;
             }
             let Some(rt) = e.props.as_ref() else {
@@ -1596,6 +1625,13 @@ impl NetManager {
             else {
                 continue;
             };
+            if self.is_server
+                && e.physics == netcore::PhysicsMode::Handoff
+                && e.body_live == Some(false)
+                && !push.contains(node)
+            {
+                push.push(node.clone());
+            }
             writes.push((node.clone(), f.clone(), u.value));
         }
         let _guard = self.base_mut();
@@ -1603,6 +1639,12 @@ impl NetManager {
             if n.is_instance_valid() {
                 apply::write(&n, &f, &v);
             }
+        }
+        // A node's own transform change reaches the physics server only after this tick's
+        // `_physics_process` calls (Godot defers it); the holder's player met the body where the
+        // state puts it, so the server's copy of that player must meet it there in this tick too.
+        for n in push {
+            modes::push_transform(&n);
         }
     }
 
