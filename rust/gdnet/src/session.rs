@@ -1019,6 +1019,13 @@ impl NetSession {
         d.set("sim_corrections", sc as i64);
         d.set("sim_corrections_per_s", c.sim_corrections_per_s as i64);
         d.set("sim_snaps", ss as i64);
+        d.set(
+            "sim_settles",
+            self.managers()
+                .iter()
+                .map(|(_, m)| m.bind().sim_settles() as i64)
+                .sum::<i64>(),
+        );
         d.set("sim_correcting", busy as i64);
         d.set("sim_bodies", n as i64);
         d.set("offset_corrections_per_s", c.corrections_per_s as i64);
@@ -1810,6 +1817,38 @@ impl NetSession {
         self.flush(outgoing);
         self.roll_stats_window();
         self.feed_debugger();
+    }
+
+    /// WP19: the hot fields of the entities whose ticks a client predicts go through their quantisers
+    /// (manager.rs `prediction_state`; tick.rs `quantize_state`).
+    fn quantize_predicted(&mut self, managers: &[(u64, Gd<NetManager>)]) {
+        for (_, m) in managers {
+            let vals = m.bind().prediction_state();
+            if vals.is_empty() {
+                continue;
+            }
+            let Some(core) = self.core.as_ref() else {
+                return;
+            };
+            let snapped: Vec<(NetId, netcore::predict::EntityState)> = vals
+                .into_iter()
+                .filter_map(|(id, fields)| {
+                    let q: Vec<(u16, u16, netcore::Value)> = fields
+                        .into_iter()
+                        .filter_map(|(p, f, v)| {
+                            let q = core.quantized(id, p, f, &v)?;
+                            (q != v).then_some((p, f, q))
+                        })
+                        .collect();
+                    (!q.is_empty()).then_some((id, q))
+                })
+                .collect();
+            if snapped.is_empty() {
+                continue;
+            }
+            let _guard = self.base_mut();
+            m.clone().bind_mut().write_state(snapped);
+        }
     }
 
     /// WP19: each held `handoff` body at its pose as the server receives it (modes.rs `snap_held`).
@@ -2621,6 +2660,15 @@ impl NetSession {
             if let Some(from) = catch_up {
                 replay::catch_up(&me, &managers, from, ctx.tick, ctx.delta);
             }
+            replayed
+        };
+        // WP19: the fresh tick of every predicted entity starts from its state as the snapshots carry
+        // it, on the server and on the owner alike (`quantize_state`, tick.rs).
+        if tick::quantize_state() {
+            self.quantize_predicted(&managers);
+        }
+        {
+            let _guard = self.base_mut();
             for (_, m) in &managers {
                 let mut m = m.clone();
                 m.bind_mut().prepare_inputs(&me, &ctx);
@@ -2629,8 +2677,7 @@ impl NetSession {
                 let mut m = m.clone();
                 m.bind_mut().net_ticks(&ctx);
             }
-            replayed
-        };
+        }
         if let Some(n) = replayed {
             self.stats.rollbacks += 1;
             self.stats.replayed_ticks += n;

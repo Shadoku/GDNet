@@ -21,9 +21,18 @@
 //! - a span with a contact: a server sample whose velocity changed faster than `max_accel` since the
 //!   one before, or a recorded local tick that did (carrying a pose forward across an impact is wrong).
 //!
-//! Snapshots only carry changes, so a body the server holds still sends nothing: while the newest
-//! sample says the server's body rests (slower than `rest_speed`) and the newest known server tick is
-//! past it, a local body that rests too is compared with that sample directly.
+//! **Settling.** Snapshots only carry changes, so a body the server holds still sends nothing. Once the
+//! newest sample says the server's body rests (slower than `rest_speed`) and nothing newer came for
+//! [`SETTLE_QUIET_S`] (the newest known server tick is that far past it), a local body that rests too
+//! (and rested at that server tick in its own recorded history, not moved since) is *settled*: frozen, carried to the server's pose in
+//! a few ticks ([`Step::Hold`]), then put there exactly, unfrozen with no velocity and asleep
+//! ([`Corrector::finish_settle`], which gdnet calls for every held body of a manager together, once none of them is
+//! still on its way, so a pile ends in the server's own resting arrangement instead of bodies pushing
+//! each other off it one at a time). A body already settled onto that sample is left alone; one that
+//! was knocked off it again settles again, at most once per [`SETTLE_RETRY_S`]. A newer sample that
+//! moves ends a settle at once ([`Step::Release`]). Correcting a resting body toward the server's pose
+//! with offsets instead never ends: each nudge wakes it, its neighbours push it back, and a stacked pile
+//! is corrected forever.
 //!
 //! The outcome, for the part of the error the correction under way does not already cover:
 //!
@@ -31,9 +40,9 @@
 //! - above `position` or `angle`: a new correction (counted, the body woken): the position and rotation
 //!   error become a pending offset applied a fraction `1 - decay` per 60 Hz tick (scaled to the tick
 //!   rate), the velocity errors are applied at once;
-//! - below them: a resting body is left alone (so a pile stays asleep); a moving one is refined quietly
-//!   (not counted, not woken), so a body that runs alongside the server's keeps to it more closely than
-//!   the thresholds, which a predicted player riding it needs.
+//! - below them: a moving body is refined quietly (not counted, not woken), so a body that runs
+//!   alongside the server's keeps to it more closely than the thresholds, which a predicted player
+//!   riding it needs; a resting one waits for its settle.
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -192,6 +201,36 @@ pub enum Step {
     },
     /// Set the pose and velocities.
     Snap(Pose),
+    /// Settling: the body is frozen (from now on, if it is not yet) and put at this pose.
+    Hold(Pose),
+    /// A settle ended early (the server's body moves again): the body is unfrozen where it is, with
+    /// these velocities (the server's), awake.
+    Release {
+        lin: V3,
+        ang: V3,
+    },
+}
+
+/// A settle starts once the server's resting body sent nothing newer for this long (seconds).
+pub const SETTLE_QUIET_S: f64 = 0.15;
+/// A body knocked off the pose it settled onto settles again at most this often (seconds).
+pub const SETTLE_RETRY_S: f64 = 0.5;
+/// The most ticks a settle's carry takes (at 60 Hz; an error of one threshold takes three).
+pub const SETTLE_MAX_TICKS: f64 = 15.0;
+/// A body further than this fraction of the thresholds from the pose it settled onto settles again.
+pub const SETTLE_SLACK: f64 = 0.05;
+
+/// A settle under way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Settling {
+    from: Pose,
+    to: Pose,
+    /// The server tick of the sample it settles onto.
+    tick: u64,
+    k: u32,
+    n: u32,
+    /// Ticks spent at `to`, waiting for the manager's other settles.
+    waited: u32,
 }
 
 /// Counters (`NetSession.stats()`).
@@ -200,6 +239,8 @@ pub struct CorrectStats {
     /// Corrections started (an error above the thresholds).
     pub corrections: u64,
     pub snaps: u64,
+    /// Settles finished (the body put at the server's resting pose, asleep).
+    pub settles: u64,
 }
 
 /// The corrections applied so far, summed (position, rotation vector, velocities).
@@ -248,6 +289,12 @@ pub struct Corrector {
     fresh: bool,
     /// The predicted tick the last correction started at.
     epoch: Option<u64>,
+    settle: Option<Settling>,
+    /// The sample tick of the last finished settle and the predicted tick it finished at.
+    settled: Option<(u64, u64)>,
+    /// Set by gdnet: a predicted player of this client touched the body lately (its push is in the
+    /// server's future), so it does not settle, and a settle under way ends.
+    pub settle_blocked: bool,
     pub stats: CorrectStats,
 }
 
@@ -360,9 +407,167 @@ impl Corrector {
             .map(|(_, m, _)| m.pose)
     }
 
-    /// Whether a pending offset is still being applied.
+    /// Whether a pending offset is still being applied, or a settle is under way.
     pub fn is_correcting(&self) -> bool {
-        norm(&self.pending_pos) > 0.0 || norm(&self.pending_rot) > 0.0
+        norm(&self.pending_pos) > 0.0 || norm(&self.pending_rot) > 0.0 || self.settle.is_some()
+    }
+
+    /// Whether a settle is carrying the body to the server's pose (not yet waiting at it).
+    pub fn is_carrying(&self) -> bool {
+        self.settle.is_some_and(|s| s.k < s.n)
+    }
+
+    /// Whether a settle has the body at the server's pose, frozen, waiting to finish.
+    pub fn is_holding(&self) -> bool {
+        self.settle.is_some_and(|s| s.k >= s.n)
+    }
+
+    /// Ticks a held body waited at its pose for the manager's other settles.
+    pub fn held_ticks(&self) -> u32 {
+        self.settle.map_or(0, |s| s.waited)
+    }
+
+    /// Whether a body at `present` rests within the settle slack of a resting server body.
+    pub fn at_rest_target(&self, present: &Pose, tuning: &Tuning) -> bool {
+        let Some((_, s)) = self.target else {
+            return false;
+        };
+        let rests =
+            |p: &Pose| norm(&p.lin) < tuning.rest_speed && norm(&p.ang) < tuning.rest_angular;
+        rests(&s)
+            && rests(present)
+            && norm(&sub(&s.pos, &present.pos)) <= tuning.position * SETTLE_SLACK
+            && norm(&rot_log(&q_mul(&s.rot, &q_conj(&present.rot)))) <= tuning.angle * SETTLE_SLACK
+    }
+
+    /// Ends a settle whose body waits at the server's pose: the pose to put it at (exactly, unfrozen,
+    /// still, asleep). `now` is the predicted tick.
+    pub fn finish_settle(&mut self, now: u64) -> Option<Pose> {
+        let st = self.settle.filter(|s| s.k >= s.n)?;
+        self.settle = None;
+        self.settled = Some((st.tick, now));
+        self.stats.settles += 1;
+        self.pending_pos = [0.0; 3];
+        self.pending_rot = [0.0; 3];
+        Some(st.to)
+    }
+
+    /// The local body lives ahead of the newest known server tick `known` (the predicted timeline):
+    /// what it did since then the server may not have simulated yet (a predicted player's push). True
+    /// when it rested at `known` in its recorded history and has not moved since.
+    fn still_since(&self, present: &Pose, known: u64, tuning: &Tuning) -> bool {
+        let rests =
+            |p: &Pose| norm(&p.lin) < tuning.rest_speed && norm(&p.ang) < tuning.rest_angular;
+        match self.recorded(known) {
+            Some((_, m, _)) => {
+                rests(&m.pose)
+                    && norm(&sub(&present.pos, &m.pose.pos)) < tuning.position * 0.5
+                    && norm(&rot_log(&q_mul(&present.rot, &q_conj(&m.pose.rot))))
+                        < tuning.angle * 0.5
+            }
+            None => true,
+        }
+    }
+
+    /// Starts settling a body at `present` onto the server's resting pose `s` of tick `t`.
+    fn start_settle(&mut self, t: u64, s: &Pose, present: &Pose, dt: f64, tuning: &Tuning) -> Step {
+        let e_pos = norm(&sub(&s.pos, &present.pos));
+        let e_rot = norm(&rot_log(&q_mul(&s.rot, &q_conj(&present.rot))));
+        let size = (e_pos / tuning.position.max(1e-9)).max(e_rot / tuning.angle.max(1e-9));
+        let most = (SETTLE_MAX_TICKS * dt * 60.0).max(1.0);
+        let n = (size * 3.0).ceil().clamp(1.0, most) as u32;
+        self.pending_pos = [0.0; 3];
+        self.pending_rot = [0.0; 3];
+        self.settle = Some(Settling {
+            from: still(present),
+            to: still(s),
+            tick: t,
+            k: 0,
+            n,
+            waited: 0,
+        });
+        self.settling(t, s, true).unwrap_or(Step::None)
+    }
+
+    /// Whether a settle is under way.
+    pub fn is_settling(&self) -> bool {
+        self.settle.is_some()
+    }
+
+    /// Joins a settle round another body of the same manager started this tick: a body whose
+    /// server's body rests, quiet as long as a settle needs, settles too, whatever it does locally (a
+    /// pile settles as one, so no settled body is knocked off again by a neighbour that was not), unless
+    /// it is beyond the teleport distance. (gdnet keeps out a body a predicted player touched lately:
+    /// its push is in the server's future.) Its settle step, when it joined.
+    pub fn join_settle(
+        &mut self,
+        present: &Pose,
+        known: u64,
+        dt: f64,
+        tuning: &Tuning,
+    ) -> Option<Step> {
+        if self.settle.is_some() {
+            return None;
+        }
+        let (t, s) = self.target?;
+        let rests =
+            |p: &Pose| norm(&p.lin) < tuning.rest_speed && norm(&p.ang) < tuning.rest_angular;
+        let quiet = known.saturating_sub(t) as f64 * dt;
+        if !rests(&s)
+            || quiet < SETTLE_QUIET_S
+            || norm(&sub(&s.pos, &present.pos)) > tuning.teleport
+        {
+            return None;
+        }
+        Some(self.start_settle(t, &s, present, dt, tuning))
+    }
+
+    /// A settle's step while one is under way: carry, wait, or end it (a newer sample that moves).
+    fn settling(&mut self, t: u64, s: &Pose, rests: bool) -> Option<Step> {
+        let mut st = self.settle?;
+        if t != st.tick {
+            if !rests {
+                self.settle = None;
+                self.epoch = None;
+                return Some(Step::Release {
+                    lin: s.lin,
+                    ang: s.ang,
+                });
+            }
+            // A newer resting sample: settle onto it instead (its wait starts again).
+            st.tick = t;
+            st.to = still(s);
+            st.waited = 0;
+            if st.k >= st.n {
+                self.settle = Some(st);
+                return Some(Step::Hold(st.to));
+            }
+        }
+        if st.k < st.n {
+            st.k += 1;
+        } else {
+            st.waited += 1;
+        }
+        let f = f64::from(st.k) / f64::from(st.n.max(1));
+        let f = f * f * (3.0 - 2.0 * f);
+        let pose = if st.k >= st.n {
+            st.to
+        } else {
+            Pose {
+                pos: add(&st.from.pos, &scale(&sub(&st.to.pos, &st.from.pos), f)),
+                rot: q_norm(&q_mul(
+                    &rot_exp(&scale(
+                        &rot_log(&q_mul(&st.to.rot, &q_conj(&st.from.rot))),
+                        f,
+                    )),
+                    &st.from.rot,
+                )),
+                lin: [0.0; 3],
+                ang: [0.0; 3],
+            }
+        };
+        self.settle = Some(st);
+        Some(Step::Hold(pose))
     }
 
     /// Whether the local body changed velocity faster than `max_accel` in any recorded tick after
@@ -385,6 +590,15 @@ impl Corrector {
         let rests =
             |p: &Pose| norm(&p.lin) < tuning.rest_speed && norm(&p.ang) < tuning.rest_angular;
         let fresh = core::mem::take(&mut self.fresh);
+        if self.settle_blocked && self.settle.take().is_some() {
+            return Step::Release {
+                lin: [0.0; 3],
+                ang: [0.0; 3],
+            };
+        }
+        if let Some(step) = self.settling(t, &s, rests(&s)) {
+            return step;
+        }
         let tau = now.saturating_sub(t) as f64 * dt;
         // The server's body at tick `t`, with the accelerations of its last two samples.
         let mut server = Moving {
@@ -403,7 +617,11 @@ impl Corrector {
             norm(&server.acc) > tuning.max_accel || norm(&server.alpha) > tuning.max_angular_accel;
         // Each error is the full outstanding one at present (position, rotation vector, velocities).
         let mut errors = None;
-        if fresh && self.epoch.is_none_or(|e| t > e + 1) && !server_contact {
+        // Both at rest: the settle below puts the body where the server's is, without a correction
+        // that would wake it.
+        let both_rest =
+            rests(&s) && rests(present) && norm(&sub(&s.pos, &present.pos)) <= tuning.teleport;
+        if fresh && self.epoch.is_none_or(|e| t > e + 1) && !server_contact && !both_rest {
             // A sample is compared once it describes a tick two after the last correction started
             // (a comparison never looks back past a velocity correction, and the recorded pose then has
             // an acceleration measured after it). Both sides are carried from
@@ -430,24 +648,58 @@ impl Corrector {
                 _ => None,
             };
         }
-        let mut refine = errors.is_some();
+        let refine = errors.is_some();
+        let ticks = |secs: f64| (secs / dt.max(1e-6)).ceil() as u64;
+        let quiet = known.saturating_sub(t);
+        let still_since_known = self.still_since(present, known, tuning);
+        // And it has been still for the quiet time itself: every pose recorded in it within the slack
+        // of the present one (a body a predicted player just started to push moves less than a
+        // threshold in its first ticks).
+        let window = ticks(SETTLE_QUIET_S);
+        let (slack_pos, slack_rot) = (tuning.position * SETTLE_SLACK, tuning.angle * SETTLE_SLACK);
+        let recent = self
+            .history
+            .iter()
+            .rev()
+            .take_while(|(k, _, _)| *k + window >= now);
+        let still_lately = recent.clone().count() as u64 + 1 >= window
+            && recent.clone().all(|(_, m, _)| {
+                norm(&sub(&present.pos, &m.pose.pos)) <= slack_pos
+                    && norm(&rot_log(&q_mul(&present.rot, &q_conj(&m.pose.rot)))) <= slack_rot
+            });
         if errors.is_none()
             && rests(&s)
             && rests(present)
-            && known > t
-            && self.epoch.is_none_or(|e| known > e + 1)
+            && still_since_known
+            && still_lately
+            && !self.settle_blocked
+            && quiet >= ticks(SETTLE_QUIET_S)
         {
-            // The server's body rests (still, as of the newest known tick) and so does the local one:
-            // it belongs where the server's is. This comparison only starts corrections: below the
-            // thresholds a resting body is left alone, so one its neighbours hold a little off the
-            // server's place still falls asleep.
-            refine = false;
-            errors = Some((
-                sub(&s.pos, &present.pos),
-                rot_log(&q_mul(&s.rot, &q_conj(&present.rot))),
-                sub(&s.lin, &present.lin),
-                sub(&s.ang, &present.ang),
-            ));
+            // The server's body rests, and nothing newer came: the local one belongs exactly where the
+            // server's is, asleep (see the module docs).
+            let (e_pos, e_rot) = (
+                norm(&sub(&s.pos, &present.pos)),
+                norm(&rot_log(&q_mul(&s.rot, &q_conj(&present.rot)))),
+            );
+            if e_pos > tuning.teleport {
+                // Too far to carry: it snaps, as any body that far off does.
+                self.stats.snaps += 1;
+                self.pending_pos = [0.0; 3];
+                self.pending_rot = [0.0; 3];
+                self.applied = Applied::default();
+                self.history.clear();
+                self.epoch = Some(now);
+                return Step::Snap(still(&s));
+            }
+            let off = e_pos > tuning.position * SETTLE_SLACK || e_rot > tuning.angle * SETTLE_SLACK;
+            let due = match self.settled {
+                None => true,
+                Some((tick, _)) if tick != t => true,
+                Some((_, at)) => off && now >= at + ticks(SETTLE_RETRY_S),
+            };
+            if due {
+                return self.start_settle(t, &s, present, dt, tuning);
+            }
         }
         let mut wake = false;
         let (mut dlin, mut dang) = ([0.0; 3], [0.0; 3]);
@@ -522,6 +774,15 @@ impl Corrector {
             dang,
             wake,
         }
+    }
+}
+
+/// `p` with no velocity.
+fn still(p: &Pose) -> Pose {
+    Pose {
+        lin: [0.0; 3],
+        ang: [0.0; 3],
+        ..*p
     }
 }
 
@@ -633,6 +894,31 @@ mod tests {
         }
     }
 
+    /// Applies a step to a modelled body; a settle that holds the body at the server's pose ends at
+    /// once (gdnet ends a manager's settles together).
+    fn apply_step(c: &mut Corrector, local: &mut Pose, step: Step, now: u64) {
+        match step {
+            Step::None => {}
+            Step::Nudge {
+                dpos,
+                drot,
+                dlin,
+                dang,
+                ..
+            } => *local = apply_nudge(local, &dpos, &drot, &dlin, &dang),
+            Step::Snap(p) | Step::Hold(p) => *local = p,
+            Step::Release { lin, ang } => {
+                local.lin = lin;
+                local.ang = ang;
+            }
+        }
+        if c.is_holding() {
+            if let Some(p) = c.finish_settle(now) {
+                *local = p;
+            }
+        }
+    }
+
     /// Runs `ticks` ticks of a body moving at `v` px/s locally while the server's moves at `vs`, with
     /// snapshots `delay` ticks late; returns the corrector, the local pose and the largest step.
     fn run(corr: &mut Corrector, local: &mut Pose, ticks: u64, vs: f64, delay: u64) -> f64 {
@@ -645,17 +931,8 @@ mod tests {
                 corr.sample(t, Component::Lin([vs, 0.0, 0.0]));
             }
             let before = local.pos[0];
-            match corr.step(local, now, now.saturating_sub(delay), DT, &tuning()) {
-                Step::None => {}
-                Step::Nudge {
-                    dpos,
-                    drot,
-                    dlin,
-                    dang,
-                    ..
-                } => *local = apply_nudge(local, &dpos, &drot, &dlin, &dang),
-                Step::Snap(p) => *local = p,
-            }
+            let step = corr.step(local, now, now.saturating_sub(delay), DT, &tuning());
+            apply_step(corr, local, step, now);
             corr.record(now, *local, DT);
             // The local physics step.
             local.pos[0] += local.lin[0] * DT;
@@ -714,12 +991,16 @@ mod tests {
 
     #[test]
     fn a_correction_decays_geometrically_and_is_applied_exactly_once() {
-        // The server's body is 20 px ahead and at rest; the local one rests too.
+        // The server's body is 20 px ahead; neither moves, but nothing counts as resting here (a
+        // resting pair settles instead: see the settle tests), so the correction's offsets show.
         let mut c = Corrector::new();
         let mut local = at(0.0, 0.0);
         c.record(1, local, DT);
         c.sample(1, Component::Pos([20.0, 0.0, 0.0]));
-        let t = tuning();
+        let t = Tuning {
+            rest_speed: 0.0,
+            ..tuning()
+        };
         let mut steps = Vec::new();
         for now in 2..200 {
             match c.step(&local, now, 1, DT, &t) {
@@ -734,6 +1015,9 @@ mod tests {
                 }
                 Step::None => {}
                 Step::Snap(_) => panic!("20 px is no teleport"),
+                Step::Hold(_) | Step::Release { .. } => {
+                    panic!("no settle: the sample is the newest")
+                }
             }
             c.record(now, local, DT);
         }
@@ -754,34 +1038,105 @@ mod tests {
         assert!(steps.len() < 60, "done within {} ticks", steps.len());
     }
 
+    /// Runs a resting local body against a resting server sample from `from` to `to` (snapshot ticks
+    /// go on, nothing changes); returns the largest step and the first tick the body sat exactly at
+    /// `at_x` with the settle finished.
+    fn rest_run(
+        c: &mut Corrector,
+        local: &mut Pose,
+        from: u64,
+        to: u64,
+        at_x: f64,
+    ) -> (f64, Option<u64>) {
+        let (mut largest, mut landed) = (0.0f64, None);
+        for now in from..to {
+            let before = local.pos[0];
+            let step = c.step(local, now, now - 1, DT, &tuning());
+            assert!(
+                !matches!(step, Step::Nudge { wake: true, .. }),
+                "a resting body is never woken by a correction"
+            );
+            apply_step(c, local, step, now);
+            largest = largest.max((local.pos[0] - before).abs());
+            if landed.is_none() && local.pos[0] == at_x && !c.is_correcting() {
+                landed = Some(now);
+            }
+            c.record(now, *local, DT);
+        }
+        (largest, landed)
+    }
+
     #[test]
-    fn a_resting_target_is_compared_once_per_snapshot_tick_and_then_never_again() {
+    fn a_resting_body_settles_exactly_onto_the_resting_server_body_once() {
         // The server's body rests at 30 px; snapshots stop (nothing changes) but the snapshot ticks go
-        // on. The local body rests at 0: one correction brings it there, then no more.
+        // on. The local body rests at 0: after the quiet time it is carried there in a few ticks and
+        // put there exactly, once, with no correction (no offsets, nothing woken).
         let mut c = Corrector::new();
         let mut local = at(0.0, 0.0);
         c.record(1, local, DT);
         c.sample(1, Component::Pos([30.0, 0.0, 0.0]));
-        let t = tuning();
-        for now in 2..400 {
-            if let Step::Nudge { dpos, .. } = c.step(&local, now, now - 1, DT, &t) {
-                local.pos = add(&local.pos, &dpos);
-            }
-            c.record(now, local, DT);
-        }
-        assert_eq!(c.stats.corrections, 1);
-        assert!((local.pos[0] - 30.0).abs() < t.position);
-        // Pushed off by 5 px locally (a neighbour settling): corrected once more, from the
-        // resting comparison alone.
+        let (largest, landed) = rest_run(&mut c, &mut local, 2, 400, 30.0);
+        assert_eq!(c.stats.corrections, 0);
+        assert_eq!(c.stats.settles, 1);
+        assert_eq!(local.pos[0], 30.0, "exactly at the server's pose");
+        let quiet = (SETTLE_QUIET_S / DT).ceil() as u64;
+        let landed = landed.expect("settled");
+        assert!(
+            landed <= 2 + quiet + SETTLE_MAX_TICKS as u64,
+            "settled at tick {landed}"
+        );
+        assert!(largest < 30.0 * 0.25, "carried, not jumped: {largest} px");
+        // Pushed off by 5 px locally (a neighbour): settled once more, after the retry time.
         local.pos[0] += 5.0;
-        for now in 400..600 {
-            if let Step::Nudge { dpos, .. } = c.step(&local, now, now - 1, DT, &t) {
-                local.pos = add(&local.pos, &dpos);
-            }
+        let (_, again) = rest_run(&mut c, &mut local, 400, 600, 30.0);
+        assert_eq!(c.stats.settles, 2);
+        assert_eq!(local.pos[0], 30.0);
+        assert!(again.is_some());
+        // Within the slack it is left alone (Godot keeps it asleep there).
+        local.pos[0] += SETTLE_SLACK * tuning().position * 0.5;
+        let x = local.pos[0];
+        rest_run(&mut c, &mut local, 600, 800, 30.0);
+        assert_eq!(c.stats.settles, 2);
+        assert_eq!(local.pos[0], x);
+    }
+
+    #[test]
+    fn a_replica_resting_just_beyond_the_threshold_settles_within_a_third_of_a_second() {
+        // The measured case: a replica resting 0.0201 m from the server's body (2.01 px at 100 px per
+        // metre), just over `correction_position`, used to be nudged 3 to 4 times a second forever.
+        let mut c = Corrector::new();
+        let mut local = at(0.0, 0.0);
+        c.record(1, local, DT);
+        c.sample(1, Component::Pos([2.1, 0.0, 0.0]));
+        let (_, landed) = rest_run(&mut c, &mut local, 2, 200, 2.1);
+        let landed = landed.expect("settled") as f64 * DT;
+        assert!(landed < 0.34, "settled after {landed} s");
+        assert_eq!(c.stats.corrections, 0);
+        assert_eq!(c.stats.settles, 1);
+    }
+
+    #[test]
+    fn a_settle_ends_at_once_when_the_server_body_moves_again() {
+        let mut c = Corrector::new();
+        let local = at(0.0, 0.0);
+        c.record(1, local, DT);
+        c.sample(1, Component::Pos([30.0, 0.0, 0.0]));
+        let quiet = (SETTLE_QUIET_S / DT).ceil() as u64;
+        let mut held = false;
+        for now in 2..(3 + quiet) {
+            held |= matches!(c.step(&local, now, now - 1, DT, &tuning()), Step::Hold(_));
             c.record(now, local, DT);
         }
-        assert_eq!(c.stats.corrections, 2);
-        assert!((local.pos[0] - 30.0).abs() < t.position);
+        assert!(held && c.is_carrying());
+        c.sample(3 + quiet, Component::Lin([200.0, 0.0, 0.0]));
+        assert_eq!(
+            c.step(&local, 4 + quiet, 3 + quiet, DT, &tuning()),
+            Step::Release {
+                lin: [200.0, 0.0, 0.0],
+                ang: [0.0; 3]
+            }
+        );
+        assert!(!c.is_correcting());
     }
 
     #[test]
@@ -843,7 +1198,11 @@ mod tests {
         };
         c.record(1, local, DT);
         c.sample(1, Component::Rot(quat_of_angle(-3.0)));
-        let t = tuning();
+        // Nothing counts as resting (a resting pair settles instead).
+        let t = Tuning {
+            rest_speed: 0.0,
+            ..tuning()
+        };
         for now in 2..200 {
             if let Step::Nudge {
                 dpos,
@@ -903,17 +1262,8 @@ mod tests {
                 c.sample(newest, Component::Lin(s.lin));
             }
             let before = local.pos[0];
-            match c.step(&local, now, newest, DT, &tuning()) {
-                Step::Nudge {
-                    dpos,
-                    drot,
-                    dlin,
-                    dang,
-                    ..
-                } => local = apply_nudge(&local, &dpos, &drot, &dlin, &dang),
-                Step::Snap(p) => local = p,
-                Step::None => {}
-            }
+            let step = c.step(&local, now, newest, DT, &tuning());
+            apply_step(&mut c, &mut local, step, now);
             c.record(now, local, DT);
             slide(&mut local, decel);
             largest = largest.max((local.pos[0] - before).abs());

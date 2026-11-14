@@ -182,6 +182,78 @@ func test_simulated_resting_pile_stays_asleep_and_converges_in_3d() -> void:
 	assert_lt(worst, THRESHOLD, "converged to within the correction threshold")
 
 
+## How far a replica may rest from the server's body once settled: half a `mm` step on each axis.
+const SETTLED_EXACT := 0.0009
+
+
+func _worst(server: Array, client: Array) -> float:
+	var worst := 0.0
+	for i in server.size():
+		worst = maxf(worst, (server[i] as Node3D).position.distance_to((client[i] as Node3D).position))
+	return worst
+
+
+func test_a_replica_resting_just_beyond_the_threshold_settles_onto_the_server_pose_and_sleeps_in_3d() -> void:
+	# The measured defect: a replica resting 0.0201 m from the server's body, just over the 0.02 m
+	# threshold, was corrected 3 to 4 times a second, each correction woke it, and it never slept.
+	timeout_sec = 20.0
+	var managers := await _start(1, NetFixture.HostMode.DEDICATED)
+	var c: Node = net.clients[0]
+	var sb: RigidBody3D = _add(managers["Server"], BOX, "Box", Vector3(0.0, 0.25, 0.0))
+	var cb: RigidBody3D = await _copy(c, "World/Box")
+	assert_true(await net.wait_until(func() -> bool: return sb.sleeping and cb.sleeping and cb.position.distance_to(sb.position) < SETTLED_EXACT, 5.0), "both rest, together")
+	# The client's box is put 0.021 m off, where it rests.
+	var t := cb.global_transform
+	t.origin.x += 0.021
+	cb.global_transform = t
+	PhysicsServer3D.body_set_state(cb.get_rid(), PhysicsServer3D.BODY_STATE_TRANSFORM, t)
+	var c0: int = net.session(c).stats()["sim_corrections"]
+	var f0 := Engine.get_physics_frames()
+	assert_true(await net.wait_until(func() -> bool: return cb.sleeping and not cb.freeze and cb.position.distance_to(sb.position) < SETTLED_EXACT, 3.0), "settled onto the server's pose and asleep (%.4f m off)" % cb.position.distance_to(sb.position))
+	var secs := float(Engine.get_physics_frames() - f0) / Engine.physics_ticks_per_second
+	await _frames(Engine.physics_ticks_per_second)
+	print("3D replica 0.021 m off at rest: settled onto the server's pose and asleep after %.2f s; %d corrections; %.5f m off a second later" % [secs, int(net.session(c).stats()["sim_corrections"]) - c0, cb.position.distance_to(sb.position)])
+	# The quiet time (0.15 s) plus the stillness window (0.15 s) plus a short carry and a tick's wait.
+	assert_lt(secs, 0.5, "within half a second")
+	assert_eq(int(net.session(c).stats()["sim_corrections"]) - c0, 0, "without a correction (nothing woken)")
+	assert_true(cb.sleeping, "and it stays asleep")
+	assert_lt(cb.position.distance_to(sb.position), SETTLED_EXACT, "where the server's is")
+
+
+func test_a_pile_that_settles_while_a_client_watches_sleeps_there_soon_after_the_server_in_3d() -> void:
+	# Reported: a pile that settled while a client watched fell asleep there about 10 s after the
+	# server's (about 1 s after it was dropped).
+	timeout_sec = 25.0
+	var managers := await _start(1, NetFixture.HostMode.DEDICATED)
+	var c: Node = net.clients[0]
+	var boxes: Array = []
+	# Two layers of eight boxes, dropped from 0.3 m above where they rest, a little turned.
+	for i in 16:
+		@warning_ignore("integer_division")
+		var layer := i / 8
+		@warning_ignore("integer_division")
+		var row := (i % 8) / 4
+		var b: RigidBody3D = _add(managers["Server"], BOX, "B%d" % i, Vector3((i % 4) * 0.55 - 0.8, 0.55 + layer * 0.6, row * 0.55))
+		b.rotation = Vector3(0.0, 0.1 * i, 0.05)
+		boxes.append(b)
+	var replicas: Array = []
+	for b: Node in boxes:
+		replicas.append(await _copy(c, "World/" + String(b.name)))
+	assert_true(await net.wait_until(func() -> bool: return _rested(boxes), 8.0), "the server's pile sleeps")
+	var f0 := Engine.get_physics_frames()
+	assert_true(await net.wait_until(func() -> bool: return _rested(replicas) and _worst(boxes, replicas) < SETTLED_EXACT, 8.0), "the client's pile sleeps on the server's poses (%d awake, %.4f m)" % [replicas.filter(func(b: RigidBody3D) -> bool: return not b.sleeping).size(), _worst(boxes, replicas)])
+	var secs := float(Engine.get_physics_frames() - f0) / Engine.physics_ticks_per_second
+	await _frames(Engine.physics_ticks_per_second)
+	print("3D pile settling while a client watches: the client's pile asleep on the server's poses %.2f s after the server's; worst gap a second later %.5f m; %d settles" % [secs, _worst(boxes, replicas), int(net.session(c).stats()["sim_settles"])])
+	# The server's snapshots stop when its pile sleeps; the client needs the quiet time (0.15 s), the
+	# stillness window (0.15 s) and the carry (at most 0.25 s), after the newest snapshot reached it
+	# (half a round trip plus the jitter buffer, about 0.1 s here): about 0.7 s (measured: 0.8 s). A
+	# body a neighbour's settle knocked off settles again after the retry time (0.5 s): 1.5 s.
+	assert_lt(secs, 1.5, "within a second and a half of the server's")
+	assert_true(_rested(replicas), "and it stays asleep")
+	assert_lt(_worst(boxes, replicas), SETTLED_EXACT, "on the server's poses")
+
+
 func _platform_rollbacks(physics: int) -> int:
 	var managers := await _start(1, NetFixture.HostMode.DEDICATED, physics)
 	var c: Node = net.clients[0]

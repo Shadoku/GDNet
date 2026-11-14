@@ -362,7 +362,11 @@ impl Body {
     fn set_pose(&mut self, before: &Pose, p: &Pose, wake: bool) {
         let v3 = |a: &[f64; 3]| Vector3::new(a[0] as f32, a[1] as f32, a[2] as f32);
         let moved = |a: &[f64; 3], b: &[f64; 3]| correct::norm(&correct::sub(a, b)) > 1e-9;
-        let turned = before.rot != p.rot;
+        // (A rotation read back from the node differs from the one written by float noise.)
+        let turned = correct::norm(&correct::rot_log(&correct::q_mul(
+            &p.rot,
+            &correct::q_conj(&before.rot),
+        ))) > 1e-7;
         let placed = moved(&before.pos, &p.pos) || turned;
         match self {
             Body::D2(b) => {
@@ -421,7 +425,73 @@ impl Body {
             }
         }
     }
+
+    /// Puts a live body to sleep, still. The caller holds its base guard.
+    fn sleep(&mut self) {
+        match self {
+            Body::D2(b) if !b.is_freeze_enabled() => {
+                b.set_linear_velocity(Vector2::ZERO);
+                b.set_angular_velocity(0.0);
+                b.set_sleeping(true);
+            }
+            Body::D3(b) if !b.is_freeze_enabled() => {
+                b.set_linear_velocity(Vector3::ZERO);
+                b.set_angular_velocity(Vector3::ZERO);
+                b.set_sleeping(true);
+            }
+            _ => {}
+        }
+    }
+
+    /// WP19 (settling): freezes the body (`held`), or unfreezes it: with no velocity and asleep (a
+    /// settle's end, `wake` None), or awake with `wake`'s velocities (a settle that ended early). The
+    /// caller holds its base guard.
+    fn set_held(&mut self, held: bool, wake: Option<(&[f64; 3], &[f64; 3])>) {
+        let v3 = |a: &[f64; 3]| Vector3::new(a[0] as f32, a[1] as f32, a[2] as f32);
+        match self {
+            Body::D2(b) => {
+                if held {
+                    if !b.is_freeze_enabled() {
+                        b.set_freeze_enabled(true);
+                        // See `set_bodies_live`: a frozen 2D body's collider follows its properties
+                        // only once its global transform is set.
+                        let t = b.get_global_transform();
+                        b.set_global_transform(t);
+                    }
+                    return;
+                }
+                b.set_freeze_enabled(false);
+                let (lin, ang) = wake.map_or((Vector2::ZERO, 0.0), |(l, a)| {
+                    (Vector2::new(l[0] as f32, l[1] as f32), a[2] as f32)
+                });
+                b.set_linear_velocity(lin);
+                b.set_angular_velocity(ang);
+                b.set_sleeping(wake.is_none());
+            }
+            Body::D3(b) => {
+                if held {
+                    if !b.is_freeze_enabled() {
+                        b.set_freeze_enabled(true);
+                    }
+                    return;
+                }
+                b.set_freeze_enabled(false);
+                let (lin, ang) =
+                    wake.map_or((Vector3::ZERO, Vector3::ZERO), |(l, a)| (v3(l), v3(a)));
+                b.set_linear_velocity(lin);
+                b.set_angular_velocity(ang);
+                b.set_sleeping(wake.is_none());
+            }
+        }
+    }
 }
+
+/// A `simulated` body a predicted entity of this client touched within this many ticks joins no
+/// settle round (the push is in the server's future).
+const PUSHED_TICKS: u64 = 30;
+
+/// A held (settling) body waits at its pose at most this many ticks for its manager's other settles.
+const SETTLE_WAIT_TICKS: u32 = 30;
 
 /// Which pose component a field of the body part is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -709,17 +779,26 @@ impl NetManager {
         if self.sim.is_empty() {
             return;
         }
+        self.note_pushed(now);
         let mut sim = std::mem::take(&mut self.sim);
         sim.retain(|_, sb| sb.body.valid());
         let mut tunings: [Option<Tuning>; 2] = [None, None];
         let mut started = (0, 0);
+        let mut settled = 0;
+        // A settle started this tick: the manager's other resting bodies join it (a pile settles as
+        // one).
+        let mut round = false;
+        let pushed = self.pushed.clone();
         let guard = self.base_mut();
-        for sb in sim.values_mut().filter(|sb| !sb.held) {
+        for (id, sb) in sim.iter_mut().filter(|(_, sb)| !sb.held) {
             let k = usize::from(matches!(sb.body, Body::D3(_)));
             let t = *tunings[k].get_or_insert_with(|| tuning(sb.body.scale()));
             let present = sb.body.pose();
             let before = sb.corr.stats;
+            let was = sb.corr.is_settling();
+            sb.corr.settle_blocked = pushed.get(id).is_some_and(|t| now < t + PUSHED_TICKS);
             let step = sb.corr.step(&present, now, known, dt, &t);
+            round |= !was && sb.corr.is_settling();
             started.0 += sb.corr.stats.corrections - before.corrections;
             started.1 += sb.corr.stats.snaps - before.snaps;
             match step {
@@ -735,12 +814,109 @@ impl NetManager {
                     sb.body.set_pose(&present, &p, wake);
                 }
                 Step::Snap(p) => sb.body.set_pose(&present, &p, true),
+                Step::Hold(p) => {
+                    sb.body.set_held(true, None);
+                    // A body waiting at its pose is not written again: a node's transform reaches the
+                    // physics server at the end of the tick, and wakes the body if it is released by
+                    // then.
+                    if sb.corr.held_ticks() == 0 {
+                        sb.body.set_pose(&present, &p, false);
+                    }
+                }
+                Step::Release { lin, ang } => sb.body.set_held(false, Some((&lin, &ang))),
+            }
+        }
+        if round {
+            for (_, sb) in sim.iter_mut().filter(|(id, sb)| {
+                !sb.held && !pushed.get(*id).is_some_and(|t| now < t + PUSHED_TICKS)
+            }) {
+                let k = usize::from(matches!(sb.body, Body::D3(_)));
+                let t = *tunings[k].get_or_insert_with(|| tuning(sb.body.scale()));
+                let present = sb.body.pose();
+                if let Some(Step::Hold(p)) = sb.corr.join_settle(&present, known, dt, &t) {
+                    sb.body.set_held(true, None);
+                    sb.body.set_pose(&present, &p, false);
+                }
+            }
+        }
+        // Settles end together, once none is still carrying its body (or after a wait): the pile is
+        // unfrozen, asleep, in the server's own resting arrangement. A body put at its pose this tick
+        // waits a tick first: Godot hands a node's new transform to the physics server only at the end
+        // of the tick's `_physics_process` calls, and that hand-off wakes a body no longer frozen.
+        let placed_now = |sb: &SimBody| sb.corr.is_holding() && sb.corr.held_ticks() == 0;
+        let carrying = sim
+            .values()
+            .any(|sb| sb.corr.is_carrying() || placed_now(sb));
+        let mut finished = false;
+        for sb in sim.values_mut().filter(|sb| sb.corr.is_holding()) {
+            if placed_now(sb) || (carrying && sb.corr.held_ticks() < SETTLE_WAIT_TICKS) {
+                continue;
+            }
+            if sb.corr.finish_settle(now).is_some() {
+                // It waits at its pose already (put there a tick or more ago).
+                sb.body.set_held(false, None);
+                settled += 1;
+                finished = true;
+            }
+        }
+        if finished {
+            // The bodies the round left alone because they already rest where the server's do (the
+            // carried ones' moves woke them) go to sleep with it, or they would wake it again; and
+            // every settled body is put to sleep once more after all of them are unfrozen.
+            for sb in sim.values_mut().filter(|sb| !sb.held) {
+                let k = usize::from(matches!(sb.body, Body::D3(_)));
+                let t = *tunings[k].get_or_insert_with(|| tuning(sb.body.scale()));
+                if !sb.corr.is_correcting() && sb.corr.at_rest_target(&sb.body.pose(), &t) {
+                    sb.body.sleep();
+                }
             }
         }
         drop(guard);
         self.sim = sim;
         self.sim_counts.0 += started.0;
         self.sim_counts.1 += started.1;
+        self.sim_counts.2 += settled;
+    }
+
+    /// Client: the `simulated` replicas this client's predicted entities touched in their last
+    /// `move_and_slide()` (`pushed`, by predicted tick).
+    fn note_pushed(&mut self, now: u64) {
+        let mut hit = Vec::new();
+        {
+            let _guard = self.base();
+            for e in self.entries.values().filter(|e| e.predicted.is_some()) {
+                for n in e.nodes.iter().flatten() {
+                    let mut colliders = Vec::new();
+                    if let Ok(b) = n.clone().try_cast::<godot::classes::CharacterBody2D>() {
+                        for i in 0..b.get_slide_collision_count() {
+                            colliders
+                                .extend(b.get_slide_collision(i).and_then(|c| c.get_collider()));
+                        }
+                    } else if let Ok(b) = n.clone().try_cast::<godot::classes::CharacterBody3D>() {
+                        for i in 0..b.get_slide_collision_count() {
+                            colliders
+                                .extend(b.get_slide_collision(i).and_then(|c| c.get_collider()));
+                        }
+                    }
+                    for c in colliders {
+                        let Ok(node) = c.try_cast::<Node>() else {
+                            continue;
+                        };
+                        let Some((root, _)) = entity_root_of(&node) else {
+                            continue;
+                        };
+                        let id = self.entries.get(&root.instance_id()).and_then(|e| e.id);
+                        if let Some(id) = id.filter(|id| self.sim.contains_key(id)) {
+                            hit.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        for id in hit {
+            self.pushed.insert(id, now);
+        }
+        self.pushed.retain(|_, t| now < *t + PUSHED_TICKS);
     }
 
     /// Client, after the tick: each `simulated` replica's pose under predicted tick `tick`.
@@ -826,6 +1002,11 @@ impl NetManager {
         let busy = self.sim.values().filter(|s| s.corr.is_correcting()).count();
         let n = self.sim.values().filter(|s| !s.held).count();
         (self.sim_counts.0, self.sim_counts.1, busy, n)
+    }
+
+    /// Settles finished (bodies put at their server body's resting pose, asleep).
+    pub fn sim_settles(&self) -> u64 {
+        self.sim_counts.2
     }
 
     /// Before a replay: the simulated bodies' poses.

@@ -312,9 +312,12 @@ pub struct NetManager {
     #[export]
     #[var(get = get_physics, set = set_physics)]
     physics: modes::PhysicsOption,
-    /// WP19, client: the `simulated` replicas being corrected, and (corrections, snaps) so far.
+    /// WP19, client: the `simulated` replicas being corrected, and (corrections, snaps, settles) so far.
     sim: HashMap<NetId, modes::SimBody>,
-    sim_counts: (u64, u64),
+    sim_counts: (u64, u64, u64),
+    /// WP19, client: the predicted tick a predicted entity of this client last touched each
+    /// `simulated` replica (modes.rs `note_pushed`).
+    pushed: HashMap<NetId, u64>,
     /// WP19, client: the holding timers of the `handoff` bodies it holds (handoff.rs).
     holding: HashMap<NetId, netcore::handoff::Holding>,
     /// WP19, client: the physics frame of its last claim by contact per body (one per rest time).
@@ -2007,6 +2010,40 @@ impl NetManager {
                 })
                 .unwrap_or_default();
             let cur = cur.unwrap_or_default();
+            // WP19: the replayed tick starts from the hot state as a snapshot carries it, as the
+            // server's tick did (`quantize_state`).
+            if tick::quantize_state() {
+                let held = {
+                    let _guard = self.base();
+                    if self.touches_simulated(&nodes) {
+                        Vec::new()
+                    } else {
+                        let mut hot = read_hot_indexed(&rt, &nodes);
+                        hot.retain(|(_, _, v)| quantizes_lengths(v));
+                        hot
+                    }
+                };
+                let snapped: Vec<(u16, u16, Value)> = s
+                    .bind_mut()
+                    .with_core(|c, _| {
+                        held.into_iter()
+                            .filter_map(|(p, f, v)| {
+                                let q = c.quantized(*id, p, f, &v)?;
+                                (q != v).then_some((p, f, q))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !snapped.is_empty() {
+                    let writes = state_writes(&rt, &nodes, snapped);
+                    let _guard = self.base_mut();
+                    for (n, f, v) in writes {
+                        if n.is_instance_valid() {
+                            apply::write(&n, &f, &v);
+                        }
+                    }
+                }
+            }
             inp.bind_mut().set_frames(
                 tick as i64,
                 cur.clone(),
@@ -2208,6 +2245,106 @@ impl NetManager {
             .collect()
     }
 
+    /// WP19 (`gdnet/prediction/quantize_state`, tick.rs): the hot values of the entities whose ticks a
+    /// client predicts, as this peer holds them: on a client its predicted entities, on the server the
+    /// entities a client owns that are not `client_owned`. Entities with a RigidBody part are left out
+    /// (their bodies move in the physics step, not in the tick). (id, [(part, field, value)]).
+    pub fn prediction_state(&self) -> Vec<(NetId, netcore::predict::EntityState)> {
+        if !self.online {
+            return Vec::new();
+        }
+        let _guard = self.base();
+        let mut out = Vec::new();
+        for iid in &self.order {
+            let Some(e) = self.entries.get(iid) else {
+                continue;
+            };
+            let (Some(id), Some(rt)) = (e.id, e.props.as_ref()) else {
+                continue;
+            };
+            let predicted = if self.is_server {
+                e.owner != netcore::SERVER && !e.client_owned
+            } else {
+                e.predicted.is_some()
+            };
+            if !predicted || e.has_body.unwrap_or_else(|| modes::has_body(&e.nodes)) {
+                continue;
+            }
+            if self.touches_simulated(&e.nodes) {
+                continue;
+            }
+            let mut hot = read_hot_indexed(rt, &e.nodes);
+            hot.retain(|(_, _, v)| quantizes_lengths(v));
+            out.push((id, hot));
+        }
+        out
+    }
+
+    /// Whether a CharacterBody part's last `move_and_slide()` met a `simulated` body: every peer
+    /// simulates that body by itself, so the two sides' copies differ by more than a quantiser step and
+    /// a snap of the entity would only add a step's worth of difference to them.
+    fn touches_simulated(&self, nodes: &[Option<Gd<Node>>]) -> bool {
+        let me = self.base().instance_id();
+        let simulated = |other: Gd<Object>| -> bool {
+            let Ok(node) = other.try_cast::<Node>() else {
+                return false;
+            };
+            let Some((root, m)) = entity_root_of(&node) else {
+                return false;
+            };
+            let check = |mm: &NetManager| {
+                mm.entries.get(&root.instance_id()).is_some_and(|e| {
+                    e.physics == netcore::PhysicsMode::Simulated && e.has_body == Some(true)
+                })
+            };
+            if m.instance_id() == me {
+                check(self)
+            } else {
+                check(&m.bind())
+            }
+        };
+        for n in nodes.iter().flatten() {
+            if let Ok(b) = n.clone().try_cast::<godot::classes::CharacterBody2D>() {
+                for i in 0..b.get_slide_collision_count() {
+                    if let Some(c) = b.get_slide_collision(i).and_then(|c| c.get_collider()) {
+                        if simulated(c) {
+                            return true;
+                        }
+                    }
+                }
+            } else if let Ok(b) = n.clone().try_cast::<godot::classes::CharacterBody3D>() {
+                for i in 0..b.get_slide_collision_count() {
+                    if let Some(c) = b.get_slide_collision(i).and_then(|c| c.get_collider()) {
+                        if simulated(c) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Writes hot values of entities (`prediction_state`'s shape) to their nodes.
+    pub fn write_state(&mut self, vals: Vec<(NetId, netcore::predict::EntityState)>) {
+        let mut writes = Vec::new();
+        for (id, state) in vals {
+            let Some(e) = self.by_id.get(&id).and_then(|i| self.entries.get(i)) else {
+                continue;
+            };
+            let Some(rt) = e.props.as_ref() else {
+                continue;
+            };
+            writes.extend(state_writes(rt, &e.nodes, state));
+        }
+        let _guard = self.base_mut();
+        for (n, f, v) in writes {
+            if n.is_instance_valid() {
+                apply::write(&n, &f, &v);
+            }
+        }
+    }
+
     /// The `NetInput` of the entity rooted at `root` (None before it is spawned).
     pub fn input_of(&self, root: &Gd<Node>) -> Option<Gd<NetInput>> {
         self.entries.get(&root.instance_id())?.input.clone()
@@ -2373,6 +2510,13 @@ fn read_hot(rt: &RuntimeProps, nodes: &[Option<Gd<Node>>]) -> Vec<Value> {
         }
     }
     out
+}
+
+/// WP19 (`quantize_state`): the values a predicted entity's tick starts from as snapshots carry them:
+/// its vectors (positions, velocities). Rotations are left as they are: a quantised angle or quaternion
+/// would turn an entity a game set to an exact rotation (a travel's marker).
+fn quantizes_lengths(v: &Value) -> bool {
+    matches!(v, Value::Vector2(_) | Value::Vector3(_))
 }
 
 fn read_hot_indexed(rt: &RuntimeProps, nodes: &[Option<Gd<Node>>]) -> Vec<(u16, u16, Value)> {

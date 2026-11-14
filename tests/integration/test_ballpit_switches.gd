@@ -134,6 +134,11 @@ func test_the_physics_switch_reaches_every_peer_and_back() -> void:
 		await _frames(Engine.physics_ticks_per_second)
 		var sim_error := _max_error(f.server, c)
 		var sims: int = f.session(c).stats()["sim_corrections"] - sim0
+		var sim_awake := _balls(c).filter(func(b: RigidBody2D) -> bool: return not b.sleeping).size()
+		# A second after the server's pile fell asleep, the client's has settled onto it: every resting
+		# replica put at its server ball's pose (the quantiser's half step) and asleep.
+		assert_lt(sim_error, CONVERGED_PX, "simulated: the client's pile settled onto the server's: %.4f px" % sim_error)
+		assert_eq(sim_awake, 0, "simulated: every client ball sleeps")
 		# handoff: nobody touches the balls, so the server holds them all, frozen elsewhere.
 		_choose(hud, "Physics", "handoff")
 		assert_true(await f.wait_until(func() -> bool: return _all_in(c, "handoff"), 2.0), "handoff reached the client")

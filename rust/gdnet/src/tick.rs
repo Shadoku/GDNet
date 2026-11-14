@@ -28,6 +28,7 @@ use std::collections::BTreeSet;
 pub const SETTING_MAX_ROLLBACK: &str = "gdnet/prediction/max_rollback_ticks";
 pub const SETTING_INPUT_ACTIONS: &str = "gdnet/input/actions";
 pub const SETTING_WARN_GLOBAL_INPUT: &str = "gdnet/debug/warn_on_global_input";
+pub const SETTING_QUANTIZE_STATE: &str = "gdnet/prediction/quantize_state";
 
 thread_local! {
     static FRESH: Cell<bool> = const { Cell::new(true) };
@@ -90,6 +91,19 @@ pub fn max_rollback_ticks(tick_rate: u32) -> u32 {
             || netcore::predict::DEFAULT_MAX_ROLLBACK.max(tick_rate.div_ceil(3)),
             |v| v.clamp(1, 600) as u32,
         )
+}
+
+/// `gdnet/prediction/quantize_state` (default true): the server and the owner start every tick of a
+/// predicted entity from its hot state as the snapshots carry it (each hot field through its
+/// quantiser), so the owner's prediction, its replays from a restored snapshot and the server's
+/// simulation all run from the same values. Without it the two sides run from values that differ below
+/// the quantiser's step, and a contact decided by such a difference (Godot's choice of which collision a
+/// `move_and_slide()` meets first depends on the physics space's history) makes the owner roll back
+/// tick after tick.
+pub fn quantize_state() -> bool {
+    setting(SETTING_QUANTIZE_STATE)
+        .and_then(|v| v.try_to::<bool>().ok())
+        .unwrap_or(true)
 }
 
 /// `gdnet/input/actions` (default empty: every InputMap action but `ui_*`).
