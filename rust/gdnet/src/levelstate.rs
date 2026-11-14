@@ -206,10 +206,14 @@ impl NetManager {
                 }
             }
         }
-        let _guard = self.base_mut();
-        for (n, f, v) in writes {
-            apply::write(&n, &f, &v);
+        {
+            let _guard = self.base_mut();
+            for (n, f, v) in writes {
+                apply::write(&n, &f, &v);
+            }
         }
+        // WP18: restored values are polled at the next record, idle or asleep.
+        self.mark_cold_dirty(node);
         moved
     }
 }

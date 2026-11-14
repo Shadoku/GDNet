@@ -18,10 +18,12 @@
 //! telemetry: per-entity hashes, sampling, the client's comparison). WP13: [`rooms`] (rooms, interest by
 //! room, travel). WP16: [`interest`] (radius with hysteresis, `visible_to`, filter results), [`levelstate`]
 //! (the level state blob kept when a level unloads). WP17: [`seats`] (seat keys, the rejoin window),
-//! [`savestate`] (the saved session state: keyed state, seats, level states).
+//! [`savestate`] (the saved session state: keyed state, seats, level states). WP18: [`activity`] (the
+//! hot list, idle and sleeping entities: what the server polls in a tick).
 
 #![forbid(unsafe_code)]
 
+pub mod activity;
 pub mod authority;
 pub mod call;
 pub mod clock;
@@ -46,6 +48,7 @@ pub mod session;
 pub mod snapshot;
 pub mod wire;
 
+pub use activity::{Activity, Poll};
 pub use authority::{AuthorityStats, Transfer};
 pub use call::{Arg, CallIn, CallMsg, CallPlan, CallResult, CallStats, OutCall, Verb};
 pub use delta::{Ack, FieldMsg, ReplStats, Replication, StateUpdate};

@@ -495,6 +495,8 @@ pub struct RtField {
     pub ty: TypeTag,
     /// WP5: the `interpolate` option (replicas sample it; owners blend it after a rollback).
     pub interp: bool,
+    /// WP18: the typed getter reads try first (fastread.rs).
+    pub fast: crate::fastread::Fast,
 }
 
 /// A derived table with cached `StringName`s and hot/cold field lists, owned by a manager.
@@ -522,6 +524,10 @@ impl RuntimeProps {
             let mut c = Vec::new();
             for (i, (d, s)) in descs.iter().zip(specs).enumerate() {
                 let name = StringName::from(s.name.as_str());
+                let fast = match s.kind {
+                    AccessKind::Prop => crate::fastread::kind(&s.name, d.ty),
+                    _ => crate::fastread::Fast::Generic,
+                };
                 let acc = match s.kind {
                     AccessKind::Prop => Accessor::Prop(name),
                     AccessKind::Playing => Accessor::Playing,
@@ -532,6 +538,7 @@ impl RuntimeProps {
                     acc,
                     ty: d.ty,
                     interp: d.interpolate,
+                    fast,
                 });
                 if d.schedule == Schedule::Hot {
                     h.push(i as u16);

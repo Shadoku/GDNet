@@ -285,7 +285,14 @@ impl Net {
     #[func]
     fn input(&self, node: Gd<Node>) -> Gd<NetInput> {
         entity_root_of(&node)
-            .and_then(|(root, m)| m.bind().input_of(&root))
+            .and_then(|(root, m)| {
+                let input = m.bind().input_of(&root);
+                if input.is_some() {
+                    // WP18: an entity simulated from input is never idle.
+                    crate::manager::idle::note_input(&root);
+                }
+                input
+            })
             .unwrap_or_else(NetInput::new_live)
     }
 

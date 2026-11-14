@@ -107,6 +107,9 @@ pub fn to_variant(v: &Value, ty: TypeTag) -> Variant {
 
 /// Reads a field of `node`.
 pub fn read(node: &Gd<Node>, f: &RtField) -> Value {
+    if let Some(v) = crate::fastread::read(node, f.fast) {
+        return v;
+    }
     match &f.acc {
         Accessor::Prop(name) | Accessor::AnimPosition(name) | Accessor::Resource(name) => {
             to_value(&node.get(name), f.ty)
