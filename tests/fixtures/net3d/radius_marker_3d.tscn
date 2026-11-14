@@ -1,0 +1,7 @@
+[gd_scene format=3]
+
+[node name="RadiusMarker3D" type="Node3D"]
+
+[node name="NetEntity" type="NetEntity" parent="."]
+inherit_profile = true
+radius = 2.0

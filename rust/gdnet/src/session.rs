@@ -575,19 +575,25 @@ impl NetSession {
     }
 
     /// WP13, server: the entity `node` belongs to is `peer`'s player (its manager's room is the peer's
-    /// room). Before it is spawned, it becomes the player when it is.
+    /// room). Before it is spawned, it becomes `peer`'s player when it is (whoever owns it).
     #[func]
     pub fn set_player(&mut self, peer: i64, node: Gd<Node>) -> bool {
         let peer = peer.max(0) as u32;
         let Some((root, m)) = entity_root_of(&node) else {
             let mut n = node;
-            n.set_meta(crate::manager::META_PLAYER, &2i64.to_variant());
+            n.set_meta(
+                crate::manager::META_PLAYER,
+                &crate::manager::player_mark(peer.into()),
+            );
             return true;
         };
         let id = m.bind().net_id_of(&root);
         if id == 0 {
             let mut r = root;
-            r.set_meta(crate::manager::META_PLAYER, &2i64.to_variant());
+            r.set_meta(
+                crate::manager::META_PLAYER,
+                &crate::manager::player_mark(peer.into()),
+            );
             return true;
         }
         self.with_core(|c, now| c.set_player(peer, id, now))

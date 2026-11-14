@@ -49,6 +49,39 @@ That is the whole change (`tests/fixtures/net/predicted_player.gd` is this scrip
 tests read; `tests/integration/test_net_prediction.gd` runs it). The script still works offline and as the
 host's own player, unchanged.
 
+### In 3D
+
+The same two changes make a `CharacterBody3D` predicted. With gravity, a jump and facing the way it
+walks:
+
+```gdscript
+extends CharacterBody3D
+const SPEED := 4.0
+const JUMP_SPEED := 4.5
+const GRAVITY := 9.8
+
+func _physics_process(delta: float) -> void:
+	var input := Net.input(self)
+	var dir := input.get_vector("left", "right", "up", "down")
+	velocity.x = dir.x * SPEED
+	velocity.z = dir.y * SPEED
+	if dir != Vector2.ZERO:
+		rotation.y = atan2(-dir.x, -dir.y)
+	if is_on_floor():
+		if input.is_action_just_pressed("jump"):
+			velocity.y = JUMP_SPEED
+	else:
+		velocity.y -= GRAVITY * delta
+	move_and_slide()
+```
+
+(`tests/fixtures/net3d/player_3d.gd`, run by `tests/integration/test_net_3d.gd` in both host modes.) The
+owner moves on the tick after a press, the server converges within one `mm` step (0.001 m per component,
+the 3D tolerance) about 9 ticks after the release over a 100 ms round trip, a server impulse causes
+exactly one rollback, and walking, turning and jumping cause none. `rotation.y` is fine to write: gdnet
+syncs and compares the `quaternion` it produces, not the Euler angles. A player away from its seat
+(page 13) gets neutral input, so it stops walking and still falls.
+
 ## What happens each tick
 
 1. The owner's `NetManager` samples the actions of the project `InputMap` from the real `Input` (a bitset
@@ -196,4 +229,6 @@ it, the server branch uses the frames it receives. `test_net_prediction.gd` meas
 30, 60 and 120 Hz (gate G5), a server impulse (exactly one rollback), `is_fresh` across a replay, replicas
 not simulating, `_net_tick`, input delay, `predict = disabled`, the warning and two lost inputs out of
 three. Give test players `collision_layer = 0` and `collision_mask = 0`: the branches share one physics
-space, and the copies of a player would otherwise collide with each other.
+space, and the copies of a player would otherwise collide with each other. A 3D player that walks on a
+floor keeps `collision_layer = 0` and masks only the floor's layer; one floor outside the branches serves
+every copy (`test_net_3d.gd`).

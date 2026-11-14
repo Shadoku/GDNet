@@ -1,0 +1,17 @@
+[gd_scene format=3]
+
+[ext_resource type="PackedScene" path="res://tests/fixtures/net3d/chest_3d.tscn" id="1_chest"]
+[ext_resource type="PackedScene" path="res://tests/fixtures/net3d/coin_3d.tscn" id="2_coin"]
+
+[node name="Hall3D" type="Node3D"]
+
+[node name="NetManager" type="NetManager" parent="."]
+
+[node name="Chest" parent="NetManager" instance=ExtResource("1_chest")]
+position = Vector3(-2, 0, 1)
+
+[node name="Coin" parent="NetManager" instance=ExtResource("2_coin")]
+position = Vector3(2, 0, 1)
+
+[node name="Entrance" type="Marker3D" parent="."]
+transform = Transform3D(0, 0, -1, 0, 1, 0, 1, 0, 0, 1.5, 0.25, -3)

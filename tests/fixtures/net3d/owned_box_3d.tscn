@@ -1,0 +1,10 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/fixtures/net3d/owned_box_3d.gd" id="1_box"]
+
+[node name="OwnedBox3D" type="Node3D"]
+script = ExtResource("1_box")
+
+[node name="NetEntity" type="NetEntity" parent="."]
+inherit_profile = true
+client_owned = true

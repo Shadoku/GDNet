@@ -11,7 +11,7 @@ var net: NetFixture
 
 
 func before_each() -> void:
-	SpawnProbe.despawn_log.clear()
+	SpawnProbe.despawn_log().clear()
 
 
 func after_each() -> void:
@@ -147,11 +147,11 @@ func test_queue_free_frees_the_replica_after_net_despawning() -> void:
 		var c := _crate("Doomed")
 		managers["Server"].add_child(c)
 		assert_true(await f.wait_until(func() -> bool: return client.has_node("World/Doomed")))
-		SpawnProbe.despawn_log.clear()
+		SpawnProbe.despawn_log().clear()
 		c.queue_free()
 		assert_true(await f.wait_until(func() -> bool: return not client.has_node("World/Doomed")), "the replica was freed")
 		var client_path := str(client.get_path()) + "/World/Doomed"
-		assert_true(SpawnProbe.despawn_log.has(client_path), "_net_despawning ran on the replica: %s" % [SpawnProbe.despawn_log])
+		assert_true(SpawnProbe.despawn_log().has(client_path), "_net_despawning ran on the replica: %s" % [SpawnProbe.despawn_log()])
 		assert_eq(despawned, [true], "entity_despawning fired while the replica was still in the tree")
 		assert_eq(f.session(client).entity_count(), 0))
 	assert_true(ok)

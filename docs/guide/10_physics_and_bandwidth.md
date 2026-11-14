@@ -53,6 +53,21 @@ seconds, costing a few bytes each time it moves; a little `angular_damp` (the Ba
 it to rest. And a kinematic body (a paddle) resting inside a pile keeps nudging the bodies it overlaps,
 so they never sleep. No dead band is applied: Godot does not jitter a sleeping body, so none is needed.
 
+The same holds in 3D: a pile of 40 `RigidBody3D` boxes on a `StaticBody3D` floor sleeps about 1.3 s after
+it is dropped, the client's copies are within half a `mm` step (0.5 mm per axis) and 1.5e-4 rad of the
+server's, and asleep the pile costs zero snapshot bytes (`tests/integration/test_net_3d_physics.gd`).
+
+### The 3D physics engine
+
+This project does not set `physics/3d/physics_engine`, so it runs on `DEFAULT`, which in Godot 4.6 is
+GodotPhysics3D (a game picks Jolt with `physics/3d/physics_engine = "Jolt Physics"`). gdnet does not
+depend on the engine: every 3D test passes on both. Two differences show in them. Jolt brings the
+test's pile to sleep sooner (about 1.0 s against 1.3 s) and its body updates are a little larger while
+they fall (18.5 against 17.8 bytes), which is the engines' different motion, not gdnet. And a
+`CharacterBody3D` standing still on a body reports that body as a slide collision under GodotPhysics3D
+and nothing under Jolt, so under Jolt the body a still player stands on interacts through the radius
+only (it is asleep and costs nothing either way); once the player moves, both report what it touches.
+
 ## Priority: who goes first
 
 Each tick the server builds one snapshot per client, filled up to the client's budget and never beyond
@@ -76,8 +91,8 @@ Before the snapshots are built, each server tick, gdnet marks for every client w
 entity `Net.spawn_for`'d to it, or `Net.set_player`) the entities that interact with it:
 
 * entities whose root is within the manager's `interaction_radius` of the player's root (2D: pixels,
-  3D: metres; `0` = the project setting `gdnet/budget/interaction_radius`, 300 px, read as 3 m in 3D at
-  100 px per metre; negative = off for that manager), and
+  3D: metres; `0` = the project setting `gdnet/budget/interaction_radius`, which is in pixels: 300 px,
+  read as 3 m in 3D at 100 px per metre; negative = off for that manager), and
 * bodies in contact with the player's body: a `RigidBody2D/3D` player with `contact_monitor` on reports
   `get_colliding_bodies()`; a `CharacterBody2D/3D` player reports its last `move_and_slide()` collisions.
 
@@ -143,6 +158,10 @@ made 2D `mm` a 0.1 px step instead of 0.001 px); 300 moving bodies fill MTU-size
 bytes. Two levers exist if that matters for a game: a coarser quantiser (`cm` is a 1 px step in 2D and
 saves about a byte per axis for fast or far-flung bodies) through `Net.configure` or a profile, and fewer
 hot properties (a body whose `scale` never changes costs nothing for it: only changed fields travel).
+
+A `RigidBody3D` update is about the same size: measured over the first quarter second of the 3D pile's
+fall, 17.8 bytes per body update (position and both velocities at `mm`, a metre being 1,000 steps, so
+1 to 2 bytes per axis for values under 8 m and 8 m/s; the quaternion's 47 bits; the same entry header).
 
 ## Hash telemetry with many bodies
 

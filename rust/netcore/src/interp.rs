@@ -34,7 +34,11 @@
 //! frame and scaled by the real frame time (`factor ^ (dt * 60)`), so the smoothing looks the same at 60
 //! and 144 Hz (gate G5). Above the teleport threshold (2 m, 200 px, 90 degrees; per property
 //! `teleport_distance`, globally `gdnet/interpolation/teleport_distance`) the field snaps: the ring is
-//! cleared and no offset is kept. Offsets are visual only; they are never recorded into any history.
+//! cleared and no offset is kept. A correction followed at once by another one of the same step is a
+//! change of speed, not a jump (a field starting to move faster than the epsilon per tick): the first
+//! correction's shift is taken back off the older samples, so the stream takes the new heading, and the
+//! offset keeps the shown value continuous (WP18). Offsets are visual only; they are never recorded
+//! into any history.
 //!
 //! **Owned entities.** After a rollback gdnet compares, per interpolated hot field, what was shown before
 //! (`simulated + offset`) with the replayed value and keeps the difference as an owned offset
@@ -349,6 +353,25 @@ fn offset_minus(kind: Kind, o: Option<Comps>, d: &Comps) -> Comps {
     }
 }
 
+/// `v` moved back by offset `d` (the inverse of [`add`]).
+fn sub(kind: Kind, v: &Value, d: &Comps) -> Value {
+    match kind {
+        Kind::Quat => add(kind, v, &q_conj(d)),
+        _ => add(kind, v, &[-d[0], -d[1], -d[2], -d[3]]),
+    }
+}
+
+/// `o` plus `d`: undoes [`offset_minus`].
+fn offset_plus(kind: Kind, o: Option<Comps>, d: &Comps) -> Comps {
+    match kind {
+        Kind::Quat => q_norm(&q_mul(&o.unwrap_or(IDENTITY), d)),
+        _ => {
+            let o = o.unwrap_or([0.0; 4]);
+            [o[0] + d[0], o[1] + d[1], o[2] + d[2], o[3] + d[3]]
+        }
+    }
+}
+
 /// A decaying visual offset of one field.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Offset {
@@ -401,6 +424,10 @@ pub struct Track {
     samples: VecDeque<(u64, Value)>,
     offset: Option<Offset>,
     last_out: Option<Value>,
+    /// The last push's correction: the tick of the sample it came with and the shift it applied to
+    /// the samples before it (WP18: a second correction by the same step right after it means the
+    /// field changed its velocity, not its place).
+    last_correction: Option<(u64, Comps)>,
 }
 
 impl Track {
@@ -410,6 +437,7 @@ impl Track {
             samples: VecDeque::new(),
             offset: None,
             last_out: None,
+            last_correction: None,
         }
     }
 
@@ -451,6 +479,8 @@ impl Track {
     /// Adds the sample `(tick, value)`. `seen` is a tick at which the entity appeared in a snapshot
     /// without this field (it was unchanged then); `max_gap` the longest gap interpolated across.
     pub fn push(&mut self, tick: u64, value: Value, seen: Option<u64>, max_gap: u64) -> Pushed {
+        let mut held = false;
+        let newest = self.samples.back().map(|s| s.0);
         if let Some(&(pt, ref pv)) = self.samples.back() {
             if tick <= pt {
                 return Pushed::Ignored;
@@ -464,19 +494,41 @@ impl Track {
             if let Some(h) = hold.filter(|h| *h > pt) {
                 let pv = pv.clone();
                 self.samples.push_back((h, pv));
+                held = true;
             }
         }
+        let last_correction = self.last_correction.take();
         let mut result = Pushed::Added;
         // A correction needs a heading: two earlier samples (a hold pair counts: standing still).
         if self.params.kind != Kind::Snap && self.samples.len() >= 2 {
             if let Some(expected) = self.heading(tick as f64) {
                 if let Some((d, m)) = diff(self.params.kind, &expected, &value) {
+                    let kind = self.params.kind;
+                    // The previous sample was a correction by the same step: the field did not jump,
+                    // it started moving at a new speed (a step over the epsilon per tick). Take that
+                    // correction's shift back off the older samples, so the stream has the new heading,
+                    // and keep the shown value continuous through the offset.
+                    let restarted = last_correction.filter(|(t, prev)| {
+                        !held
+                            && Some(*t) == newest
+                            && offset_magnitude(kind, &offset_minus(kind, Some(d), prev))
+                                <= self.params.epsilon
+                    });
                     if m > self.params.teleport {
                         self.samples.clear();
                         self.offset = None;
                         result = Pushed::Teleported;
+                    } else if let Some((t, prev)) = restarted {
+                        for s in self.samples.iter_mut().filter(|s| s.0 < t) {
+                            s.1 = sub(kind, &s.1, &prev);
+                        }
+                        let o = offset_plus(kind, self.offset.as_ref().map(|o| o.value), &prev);
+                        self.offset = (offset_magnitude(kind, &o) > self.params.epsilon * TINY)
+                            .then_some(Offset {
+                                params: self.params,
+                                value: o,
+                            });
                     } else if m > self.params.epsilon {
-                        let kind = self.params.kind;
                         for s in self.samples.iter_mut() {
                             s.1 = add(kind, &s.1, &d);
                         }
@@ -485,6 +537,7 @@ impl Track {
                             params: self.params,
                             value: o,
                         });
+                        self.last_correction = Some((tick, d));
                         result = Pushed::Corrected;
                     }
                 }
@@ -987,6 +1040,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// WP18: a steady turn about a fixed axis (each sample one tick's rotation further, some written
+    /// as -q, as `smallest3` does) is a heading, never a correction.
+    #[test]
+    fn a_steady_quaternion_turn_is_no_correction() {
+        let d = desc("quaternion", TypeTag::Quaternion, Quant::Smallest3);
+        let mut t = track(&d);
+        let axis = [0.3f64, 1.0, 0.2];
+        let n = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        let half = 0.21f64 / 2.0;
+        let r = [
+            axis[0] / n * half.sin(),
+            axis[1] / n * half.sin(),
+            axis[2] / n * half.sin(),
+            half.cos(),
+        ];
+        let mut q = q_norm(&[0.4, -0.2, 0.7, 0.5]);
+        for i in 0..40u64 {
+            let s = if i % 3 == 0 { -1.0 } else { 1.0 };
+            let v = Value::Quaternion(q.map(|c| (c * s) as f32));
+            assert_ne!(t.push(10 + i, v, None, 6), Pushed::Corrected, "sample {i}");
+            q = q_norm(&q_mul(&r, &q));
+        }
+        assert!(t.offset().is_none());
+    }
+
+    /// WP18: a field that starts moving faster than the correction epsilon per tick (a body falling
+    /// at 4 m/s, a wheel turning 12 rad/s) is corrected once at the start; from the second step on the
+    /// stream has the new heading, so no further sample is a correction and the offset stays small.
+    #[test]
+    fn a_fast_start_is_corrected_once_then_followed() {
+        // 0.08 m per tick (4.8 m/s at 60 Hz), above the 0.05 m epsilon.
+        let d = desc("position", TypeTag::Vector3, Quant::Mm);
+        let mut t = track(&d);
+        t.push(10, Value::Vector3([1.0, 0.0, 0.0]), None, 6);
+        t.push(11, Value::Vector3([1.0, 0.0, 0.0]), None, 6);
+        let mut corrections = 0;
+        for i in 1..20u64 {
+            let v = Value::Vector3([1.0 + 0.08 * i as f32, 0.0, 0.0]);
+            if t.push(11 + i, v, None, 6) == Pushed::Corrected {
+                corrections += 1;
+            }
+        }
+        assert_eq!(corrections, 1, "one correction at the start");
+        let o = t.offset().map_or(0.0, Offset::magnitude);
+        assert!(o < 0.08, "the offset is under one step: {o}");
+        // Between the last two samples the value is on the line.
+        let Value::Vector3(v) = t.value_at(Some(29.5)).unwrap() else {
+            panic!()
+        };
+        assert!((v[0] - (1.0 + 0.08 * 18.5)).abs() < 1e-4, "{v:?}");
+        // The same for a quaternion turning 0.21 rad a tick from rest.
+        let d = desc("quaternion", TypeTag::Quaternion, Quant::Smallest3);
+        let mut t = track(&d);
+        let half = 0.21f64 / 2.0;
+        let r = [0.0, half.sin(), 0.0, half.cos()];
+        let mut q = q_norm(&[0.4, -0.2, 0.7, 0.5]);
+        t.push(10, Value::Quaternion(q.map(|c| c as f32)), None, 6);
+        t.push(11, Value::Quaternion(q.map(|c| c as f32)), None, 6);
+        let mut corrections = 0;
+        for i in 1..20u64 {
+            q = q_norm(&q_mul(&r, &q));
+            if t.push(11 + i, Value::Quaternion(q.map(|c| c as f32)), None, 6) == Pushed::Corrected
+            {
+                corrections += 1;
+            }
+        }
+        assert_eq!(corrections, 1, "one correction at the start of the turn");
+        let o = t.offset().map_or(0.0, Offset::magnitude);
+        assert!(o < 0.21, "the offset is under one step: {o}");
     }
 
     #[test]

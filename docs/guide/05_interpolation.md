@@ -61,7 +61,7 @@ How each type blends:
 |---|---|
 | `float`, `Vector2/3/4`, `Color` | linearly |
 | `rotation`, or a float quantised `deg` | linearly along the shorter arc, wrapped to [-PI, PI) (3.1 to -3.1 goes through PI, not through 0) |
-| `Quaternion` | slerp along the shorter arc, always unit length |
+| `Quaternion` | slerp along the shorter arc, always unit length (samples may arrive as `q` or `-q`, the same rotation: the replica never swings the long way round) |
 | `int`, `bool`, strings, transforms, anything else | steps when the render tick reaches the sample |
 
 **Cold properties snap** (visibility, modulate, animation names, text, exports): they change rarely and
@@ -102,7 +102,19 @@ property with the `teleport_distance` option (profile entry, `state_options`, or
 Net.configure($NetManager/Portal, {"teleport_distance": {"position": 10.0}})
 ```
 
+A field that starts moving faster than the epsilon per tick (a body falling at 3 m/s or more, a wheel
+turning faster than 300 degrees a second, at 60 Hz) is corrected once, on its first step; when the next
+sample is off by the same step again, it was a change of speed, not of place: the older samples get that
+correction back, so the stream takes the new heading, and the offset keeps what is shown continuous.
+(Before WP18 every sample of such a field was a correction and the replica fell behind by several ticks:
+`test_interpolation_a_fast_start_is_followed_not_corrected_every_tick`.)
+
 Offsets are visual only: nothing records them into a history, and the server never sees them.
+
+**In 3D** the thresholds are metres and degrees as they stand: a 5 cm epsilon, 25 cm for the faster
+decay, a 2 m teleport distance; the quaternion's are 5, 10 and 90 degrees. `test_net_3d_interp.gd` checks
+a replica that moves and turns (no frame backwards, no turn the wrong way, slerp across the double cover),
+a 1.5 m correction that blends and a 3 m one that snaps.
 
 ## The owner after a rollback
 

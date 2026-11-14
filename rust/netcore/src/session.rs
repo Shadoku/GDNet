@@ -342,16 +342,17 @@ pub struct ScopeStats {
     pub rebuilds: u64,
 }
 
-/// WP13: which entity [`Spawn`] makes its owner's player (the entity whose manager's room is the
-/// owner's room, 2.11).
+/// WP13: which entity [`Spawn`] makes a peer's player (the entity whose manager's room is that peer's
+/// room, 2.11).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PlayerMark {
     #[default]
     No,
     /// The owner's player when it has none yet (`Net.spawn_for`).
     IfNone,
-    /// The owner's player, replacing any earlier one (`Net.set_player`).
-    Always,
+    /// The player of the given peer (any peer, not only the owner), replacing any earlier one
+    /// (`Net.set_player` before the spawn).
+    Of(PeerId),
 }
 
 /// WP8: the session's hash telemetry state.
@@ -1147,7 +1148,7 @@ impl Spawn {
         self
     }
 
-    /// WP13: the entity becomes its owner's player (see [`PlayerMark`]).
+    /// WP13: the entity becomes a peer's player (see [`PlayerMark`]).
     pub fn as_player(mut self, mark: PlayerMark) -> Self {
         self.player = mark;
         self
@@ -1397,14 +1398,14 @@ impl Session {
             self.interest.set(id, &spec);
         }
         // WP13: the owner's player sets its room (and may send `Travel` and a scope change first).
-        let mark = match player {
-            PlayerMark::No => false,
-            PlayerMark::IfNone => self.scope.rooms.player(owner).is_none(),
-            PlayerMark::Always => true,
+        let peer = match player {
+            PlayerMark::No => None,
+            PlayerMark::IfNone => self.scope.rooms.player(owner).is_none().then_some(owner),
+            PlayerMark::Of(p) => Some(p),
         };
-        if mark {
-            self.scope.rooms.set_player(owner, id);
-            self.refresh_scope(owner, now_us);
+        if let Some(peer) = peer {
+            self.scope.rooms.set_player(peer, id);
+            self.refresh_scope(peer, now_us);
         }
         self.share_create(&create, None, now_us);
         Ok(id)

@@ -191,6 +191,11 @@ These are the rules that keep it at seconds:
   branch; seat 1 is the host or the first client); it points the dealer's `save_path` at a file of its own
   per test process and deletes it in `after_each`, and scans each client's packets for the other seat's
   cards with `_debug_watch`.
+  3D (WP18, gate G10): the 3D twins are `test_net_3d.gd` (state, prediction), `test_net_3d_interp.gd`,
+  `test_net_3d_world.gd` (calls, authority, interest, rooms, seats, overlay) and `test_net_3d_physics.gd`
+  (a `RigidBody3D` pile, interaction scoring), with fixtures in `tests/fixtures/net3d/`. Lengths are metres;
+  compare rotations with an angle (a replica may hold `-q`), and give the clients' `RigidBody3D` copies a
+  collision layer of their own as they enter the manager (`child_entered_tree`).
 
 ## Design for testability
 

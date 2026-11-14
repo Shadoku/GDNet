@@ -69,7 +69,7 @@ half a second gets full state. Values too large for a snapshot (over 1,000 bytes
 | `mm` | fixed point, a millimetre per step, zigzag varint: 0.001 units in 3D, 0.1 px in 2D | half a step: 0.0005 m / 0.05 px |
 | `cm` | fixed point, a centimetre per step: 0.01 units in 3D, 1 px in 2D | 0.005 m / 0.5 px |
 | `deg` | an angle wrapped to one turn, 16 bits | 0.0055 degrees (replicas get the angle in [-PI, PI)) |
-| `smallest3` | a unit quaternion's three smallest components, 47 bits | about 2e-5 |
+| `smallest3` | a unit quaternion's three smallest components, 47 bits | 2.2e-5 per sent component; the rotation is off by at most 1.5e-4 rad (0.009 degrees) |
 | `f16` | half precision per component | about 1/2048 relative |
 
 Defaults: hot vectors and transforms `mm`, quaternions `smallest3`, hot colours `f16`, everything else
@@ -83,6 +83,17 @@ is 0.001 of its unit (an `angular_velocity` in rad/s, for instance). The default
 any screen shows; `Net.configure(node, {"quantize": {"position": "cm"}})` (1 px) saves about a byte per
 axis for positions in the hundreds to thousands of pixels. The 2D prediction tolerance follows: 0.1 px by
 default (one `mm` step).
+
+**3D.** A `Node3D` sends `position` at `mm` (a replica is within 0.5 mm per axis of the server) and
+`quaternion` at `smallest3`, not `rotation`: Euler angles have no single value per orientation and do not
+interpolate. A quaternion and its negation are the same rotation, and the quantiser sends whichever has
+its largest component positive, so a replica may read `-q` where the server reads `q`; compare rotations
+with `a.angle_to(b)` or `is_equal_approx` on the bases, not component by component. The rotation of a
+replica is off by at most 1.5e-4 rad: the three sent components are each within half a 15-bit step
+(2.2e-5), the derived one within 6.5e-5, and the rotation between two unit quaternions is at most twice
+the length of their difference. Measured over 200 random rotations: under 9e-5 rad
+(`tests/integration/test_net_3d.gd`). `scale` at `f16` keeps about three significant digits. The 3D
+prediction tolerance is one `mm` step, 0.001 m per component.
 
 ## Bandwidth
 

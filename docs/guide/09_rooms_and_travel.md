@@ -18,9 +18,9 @@ inspector to group several managers into one room, or to `"*"`: a `"*"` manager 
 room (scoreboards, a global weather entity).
 
 A peer's **primary room** is the room of the manager holding its *player*. The first entity
-`Net.spawn_for`'d to a peer is its player; `Net.set_player(peer, node)` says so explicitly (before or after
-the spawn). `Net.set_room(peer, name)` sets the primary room whatever the player's (spectators, a lobby); an
-empty name removes the override.
+`Net.spawn_for`'d to a peer is its player; `Net.set_player(peer, node)` says so explicitly, for any entity
+whoever owns it (before or after the spawn). `Net.set_room(peer, name)` sets the primary room whatever the
+player's (spectators, a lobby); an empty name removes the override.
 
 A peer sees a **set of rooms**:
 

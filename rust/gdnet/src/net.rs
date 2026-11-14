@@ -1285,7 +1285,10 @@ impl Net {
         match session_of(&node) {
             Some(mut s) => s.bind_mut().set_player(peer, node),
             None => {
-                node.set_meta(crate::manager::META_PLAYER, &2i64.to_variant());
+                node.set_meta(
+                    crate::manager::META_PLAYER,
+                    &crate::manager::player_mark(peer),
+                );
                 true
             }
         }

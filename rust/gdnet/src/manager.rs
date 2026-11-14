@@ -66,8 +66,13 @@ pub const META_MANAGER: &str = "_net_manager";
 /// Meta read at enrolment for the owner when the entity has no `NetEntity` (`Net.spawn_for`).
 pub const META_OWNER: &str = "_net_owner";
 /// WP13: meta on an entity root: 1 = becomes its owner's player when it has none (`Net.spawn_for`),
-/// 2 = becomes its owner's player (`Net.set_player` before the spawn).
+/// -p = becomes peer p's player (`Net.set_player(p, node)` before the spawn; see [`player_mark`]).
 pub const META_PLAYER: &str = "_net_player";
+
+/// WP13: the [`META_PLAYER`] value that makes an entity peer `peer`'s player once it is spawned.
+pub fn player_mark(peer: i64) -> Variant {
+    (-peer.max(1)).to_variant()
+}
 /// Meta on an entity root: its priority set by `Net.configure(node, {"priority": p})`.
 pub const META_PRIORITY: &str = "_net_priority";
 
@@ -1296,7 +1301,7 @@ impl NetManager {
             };
             let player = match mark {
                 1 => netcore::PlayerMark::IfNone,
-                2 => netcore::PlayerMark::Always,
+                m if m < 0 => netcore::PlayerMark::Of((-m).min(i64::from(u32::MAX)) as u32),
                 _ => netcore::PlayerMark::No,
             };
             // WP16: radius, visible_to and the filter, before anyone is sent the entity.

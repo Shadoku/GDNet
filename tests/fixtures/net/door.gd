@@ -10,8 +10,6 @@ extends Node2D
 var calls: Array = []
 ## The NetCallInfo each `note` call received: {text, sender, tick, is_local}.
 var infos: Array = []
-## What `_net_allow` answers for a sender that does not own the door (process-wide; tests reset it).
-static var allow_others: bool = false
 ## The `_net_allow` questions asked on this peer: [method, sender].
 var asked: Array = []
 ## How many calls had run here when `_net_spawned` ran (-1 before it ran).
@@ -47,7 +45,18 @@ func knock(k: int) -> void:
 
 func _net_allow(method: StringName, sender: int) -> bool:
 	asked.append([String(method), sender])
-	return allow_others
+	return allows_others()
+
+
+## What `_net_allow` answers for a sender that does not own the door (process-wide; tests reset it). Kept
+## in an Engine meta, not a `static var`: a script with static variables can be reported as a resource
+## still in use at exit, depending on which test files share a runner process.
+static func allows_others() -> bool:
+	return bool(Engine.get_meta(&"_door_allow_others", false))
+
+
+static func set_allow_others(on: bool) -> void:
+	Engine.set_meta(&"_door_allow_others", on)
 
 
 func _secret() -> void:
